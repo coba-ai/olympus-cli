@@ -1,0 +1,7 @@
+{
+  "data": {
+    "user": { "email": "user@example.test" },
+    "memberships": [{ "org": { "slug": "beta", "name": "Beta" }, "role": "teammate" }],
+    "token": { "name": "pin", "last4": "abcd", "organization": { "slug": "beta", "name": "Beta" } }
+  }
+}

@@ -1,0 +1,50 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - script/build-release.ts
+      - package.json
+      - install.sh
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      - run: bun script/build-release.ts
+      - run: ./dist/olympus-linux-x64 -h
+      - run: (cd dist && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: olympus-binaries
+          path: |
+            dist/olympus-*
+            dist/SHA256SUMS
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: olympus-binaries
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/olympus-linux-x64 dist/olympus-linux-arm64 \
+            dist/olympus-darwin-x64 dist/olympus-darwin-arm64 \
+            dist/SHA256SUMS \
+            --verify-tag --generate-notes -R "$GITHUB_REPOSITORY"
