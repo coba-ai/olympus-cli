@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  api, CliError, DEFAULT_HOST, deleteCreds, deviceLogin, envKey, fail, loginWithToken, print, readCreds, resolveHost, resolveOrg,
+  api, CliError, DEFAULT_HOST, defaultOrg, deleteCreds, deviceLogin, envKey, fail, loginWithToken, print, readCreds, resolveHost, resolveOrg,
   resolveToken, writeCreds, type Io, type Me,
 } from "../src/core";
 import { DEVICE_CODE, startFake, TOKENS } from "./fake-api";
@@ -652,5 +652,35 @@ describe("fake parity with server 439af0d6", () => {
     const a = await (await raw("/api/v1/orgs/zzz/webhooks", { token: TOKENS.owner })).text();
     const b = await (await raw(`${wh}/wh_99`, { token: TOKENS.owner })).text();
     expect([a, b]).toEqual([b, '{"error":{"code":"not_found","message":"Not found"}}']);
+  });
+});
+
+describe("defaultOrg and print seams", () => {
+  test("defaultOrg reports its source; flag/env skip /me; ambiguous/none -> undefined", async () => {
+    const calls: string[] = [];
+    const spy = (t: string) => async () => (calls.push("me"), await meOf(t)());
+    expect(await defaultOrg("x", io, {}, spy(TOKENS.owner))).toEqual({ slug: "x", from: "flag" });
+    expect(await defaultOrg(undefined, { ...io, env: { OLYMPUS_ORG: "y" } }, {}, spy(TOKENS.owner))).toEqual({ slug: "y", from: "env" });
+    expect(calls).toHaveLength(0);
+    expect(await defaultOrg(undefined, io, { org: "beta" }, meOf(TOKENS.pinned))).toEqual({ slug: "acme", from: "pin" });
+    expect(await defaultOrg(undefined, io, { org: "beta" }, meOf(TOKENS.multi))).toEqual({ slug: "beta", from: "stored" });
+    expect(await defaultOrg(undefined, io, {}, meOf(TOKENS.owner))).toEqual({ slug: "acme", from: "only" });
+    expect(await defaultOrg(undefined, io, {}, meOf(TOKENS.multi))).toBeUndefined();
+    const none = async () => ({ user: { email: "" }, memberships: [], token: { name: "", last4: "", organization: null } });
+    expect(await defaultOrg(undefined, io, {}, none)).toBeUndefined();
+  });
+  test("print: rich only when tty and provided; json calls neither", () => {
+    const h = () => "human", r = () => "rich";
+    print({ ...io, tty: true }, false, {}, h, r);
+    print({ ...io, tty: true }, false, {}, h);
+    print({ ...io, tty: false }, false, {}, h, r);
+    print(io, false, {}, h, r);
+    expect(io.o).toEqual(["rich\n", "human\n", "human\n", "human\n"]);
+    io.o.length = 0;
+    let called = 0;
+    const spy = () => (called++, "x");
+    for (const tty of [true, false]) print({ ...io, tty }, true, { a: 1 }, spy, spy);
+    expect(called).toBe(0);
+    expect(io.o).toEqual(['{"a":1}\n', '{"a":1}\n']);
   });
 });
