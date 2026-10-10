@@ -40,7 +40,7 @@ Limit: 60 requests per minute per token.
 
 ```
 GET    /me                          → {data:{user:{email}, memberships:[{org:{slug,name}, role}], token:{name, last4, organization}}}
-GET    /orgs/:org/agents            → {data:[{profile_name, name, paused}]}
+GET    /orgs/:org/agents            → {data:[{profile_name, name, paused, primary?, role_line?, created_at?}]}
 
 GET    /orgs/:org/webhooks          → {data:[{id, name, agent, full_tools, url, last_delivery_at, last_delivery_status, created_at}]}
 GET    /orgs/:org/webhooks/:id      → {data:{…, instructions}}
@@ -54,6 +54,7 @@ DELETE /orgs/:org/webhooks/:id      → 204
 - Roles are `operator` and `teammate`. Reading agents and listing webhooks is open to members;
   reading one webhook (its instructions) and every write need `operator`.
 - `agent` is an agent's `profile_name`. `full_tools` defaults to `false`.
+- `primary`, `role_line` and `created_at` on agents are newer servers only; an absent field means unknown.
 - The webhook `secret` is returned once, on create, and cannot be read again.
 
 ## Device login

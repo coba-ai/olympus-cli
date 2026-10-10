@@ -57,7 +57,11 @@ Empty values count as unset. Stored credentials: `~/.config/olympus/credentials.
 
 ## Output and exit codes
 
-Human mode prints plain tab-separated lines. `--json` prints the API body as-is, one compact line
+Human mode depends on where stdout goes. On a terminal you get headers, aligned columns, relative
+times ("3h ago"), a `*` on the default org in `org list`, and full-sentence confirmations; control
+characters in server text are stripped. Piped or redirected, you get plain tab-separated lines that
+scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
+emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms. `--json` prints the API body as-is, one compact line
 (`org list` → `{data:[…]}`, `org use` → `{data:{org}}`, `delete` → `{data:{id,deleted:true}}`,
 `logout` → `{data:{deleted}}`). Errors go to stderr; with `--json` stderr is the error object, and
 usage errors are `{"error":{"code":"usage",…}}`. A token is never printed.
