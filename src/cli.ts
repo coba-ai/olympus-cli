@@ -39,7 +39,7 @@ function webhookBlock(w: any, now: number): string {
   if (has("full_tools")) pairs.push(["full tools", w.full_tools ? "yes" : "no"]);
   if (has("url")) pairs.push(["url", clean(w.url)]);
   const [st, at] = [w.last_delivery_status ?? null, w.last_delivery_at ?? null];
-  pairs.push(["last delivery", st === null ? (at ? when(at, now) : "never") : delivery(st, null, now) + (at ? ", " + when(at, now) : "")]);
+  pairs.push(["last delivery", delivery(st, null, now) + (st !== null && at ? ", " + when(at, now) : "")]);
   if (has("created_at")) pairs.push(["created", when(w.created_at, now)]);
   for (const [k, x] of Object.entries(w)) if (!KNOWN.has(k)) pairs.push([k, clean(x)]);
   const instr = w.instructions === undefined || w.instructions === null ? "" :
@@ -118,9 +118,9 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
           m.user.email, `token ${m.token.name} …${m.token.last4}${pin ? ` (pinned to ${pin})` : ""}`,
           ...m.memberships.map((x) => `${x.org.slug}\t${x.org.name}\t${x.role}`),
         ].join("\n"), () => keyValue([
-          ["host", host],
-          ["user", m.user.email],
-          ["token", `${m.token.name} …${m.token.last4} (from ${envKey(io) ? "OLYMPUS_API_KEY" : "credentials.json"})`],
+          ["host", clean(host)],
+          ["user", clean(m.user.email)],
+          ["token", `${clean(m.token.name)} …${m.token.last4} (from ${envKey(io) ? "OLYMPUS_API_KEY" : "credentials.json"})`],
           ["scope", pin ? `${clean(pin)} (pinned)` : "all organizations"],
           ["default org", d ? `${clean(d.slug)} (${SOURCE[d.from]})` : "none"],
           ["organizations", m.memberships.map((x) => `${clean(x.org.slug)} (${clean(x.org.name)}, ${clean(x.role)})`).join("\n") || "none"],
@@ -194,7 +194,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
         want(2);
         plan = async (call, org) => {
           const slug = await org();
-          const b = await call("GET", await wh(org));
+          const b = await call("GET", await wh(async () => slug));
           print(io, json, b, () => b.data.map(row).join("\n"), () => b.data.length
             ? table(["ID", "NAME", "AGENT", "TOOLS", "LAST DELIVERY"], b.data.map((w: any) => [w.id, w.name, w.agent, w.full_tools ? "full" : "-", delivery(w.last_delivery_status, w.last_delivery_at, now())]))
             : `No webhooks in ${clean(slug)} yet. Create one:\n  olympus webhook create --name NAME --agent PROFILE --instructions TEXT`);

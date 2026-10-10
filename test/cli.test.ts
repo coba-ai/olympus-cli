@@ -515,6 +515,15 @@ test("R3 whoami block, one /me", async () => {
   expect((await rich(["whoami"], { env: multi })).out).toContain("default org    none");
 });
 
+test("R4b whoami single-lines email; webhook block 'never' when status null but time set", async () => {
+  fake.state.next = { status: 200, body: { data: { user: { email: "a@b.c\nevil: x" }, token: { name: "t", last4: "abcd" }, memberships: [] } } };
+  const w = await rich(["whoami"], { env: owner });
+  expect(w.out).toMatch(/^user +a@b\.c.*evil: x$/m);
+  await withBeta([seeded("wh_9", { last_delivery_status: null })], async () => {
+    expect((await rich(["webhook", "get", "wh_9", "--org", "beta"], { env: multi })).out).toContain("last delivery  never\n");
+  });
+});
+
 test("R4 webhook list / get / update / delete", async () => {
   await withBeta([seeded("wh_7"), seeded("wh_1", { name: "seed", full_tools: false, last_delivery_at: null, last_delivery_status: null })], async () => {
     const o = { env: multi };
