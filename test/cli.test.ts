@@ -9,7 +9,8 @@ const fake = startFake();
 afterAll(() => fake.stop());
 beforeEach(() => { fake.state.requests.length = 0; delete fake.state.next; delete fake.state.device; delete fake.state.onRequest; });
 
-async function cli(args: string[], o: { env?: Record<string, string>; stdin?: string; home?: string; creds?: string; sleep?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; openBrowser?: (url: string) => void } = {}) {
+let ttyDefault = false; // B7 reruns its sweep with this on
+async function cli(args: string[], o: { env?: Record<string, string>; stdin?: string; home?: string; creds?: string; sleep?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; openBrowser?: (url: string) => void; tty?: boolean } = {}) {
   const home = o.home ?? (await mkdtemp(join(tmpdir(), "oly-")));
   if (o.creds !== undefined) {
     await mkdir(join(home, ".config/olympus"), { recursive: true });
@@ -20,7 +21,7 @@ async function cli(args: string[], o: { env?: Record<string, string>; stdin?: st
   const code = await run(args, {
     env: { OLYMPUS_HOST: fake.url, ...o.env }, home, stdin: async () => o.stdin ?? "",
     out: (s) => { out += s; }, err: (s) => { err += s; },
-    sleep: o.sleep ?? (async (ms) => { clock += ms; }), now: o.now ?? (() => clock), openBrowser: o.openBrowser,
+    sleep: o.sleep ?? (async (ms) => { clock += ms; }), now: o.now ?? (() => clock), openBrowser: o.openBrowser, tty: o.tty ?? ttyDefault,
   });
   return { code, out, err, home };
 }
@@ -249,7 +250,10 @@ test("D5 device login never leaks token or device_code", async () => {
   expect(rs.filter((r) => r.code !== 0)).toHaveLength(4);
 });
 
-test("B7 token never leaks", async () => {
+test("B7 token never leaks (piped and tty)", async () => {
+  for (const tty of [false, true]) {
+  ttyDefault = tty;
+  try {
   const T = TOKENS.owner;
   const sweeps: { r: Awaited<ReturnType<typeof cli>> }[] = [];
   const base = { env: { OLYMPUS_API_KEY: T } };
@@ -284,6 +288,8 @@ test("B7 token never leaks", async () => {
   }
   for (const { r } of sweeps) { expect(r.out).not.toContain(T); expect(r.err).not.toContain(T); }
   expect(sweeps.some(({ r }) => r.code !== 0)).toBe(true);
+  } finally { ttyDefault = false; }
+  }
 });
 
 test("B8 usage errors", async () => {
@@ -442,4 +448,166 @@ test("AC4d webhook delete without --yes still exits 1 with no request", async ()
   const r = await cli(["webhook", "delete", "wh_1"], { env: owner });
   expect(r.code).toBe(1);
   expect(reqs()).toHaveLength(0);
+});
+
+// ---- rich (tty) output. Fixed clock: 2026-10-10 14:00 UTC.
+const NOW = () => Date.parse("2026-10-10T14:00:00Z");
+const rich = (args: string[], o: Parameters<typeof cli>[1] = {}) => cli(args, { tty: true, now: NOW, ...o });
+const multi = { OLYMPUS_API_KEY: TOKENS.multi };
+const storedOrg = (org: string) => JSON.stringify({ host: fake.url, token: TOKENS.multi, org });
+const seeded = (id: string, extra: Record<string, unknown> = {}) => ({
+  id, name: "deploys", agent: "hermes", full_tools: true, url: `${fake.url}/hooks/${id}`,
+  last_delivery_at: "2026-10-10T11:00:00Z", last_delivery_status: 202, created_at: "2026-10-06T09:12:00Z",
+  instructions: "When a deploy finishes,\npost a summary.", ...extra,
+});
+const withBeta = async (rows: any[], f: () => Promise<void>) => {
+  fake.state.webhooks.beta = rows;
+  try { await f(); } finally { fake.state.webhooks.beta = []; }
+};
+
+test("R1 agents list: table, older server, empty", async () => {
+  const r = await rich(["agents", "list"], { env: owner });
+  expect(r.out).toBe(
+    "PROFILE  NAME              STATUS  CREATED  ROLE\n" +
+    "hermes   Hermes (primary)  active  9d ago   Front desk for the team\n" +
+    "hera     Hera              paused  20d ago  -\n");
+  fake.state.next = { status: 200, body: { data: [{ profile_name: "hermes", name: "Hermes", paused: false }, { profile_name: "hera", name: "Hera", paused: true }] } };
+  const old = await rich(["agents", "list", "--org", "acme"], { env: owner });
+  expect(old.code).toBe(0);
+  expect(old.out).toBe("PROFILE  NAME    STATUS\nhermes   Hermes  active\nhera     Hera    paused\n");
+  fake.state.next = { status: 200, body: { data: [{ profile_name: "a", name: "A", paused: false, role_line: "x", created_at: null }] } };
+  expect((await rich(["agents", "list", "--org", "acme"], { env: owner })).out).toBe("PROFILE  NAME  STATUS  ROLE\na        A     active  x\n");
+  fake.state.next = { status: 200, body: { data: [] } };
+  expect((await rich(["agents", "list", "--org", "acme"], { env: owner })).out).toBe("No agents in acme yet. Agents are created in the Olympus app.\n");
+});
+
+test("R2 org list marks the default and says where it came from", async () => {
+  const stored = await rich(["org", "list"], { env: multi, creds: storedOrg("beta") });
+  expect(stored.out).toBe("   SLUG  NAME  ROLE\n   acme  Acme  operator\n*  beta  Beta  operator\n\n* default org (saved by olympus org use)\n");
+  expect(stored.out.split("\n").every((l) => l === l.trimEnd())).toBe(true);
+  const none = await rich(["org", "list"], { env: multi });
+  expect(none.out).toBe("   SLUG  NAME  ROLE\n   acme  Acme  operator\n   beta  Beta  operator\n\nNo default org; pick one with `olympus org use <slug>` or pass --org.\n");
+  const stale = await rich(["org", "list"], { env: multi, creds: storedOrg("gone") });
+  expect(stale.out).toContain("default org gone (saved by olympus org use) is not one of your organizations");
+  expect(stale.out).not.toContain("*  ");
+  const only = await rich(["org", "list"], { env: owner });
+  expect(only.out).toContain("*  acme");
+  expect(only.out).toContain("* default org (only membership)");
+  expect((await rich(["org", "list", "--org", "beta"], { env: multi })).out).toContain("* default org (--org)");
+  // one /me, nothing else
+  fake.state.requests.length = 0;
+  await rich(["org", "list"], { env: multi, creds: storedOrg("beta") });
+  expect(reqs().map((q) => q.path)).toEqual(["/api/v1/me"]);
+});
+
+test("R3 whoami block, one /me", async () => {
+  const r = await rich(["whoami"], { env: owner });
+  expect(r.out).toBe(
+    `host           ${fake.url}\nuser           owner@acme.test\ntoken          test …abcd (from OLYMPUS_API_KEY)\n` +
+    "scope          all organizations\ndefault org    acme (only membership)\norganizations  acme (Acme, operator)\n");
+  expect(reqs().map((q) => q.path)).toEqual(["/api/v1/me"]);
+  const p = await rich(["whoami"], { env: { OLYMPUS_API_KEY: TOKENS.pinned } });
+  expect(p.out).toContain("scope          acme (pinned)\ndefault org    acme (token pin)\n");
+  expect((await rich(["whoami"], { env: multi })).out).toContain("organizations  acme (Acme, operator)\n               beta (Beta, operator)");
+  const s = await rich(["whoami"], { creds: storedOrg("beta") });
+  expect(s.out).toContain("token          test …abcd (from credentials.json)");
+  expect(s.out).toContain("default org    beta (saved by olympus org use)");
+  expect((await rich(["whoami"], { env: multi })).out).toContain("default org    none");
+});
+
+test("R4b whoami single-lines email; webhook block 'never' when status null but time set", async () => {
+  fake.state.next = { status: 200, body: { data: { user: { email: "a@b.c\nevil: x" }, token: { name: "t", last4: "abcd" }, memberships: [] } } };
+  const w = await rich(["whoami"], { env: owner });
+  expect(w.out).toMatch(/^user +a@b\.c.*evil: x$/m);
+  await withBeta([seeded("wh_9", { last_delivery_status: null })], async () => {
+    expect((await rich(["webhook", "get", "wh_9", "--org", "beta"], { env: multi })).out).toContain("last delivery  never\n");
+  });
+});
+
+test("R4 webhook list / get / update / delete", async () => {
+  await withBeta([seeded("wh_7"), seeded("wh_1", { name: "seed", full_tools: false, last_delivery_at: null, last_delivery_status: null })], async () => {
+    const o = { env: multi };
+    expect((await rich(["webhook", "list", "--org", "beta"], o)).out).toBe(
+      "ID    NAME     AGENT   TOOLS  LAST DELIVERY\nwh_7  deploys  hermes  full   202 accepted, 3h ago\nwh_1  seed     hermes  -      never\n");
+    expect((await rich(["webhook", "get", "wh_7", "--org", "beta"], o)).out).toBe(
+      "id             wh_7\nname           deploys\nagent          hermes\nfull tools     yes\n" +
+      `url            ${fake.url}/hooks/wh_7\n` +
+      "last delivery  202 accepted, 3h ago (2026-10-10 11:00 UTC)\ncreated        4d ago (2026-10-06 09:12 UTC)\n\n" +
+      "instructions:\n  When a deploy finishes,\n  post a summary.\n");
+    expect((await rich(["webhook", "get", "wh_1", "--org", "beta"], o)).out).toContain("last delivery  never\n");
+    const u = await rich(["webhook", "update", "wh_7", "--no-full-tools", "--org", "beta"], o);
+    expect(u.out.startsWith("Updated webhook wh_7.\n\nid             wh_7\n")).toBe(true);
+    expect(u.out).toContain("full tools     no\n");
+    expect(u.out).not.toContain("instructions:");
+    expect((await rich(["webhook", "delete", "wh_7", "--yes", "--org", "beta"], o)).out).toBe("Deleted webhook wh_7.\n");
+  });
+  // unknown keys follow the known ones, before instructions
+  await withBeta([seeded("wh_9", { extra_key: "x", nested: { a: 1 } })], async () => {
+    const g = (await rich(["webhook", "get", "wh_9", "--org", "beta"], { env: multi })).out;
+    expect(g.indexOf("created ")).toBeLessThan(g.indexOf("extra_key      x"));
+    expect(g.indexOf("nested")).toBeGreaterThan(0);
+    expect(g.indexOf("nested")).toBeLessThan(g.indexOf("instructions:"));
+    expect(g).toContain('{"a":1}');
+  });
+});
+
+test("R5 empty webhook list, webhook create", async () => {
+  fake.state.webhooks.beta = [];
+  expect((await rich(["webhook", "list", "--org", "beta"], { env: multi })).out).toBe(
+    "No webhooks in beta yet. Create one:\n  olympus webhook create --name NAME --agent PROFILE --instructions TEXT\n");
+  try {
+    const c = await rich(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "do it", "--org", "beta"], { env: multi });
+    expect(c.code).toBe(0);
+    expect(c.out).toMatch(/^id {13}wh_\d+\nname {11}n\n/);
+    expect(c.out).toMatch(/created {8}just now|created {8}\d+m ago|created {8}\S+ \(/); // wall-clock created_at vs fixed clock: shape only
+    expect(c.out).toMatch(/last delivery {2}never\n/);
+    expect(c.out).not.toContain("instructions:");
+    expect(c.out).toMatch(/\n\nSigning secret \(shown once — store it now; it cannot be read again\):\n {2}whsec_[0-9a-f]+\n/);
+    expect(c.out).toContain('See "Delivering to a webhook" in docs/API.md: https://github.com/coba-ai/olympus-cli/blob/main/docs/API.md#delivering-to-a-webhook\n');
+  } finally { fake.state.webhooks.beta = []; }
+});
+
+test("R6 confirmations are sentences", async () => {
+  expect((await rich(["login", "--with-token"], { stdin: TOKENS.owner })).out).toBe(`Logged in to ${fake.url} as owner@acme.test.\n`);
+  const home = await mkdtemp(join(tmpdir(), "oly-"));
+  await cli(["login", "--with-token"], { home, stdin: TOKENS.owner });
+  expect((await rich(["logout"], { home })).out).toBe("Logged out; stored credentials removed.\n");
+  expect((await rich(["logout"], { home })).out).toBe("Not logged in; no stored credentials.\n");
+  expect((await rich(["org", "use", "beta"], { env: multi })).out).toBe("Default org is now beta.\n");
+});
+
+test("R7 piped and tty --json are byte-equal", async () => {
+  for (const args of [["agents", "list", "--json"], ["whoami", "--json"]]) {
+    const [a, b] = [await cli(args, { env: owner, tty: false }), await cli(args, { env: owner, tty: true })];
+    expect(b.out).toBe(a.out);
+  }
+  // piped stays the tab-separated shape even when the server sends the new fields
+  expect((await cli(["agents", "list"], { env: owner, tty: false })).out).toBe("hermes\tHermes\tactive\nhera\tHera\tpaused\n");
+});
+
+test("R8 terminal control sequences from the server never reach a tty", async () => {
+  const bad = "\x1b]52;c;AAAA\x07\x9b";
+  const noCtl = (out: string) => { expect(out).not.toContain("\x1b"); expect(out).not.toContain("\x9b"); expect(out).not.toContain("\x07"); };
+  fake.state.next = { status: 200, body: { data: [{ profile_name: "p" + bad, name: "n" + bad, paused: false, role_line: "r" + bad, created_at: "bad" + bad }] } };
+  const a = await rich(["agents", "list", "--org", "acme"], { env: owner });
+  noCtl(a.out);
+  expect(a.out).toContain("n]52;c;AAAA");
+  const me = { data: { user: { email: "e" + bad }, token: { name: "t" + bad, last4: "abcd", organization: null }, memberships: [{ org: { slug: "acme", name: "A" + bad }, role: "operator" + bad }] } };
+  fake.state.next = { status: 200, body: me };
+  noCtl((await rich(["whoami"], { env: owner })).out);
+  fake.state.next = { status: 200, body: me };
+  noCtl((await rich(["org", "list"], { env: owner })).out);
+  await withBeta([seeded("wh_x", { name: "n" + bad, instructions: "i" + bad + "\nline2", created_at: "bad" + bad, last_delivery_at: "bad" + bad })], async () => {
+    const g = await rich(["webhook", "get", "wh_x", "--org", "beta"], { env: multi });
+    noCtl(g.out);
+    expect(g.out).toContain("\n  line2");
+    noCtl((await rich(["webhook", "list", "--org", "beta"], { env: multi })).out);
+  });
+  const c = await rich(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "x", "--org", "beta"], { env: multi });
+  fake.state.webhooks.beta = [];
+  noCtl(c.out);
+  noCtl((await rich(["org", "use", "beta" + bad], { env: multi })).out);
+  noCtl((await rich(["agents", "list", "--org", "acme" + bad], { env: owner })).out);
+  fake.state.next = { status: 200, body: { data: [] } };
+  noCtl((await rich(["agents", "list", "--org", "acme"], { env: owner })).out);
 });

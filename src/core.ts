@@ -9,6 +9,7 @@ export type Io = {
   err: (s: string) => void;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
+  tty?: boolean;
   openBrowser?: (url: string) => void;
 };
 export type Exit = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 130;
@@ -187,22 +188,48 @@ export function api(host: string, token?: string, timeoutMs = 30_000, signal?: A
   };
 }
 
+export type OrgSource = "flag" | "env" | "pin" | "stored" | "only";
+
+// Same precedence resolveOrg always had; flag/env never call `me`. `slugs` is set only when nothing resolved.
+async function pickOrg(
+  flag: string | undefined,
+  io: Io,
+  creds: Creds,
+  me: () => Promise<Me>,
+): Promise<{ slug: string; from: OrgSource } | { slugs: string[] }> {
+  const f = set(flag);
+  if (f) return { slug: f, from: "flag" };
+  const e = set(io.env.OLYMPUS_ORG);
+  if (e) return { slug: e, from: "env" };
+  const m = await me();
+  const pin = m.token.organization?.slug;
+  if (pin) return { slug: pin, from: "pin" };
+  if (creds.org) return { slug: creds.org, from: "stored" };
+  const slugs = m.memberships.map((x) => x.org.slug);
+  if (slugs.length === 1) return { slug: slugs[0]!, from: "only" };
+  return { slugs };
+}
+
+export async function defaultOrg(
+  flag: string | undefined,
+  io: Io,
+  creds: Creds,
+  me: () => Promise<Me>,
+): Promise<{ slug: string; from: OrgSource } | undefined> {
+  const r = await pickOrg(flag, io, creds, me);
+  return "slug" in r ? r : undefined;
+}
+
 export async function resolveOrg(
   flag: string | undefined,
   io: Io,
   creds: Creds,
   me: () => Promise<Me>,
 ): Promise<string> {
-  const direct = set(flag) ?? set(io.env.OLYMPUS_ORG);
-  if (direct) return direct;
-  const m = await me();
-  const pin = m.token.organization?.slug;
-  if (pin) return pin;
-  if (creds.org) return creds.org;
-  const slugs = m.memberships.map((x) => x.org.slug);
-  if (slugs.length === 1) return slugs[0]!;
+  const r = await pickOrg(flag, io, creds, me);
+  if ("slug" in r) return r.slug;
   throw usage(
-    slugs.length ? `multiple organizations (${slugs.join(", ")}); pass --org or run \`olympus org use <slug>\`` : "no organizations",
+    r.slugs.length ? `multiple organizations (${r.slugs.join(", ")}); pass --org or run \`olympus org use <slug>\`` : "no organizations",
   );
 }
 
@@ -293,9 +320,9 @@ export async function deviceLogin(
   }
 }
 
-export function print(io: Io, json: boolean, body: unknown, human: () => string): void {
+export function print(io: Io, json: boolean, body: unknown, human: () => string, rich?: () => string): void {
   if (json) return io.out(JSON.stringify(body) + "\n");
-  const s = human();
+  const s = (io.tty && rich ? rich : human)();
   if (s === "") return; // an empty list prints nothing, not a blank line
   io.out(s.endsWith("\n") ? s : s + "\n");
 }

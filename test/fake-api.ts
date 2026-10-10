@@ -20,7 +20,10 @@ export type FakeState = {
 
 const NAMES: Record<string, string> = { acme: "Acme", beta: "Beta" };
 // hera is paused; Agent#paused? in the server
-const AGENTS = [{ profile_name: "hermes", name: "Hermes", paused: false }, { profile_name: "hera", name: "Hera", paused: true }];
+const AGENTS = [
+  { profile_name: "hermes", name: "Hermes", paused: false, primary: true, role_line: "Front desk for the team", created_at: "2026-10-01T09:00:00Z" },
+  { profile_name: "hera", name: "Hera", paused: true, primary: false, role_line: null, created_at: "2026-09-20T09:00:00Z" },
+];
 // ApiBase's wording, byte for byte (BaseController at 439af0d6)
 const NOT_FOUND = "Not found";
 const MAX_INSTRUCTIONS = 8000;

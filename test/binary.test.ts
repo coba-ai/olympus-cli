@@ -26,6 +26,10 @@ test("binary ignores cwd .env, honours real env", async () => {
   const ok = await spawn({ OLYMPUS_API_KEY: TOKENS.owner });
   expect(ok.code).toBe(0);
   expect(JSON.parse(ok.out).data.user.email).toBeString();
+  // AC12: piped human output of the compiled binary is exact bytes (also proves node:http works under --compile).
+  const l = Bun.spawn([bin, "org", "list"], { cwd: tmp, env: { PATH: process.env.PATH!, HOME: tmp, OLYMPUS_HOST: fake.url, OLYMPUS_API_KEY: TOKENS.multi }, stdout: "pipe", stderr: "pipe" });
+  expect(await l.exited).toBe(0);
+  expect(await new Response(l.stdout).text()).toBe("acme\tAcme\toperator\nbeta\tBeta\toperator\n");
 }, 60_000);
 
 // C2: Ctrl-C while polling exits 130 promptly and writes nothing.
