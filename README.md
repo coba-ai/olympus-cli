@@ -95,8 +95,10 @@ Agents and days:
 
 When it asks, `day close` first reads the day (so a bad token, organization or date fails before the
 first question), then asks for shipped, blockers (one per line), learnings (one per line) and a
-reflection. Enter skips a question; an empty line ends a list. Ctrl-C cancels at any point before the save (typed-ahead answers are discarded); Ctrl-D cancels at a
-question that still needs an answer. Exit 130, nothing saved. If every answer is empty and the day has nothing saved yet, nothing is saved either (exit 130).
+reflection. Enter skips a question; an empty line ends a list. Ctrl-C cancels at any point before the save
+(typed-ahead answers are discarded); Ctrl-D cancels at a question that still needs an answer. Exit
+130, nothing saved. If every answer is empty and the day has nothing saved yet, nothing is saved
+either (exit 130).
 The wording of prompts and of terminal-mode confirmations is not a stable interface; the piped forms
 below are.
 

@@ -321,19 +321,7 @@ test("AC24 help lists the day lines; processIo offers ask only on a terminal", a
 });
 
 test("Ctrl-C in the same burst as queued answers cancels: exit 130, no PUT", async () => {
-  const rl: any = new EventEmitter();
-  rl.setPrompt = () => {};
-  rl.close = () => rl.emit("close");
-  let first = true;
-  rl.prompt = () => {
-    if (!first) return;
-    first = false;
-    queueMicrotask(() => { // input arrives after the question is pending, as with a real tty
-      for (const l of ["a", "", "", "r"]) rl.emit("line", l);
-      rl.emit("SIGINT");
-    });
-  };
-  const r = await run1(["day", "close", "2026-10-07"], true, lineAsker(rl));
+  const r = await run1(["day", "close", "2026-10-07"], true, burst(["a", "", "", "r"], "SIGINT"));
   expect(r.code).toBe(130);
   expect(reqs().map((q) => q.method)).toEqual(["GET"]);
 });
