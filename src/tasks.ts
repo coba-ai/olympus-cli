@@ -3,46 +3,23 @@ import { clean, keyValue, table, when } from "./format";
 
 const enc = encodeURIComponent;
 type Opts = Record<string, unknown>;
-export type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
+type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
 export type Plan = (call: Api, org: () => Promise<string>) => Promise<void>;
 
 // Flags every command accepts; the rest are per subcommand.
 const GLOBAL = ["json", "host", "org", "help"];
-// Flags that take a value: a non-string here is a usage error (parseArgs cannot produce one today; this is the net).
-// "add-tag"/"remove-tag" are multiple-string like "tag"; they are only checked by the allowlist.
-const STRINGS = ["week", "who", "text", "desc", "assign", "section"];
-
-// Wave 3 sets `build` on the write commands; a command with no `build` is recognised but not available yet.
-type Spec = { flags: string[]; n: number; build?: (c: Ctx) => Plan };
-const W = ["week"];
-const SPECS: Record<string, Spec> = {
-  people: { flags: [], n: 1 }, tags: { flags: [], n: 1 },
-  list: { flags: [...W, "mine", "who", "open", "done", "today", "tag", "backlog"], n: 2 },
-  get: { flags: W, n: 3 },
-  add: { flags: [...W, "desc", "assign", "backlog", "today", "star", "tag"], n: 3 },
-  update: { flags: [...W, "text", "desc", "assign", "unassign", "section", "tag", "tags", "add-tag", "remove-tag"], n: 3 },
-  done: { flags: W, n: 3 }, undone: { flags: W, n: 3 },
-  today: { flags: [...W, "off"], n: 3 }, star: { flags: [...W, "off"], n: 3 },
-  delete: { flags: [...W, "yes"], n: 3 },
-  "sub add": { flags: [...W, "assign"], n: 5 },
-  "sub done": { flags: [...W, "undo"], n: 5 },
-  "sub delete": { flags: [...W, "yes"], n: 5 },
-};
 
 // ---- write commands: each build() throws its usage errors synchronously, before the closure exists.
 const item = (c: Ctx, b: any, sentence: string) => print(c.io, c.json, b, () => detail(b.data), () => `${sentence}\n\n${block(b.data, c.now())}`);
 const need = (c: Ctx, name: string) => { if (!c.v.yes) throw usage(`${name} needs --yes`); };
 const tagList = (c: Ctx, k: string) => (c.v[k] as string[] | undefined) ?? [];
 
-function patch(sentence: (id: string) => string, body: (c: Ctx) => Record<string, unknown>): (c: Ctx) => Plan {
-  return (c) => {
-    const b = body(c);
-    const id = c.pos[2]!;
-    return async (call, org) => item(c, await call("PATCH", await tasksPath(c, org, `/${enc(id)}`), b), sentence(clean(id)));
-  };
+function patch(c: Ctx, body: Record<string, unknown>, sentence: (id: string) => string): Plan {
+  const id = c.pos[2]!;
+  return async (call, org) => item(c, await call("PATCH", await tasksPath(c, org, `/${enc(id)}`), body), sentence(clean(id)));
 }
 
-SPECS.add!.build = (c) => {
+function add(c: Ctx): Plan {
   const { v } = c;
   const body: Record<string, unknown> = { text: c.pos[2] };
   if (v.desc !== undefined) body.description = v.desc;
@@ -55,15 +32,15 @@ SPECS.add!.build = (c) => {
     const b = await call("POST", await tasksPath(c, org), body);
     item(c, b, `Added task ${clean(b.data.id)}.`);
   };
-};
+}
 
-SPECS.update!.build = (c) => {
+function update(c: Ctx): Plan {
   const { v } = c;
   if (v.assign !== undefined && v.unassign) throw usage("give only one of --assign / --unassign");
   const set = tagList(c, "tag").length > 0;
   if (set && v.tags === false) throw usage("give only one of --tag / --no-tags");
-  const add = tagList(c, "add-tag"), rem = tagList(c, "remove-tag");
-  if ((add.length || rem.length) && (set || v.tags === false)) throw usage("--add-tag / --remove-tag cannot be combined with --tag or --no-tags");
+  const addT = tagList(c, "add-tag"), rem = tagList(c, "remove-tag");
+  if ((addT.length || rem.length) && (set || v.tags === false)) throw usage("--add-tag / --remove-tag cannot be combined with --tag or --no-tags");
   const body: Record<string, unknown> = {};
   if (v.text !== undefined) body.text = v.text;
   if (v.desc !== undefined) body.description = v.desc;
@@ -72,30 +49,25 @@ SPECS.update!.build = (c) => {
   if (v.unassign) body.assignee = null;
   if (set) body.tags = tagList(c, "tag");
   if (v.tags === false) body.tags = [];
-  if (add.length) body.add_tags = add;
+  if (addT.length) body.add_tags = addT;
   if (rem.length) body.remove_tags = rem;
   if (!Object.keys(body).length) throw usage("task update needs at least one field to change");
-  return patch((id) => `Updated task ${id}.`, () => body)(c);
-};
+  return patch(c, body, (id) => `Updated task ${id}.`);
+}
 
-SPECS.done!.build = patch((id) => `Marked ${id} done.`, () => ({ done: true }));
-SPECS.undone!.build = patch((id) => `Marked ${id} not done.`, () => ({ done: false }));
-SPECS.today!.build = (c) => patch((id) => (c.v.off ? `Removed ${id} from today.` : `Marked ${id} for today.`), () => ({ today: !c.v.off }))(c);
-SPECS.star!.build = (c) => patch((id) => (c.v.off ? `Unstarred ${id}.` : `Starred ${id}.`), () => ({ one_thing: !c.v.off }))(c);
-
-SPECS.delete!.build = (c) => {
+function del(c: Ctx): Plan {
   need(c, "task delete");
   const id = c.pos[2]!;
   return async (call, org) => {
     await call("DELETE", await tasksPath(c, org, `/${enc(id)}`));
     print(c.io, c.json, { data: { id, deleted: true } }, () => `deleted ${clean(id)}`, () => `Deleted task ${clean(id)}.`);
   };
-};
+}
 
 const subPath = (c: Ctx, org: () => Promise<string>, sid?: string) =>
   tasksPath(c, org, `/${enc(c.pos[3]!)}/subtasks${sid === undefined ? "" : `/${enc(sid)}`}`);
 
-SPECS["sub add"]!.build = (c) => {
+function subAdd(c: Ctx): Plan {
   const body: Record<string, unknown> = { text: c.pos[4] };
   if (c.v.assign !== undefined) body.assignee = c.v.assign;
   return async (call, org) => {
@@ -103,51 +75,69 @@ SPECS["sub add"]!.build = (c) => {
     const subs: any[] = b.data.subtasks ?? [];
     item(c, b, `Added subtask ${clean(subs[subs.length - 1]?.id)} to ${clean(c.pos[3])}.`);
   };
-};
+}
 
-SPECS["sub done"]!.build = (c) => async (call, org) =>
+const subDone = (c: Ctx): Plan => async (call, org) =>
   item(c, await call("PATCH", await subPath(c, org, c.pos[4]!), { done: !c.v.undo }), `Marked subtask ${clean(c.pos[4])} ${c.v.undo ? "not done" : "done"}.`);
 
-SPECS["sub delete"]!.build = (c) => {
+function subDelete(c: Ctx): Plan {
   need(c, "task sub delete");
   return async (call, org) =>
     item(c, await call("DELETE", await subPath(c, org, c.pos[4]!)), `Deleted subtask ${clean(c.pos[4])} from ${clean(c.pos[3])}.`);
+}
+
+// n = expected positionals (including the command word).
+type Spec = { flags: string[]; n: number; build: (c: Ctx) => Plan };
+const W = ["week"];
+const SPECS: Record<string, Spec> = {
+  people: { flags: [], n: 1, build: people }, tags: { flags: [], n: 1, build: tags },
+  list: { flags: [...W, "mine", "who", "open", "done", "today", "tag", "backlog"], n: 2, build: list },
+  get: { flags: W, n: 3, build: get },
+  add: { flags: [...W, "desc", "assign", "backlog", "today", "star", "tag"], n: 3, build: add },
+  update: { flags: [...W, "text", "desc", "assign", "unassign", "section", "tag", "tags", "add-tag", "remove-tag"], n: 3, build: update },
+  done: { flags: W, n: 3, build: (c) => patch(c, { done: true }, (id) => `Marked ${id} done.`) },
+  undone: { flags: W, n: 3, build: (c) => patch(c, { done: false }, (id) => `Marked ${id} not done.`) },
+  today: { flags: [...W, "off"], n: 3, build: (c) => patch(c, { today: !c.v.off }, (id) => (c.v.off ? `Removed ${id} from today.` : `Marked ${id} for today.`)) },
+  star: { flags: [...W, "off"], n: 3, build: (c) => patch(c, { one_thing: !c.v.off }, (id) => (c.v.off ? `Unstarred ${id}.` : `Starred ${id}.`)) },
+  delete: { flags: [...W, "yes"], n: 3, build: del },
+  "sub add": { flags: [...W, "assign"], n: 5, build: subAdd },
+  "sub done": { flags: [...W, "undo"], n: 5, build: subDone },
+  "sub delete": { flags: [...W, "yes"], n: 5, build: subDelete },
 };
+
+// Every task flag except --yes, which other commands (webhook delete) also take; cli.ts rejects these on other commands.
+export const TASK_FLAGS = [...new Set(Object.values(SPECS).flatMap((s) => s.flags))].filter((k) => k !== "yes");
 
 // Validates everything synchronously (so usage errors exit 1 before credentials are read), then returns the closure.
 export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () => number): Plan {
   const [cmd, a, b] = pos;
-  const key = cmd === "people" || cmd === "tags" ? cmd : cmd === "tasks" ? "list" : a === "sub" ? (b ? `sub ${b}` : "sub") : (a ?? "");
-  const spec = SPECS[key];
-  if (!spec || (key === "people" || key === "tags") !== (cmd === "people" || cmd === "tags")) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
+  const isSub = cmd === "task" && a === "sub";
+  const key = cmd === "people" || cmd === "tags" ? cmd : cmd === "tasks" ? "list" : isSub ? (b ? `sub ${b}` : "sub") : (a ?? "");
+  // hasOwn: a plain lookup would find Object.prototype keys (constructor, __proto__, ...).
+  // A lone positional with a space ("sub add") must not reach a two-word spec; "people"/"tags" are not task subcommands.
+  const spec = Object.hasOwn(SPECS, key) && (isSub || !key.includes(" ")) && !(cmd === "task" && (key === "people" || key === "tags")) ? SPECS[key] : undefined;
+  if (!spec) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
   const n = cmd === "tasks" ? 1 : spec.n;
   for (const [k, x] of Object.entries(v)) {
     if (x === undefined || GLOBAL.includes(k)) continue;
     if (!spec.flags.includes(k)) throw usage(`unknown option '--${k}' for ${cmd === "task" ? "task " + key : cmd}`);
-    if (STRINGS.includes(k) && typeof x !== "string") throw usage(`--${k} needs a value`);
   }
   if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`);
   if (v.mine && v.who !== undefined) throw usage("give only one of --mine / --who");
   if (v.open && v.done) throw usage("give only one of --open / --done");
   if (v.tags === true) throw usage("--tags is only valid as --no-tags");
-  const c: Ctx = { pos, v, io, json, now };
-  if (key === "people") return people(c);
-  if (key === "tags") return tags(c);
-  if (key === "list") return list(c);
-  if (key === "get") return get(c);
-  if (!spec.build) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
-  return spec.build(c);
+  return spec.build({ pos, v, io, json, now });
 }
 
-// ---- shared helpers (wave 3 reuses these)
-export const weekQuery = (c: Ctx) => (typeof c.v.week === "string" ? `?week=${enc(c.v.week)}` : "");
-export const tasksPath = async (c: Ctx, org: () => Promise<string>, rest = "") => `/orgs/${enc(await org())}/tasks${rest}${weekQuery(c)}`;
+// ---- shared helpers
+const weekQuery = (c: Ctx) => (typeof c.v.week === "string" ? `?week=${enc(c.v.week)}` : "");
+const tasksPath = async (c: Ctx, org: () => Promise<string>, rest = "") => `/orgs/${enc(await org())}/tasks${rest}${weekQuery(c)}`;
 const dash = (x: unknown) => (x === null || x === undefined || x === "" || (Array.isArray(x) && !x.length) ? "-" : clean(Array.isArray(x) ? x.join(",") : x));
 const aid = (x: any) => (x?.assignee?.id == null ? "-" : clean(x.assignee.id));
-export const who = (a: any): string | null => (a ? (a.name == null ? `${clean(a.id)} (unknown)` : `${clean(a.name)}${a.kind ? ` (${clean(a.kind)})` : ""}`) : null);
+const who = (a: any): string | null => (a ? (a.name == null ? `${clean(a.id)} (unknown)` : `${clean(a.name)}${a.kind ? ` (${clean(a.kind)})` : ""}`) : null);
 
 // Piped item form: fixed lines, null/""/[] print "-", every server string cleaned.
-export function detail(t: any): string {
+function detail(t: any): string {
   return [
     `id: ${dash(t.id)}`, `text: ${dash(t.text)}`, `description: ${dash(t.description)}`, `section: ${dash(t.section)}`,
     `order: ${dash(t.order)}`, `done: ${t.done === true}`, `done_at: ${dash(t.done_at)}`, `assignee: ${aid(t)}`,
@@ -157,7 +147,7 @@ export function detail(t: any): string {
   ].join("\n");
 }
 
-export function block(t: any, now: number): string {
+function block(t: any, now: number): string {
   const pairs: [string, string | null][] = [
     ["id", clean(t.id)], ["text", clean(t.text)], ["section", clean(t.section)],
     ["status", t.done ? `done, ${when(t.done_at, now)}` : "open"], ["assignee", who(t.assignee)],

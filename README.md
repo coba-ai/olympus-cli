@@ -54,7 +54,7 @@ Tasks: any member, teammate included, can read and write them. Every `task` subc
 `--week DATE`: any date works, the server normalises it to that week's Monday, and the default is the
 current week. `--star` / `task star` marks the one thing; `task today` flags a task for today. `--assign`
 and `--who` take `me`, a person id (`olympus people`) or a member's email; `--assign` is resolved by the
-server, so a name that matches nobody (or a paused agent) is exit 6. `task delete` and `task sub delete`
+server, so a value that matches nobody (or a paused agent) is exit 6. `task delete` and `task sub delete`
 never prompt and require `--yes`. `--tag` replaces a task's tags, `--no-tags` clears them, and
 `--add-tag` / `--remove-tag` edit them without replacing (they cannot be combined with `--tag` or
 `--no-tags`); edits made this way by two people at once never drop each other's tags.

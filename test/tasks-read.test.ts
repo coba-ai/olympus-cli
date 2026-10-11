@@ -107,6 +107,8 @@ test("AC11 usage errors send no request, even with no token", async () => {
     ["task", "update", "x", "--add-tag", "a", "--tag", "b"], ["task", "add"], ["task", "sub", "add", "t"],
     ["webhook", "list", "--week", "x"], ["webhook", "list", "--week", "x", "--help"], ["whoami", "--mine"], ["login", "--tag", "a"],
     ["tasks", "--help-me"],
+    ["task", "constructor", "--week", "x"], ["task", "__proto__", "--yes"], ["task", "hasOwnProperty", "--open"], ["task", "toString"],
+    ["task", "sub add", "tback001", "x", "y"],
   ];
   for (const a of bads) {
     const r = await cli(a, { env: {} });
@@ -151,6 +153,25 @@ test("AC13 task get: piped golden, tty block, 404 without credentials hint", asy
   fake.state.requests.length = 0;
   const h = await run2(["people"]);
   expect(h.code).toBe(0);
+});
+
+test("stored-org 404 keeps the credentials.json hint on people, tasks and tags", async () => {
+  const home = await mkdtemp(join(tmpdir(), "oly-"));
+  await Bun.write(join(home, ".config/olympus/credentials.json"), JSON.stringify({ host: fake.url, token: TOKENS.owner, org: "zzz" }));
+  for (const a of [["people"], ["tasks"], ["tags"]]) {
+    let err = "";
+    const code = await run(a, { env: { OLYMPUS_HOST: fake.url }, home, stdin: async () => "", out: () => {}, err: (s) => { err += s; }, now: () => NOW });
+    expect([a[0], code, err.includes('org "zzz" from credentials.json')]).toEqual([a[0], 3, true]);
+  }
+});
+
+test("Retry-After text is cleaned on stderr and is not JSON", async () => {
+  fake.state.next = { status: 503, body: { error: { code: "unavailable" } }, headers: { "Retry-After": "a\x9b31m" } };
+  const r = await run1(["task", "done", "tback001"]);
+  expect(r.code).not.toBe(0);
+  expect(r.err).toContain("retry after");
+  noCtl(r.err);
+  expect(() => JSON.parse(r.err)).toThrow();
 });
 
 test("AC14 hostile server strings never reach stdout, piped or tty", async () => {

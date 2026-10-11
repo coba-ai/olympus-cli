@@ -4,7 +4,7 @@ import {
   CliError, DEFAULT_HOST, api, defaultOrg, envKey, deleteCreds, deviceLogin, fail, loginWithToken, print, readCreds,
   resolveHost, resolveOrg, resolveToken, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
 } from "./core";
-import { taskPlan } from "./tasks";
+import { TASK_FLAGS, taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
 
 const USAGE = `usage: olympus <command> [flags]
@@ -36,7 +36,6 @@ const OPTIONS = {
   "add-tag": { type: "string", multiple: true }, "remove-tag": { type: "string", multiple: true },
 } as const;
 // Flags that belong to the people/tasks/task family; any other command rejects them.
-const TASK_FLAGS = ["week", "who", "desc", "assign", "text", "section", "tag", "mine", "open", "done", "today", "backlog", "star", "unassign", "off", "undo", "tags", "add-tag", "remove-tag"];
 
 const enc = encodeURIComponent;
 const SOURCE: Record<OrgSource, string> = {

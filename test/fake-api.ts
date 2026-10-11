@@ -276,10 +276,9 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         const row = store[week];
         const tid = seg[5], isSub = seg[6] === "subtasks", sid = seg[7];
         const m = req.method;
-        const view = (t: Item) => t;
         if (!tid) {
           if (m === "GET")
-            return tsend(200, { data: { week, current, version: row?.version ?? 0, me: me.id, tasks: (row?.tasks ?? []).map(view) } });
+            return tsend(200, { data: { week, current, version: row?.version ?? 0, me: me.id, tasks: (row?.tasks ?? []) } });
           if (m !== "POST") return terr(404, "not_found", NOT_FOUND);
           const b = isObj(body) ? body : {};
           const r = fields(b, true);
@@ -316,7 +315,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
           const r = subFields(isObj(body) ? body : {}, true);
           if (r.f) return bad(r.f);
           t.subtasks.push({ id: rid("s"), text: "", done: false, done_at: null, assignee: null, today: false, order: t.subtasks.length });
-          applySub(t.subtasks[t.subtasks.length - 1], r.set!);
+          apply(t.subtasks[t.subtasks.length - 1], r.set!);
           row!.version++;
           return tsend(201, { data: t });
         }
@@ -330,7 +329,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         if (m !== "PATCH") return terr(404, "not_found", NOT_FOUND);
         const r = subFields(isObj(body) ? body : {}, false);
         if (r.f) return bad(r.f);
-        applySub(s, r.set!);
+        apply(s, r.set!);
         row!.version++;
         return tsend(200, { data: t });
 
@@ -413,9 +412,6 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
             x.done_at = done ? x.done_at ?? nowIso() : null;
             x.done = done;
           }
-        }
-        function applySub(x: Item, set: Item) {
-          apply(x, set);
         }
       }
 

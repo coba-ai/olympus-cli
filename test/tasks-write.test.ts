@@ -171,7 +171,7 @@ test("AC21 item output: piped detail, TTY sentence + block, json body", async ()
 });
 
 test("AC21 server strings are cleaned in every write output", async () => {
-  fake.state.tasks.acme![fake.state.today && "2026-10-05"]!.tasks[3]!.text = EVIL;
+  fake.state.tasks.acme!["2026-10-05"]!.tasks[3]!.text = EVIL;
   for (const tty of [false, true]) {
     for (const a of [["done", "tback001"], ["update", "tback001", "--desc", EVIL], ["sub", "add", "tback001", EVIL]]) {
       const r = await run1(["task", ...a], tty);

@@ -337,7 +337,7 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   const err: any = e.body?.error;
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
   let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
-  if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : e.retryAfter})`;
+  if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;
   const fields = err?.details?.fields;
