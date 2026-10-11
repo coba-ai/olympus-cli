@@ -2,6 +2,7 @@
 
 `olympus` — the command-line client for the [Olympus](https://tryolympus.ai) API, built for agents first
 (`--json`, stable exit codes, `OLYMPUS_API_KEY`) and humans second. API reference: [`docs/API.md`](docs/API.md).
+Agents: [`llms.txt`](llms.txt) is a compact install-and-use guide written for LLM agents.
 
 ## Install
 
