@@ -1,4 +1,4 @@
-import { CliError, print, usage, type Api, type Io } from "./core";
+import { CliError, print, seg, usage, type Api, type Io } from "./core";
 import { clean, keyValue, table, when } from "./format";
 
 const enc = encodeURIComponent;
@@ -16,7 +16,7 @@ const tagList = (c: Ctx, k: string) => (c.v[k] as string[] | undefined) ?? [];
 
 function patch(c: Ctx, body: Record<string, unknown>, sentence: (id: string) => string): Plan {
   const id = c.pos[2]!;
-  return async (call, org) => item(c, await call("PATCH", await tasksPath(c, org, `/${enc(id)}`), body), sentence(clean(id)));
+  return async (call, org) => item(c, await call("PATCH", await tasksPath(c, org, `/${seg(id)}`), body), sentence(clean(id)));
 }
 
 function add(c: Ctx): Plan {
@@ -59,13 +59,13 @@ function del(c: Ctx): Plan {
   need(c, "task delete");
   const id = c.pos[2]!;
   return async (call, org) => {
-    await call("DELETE", await tasksPath(c, org, `/${enc(id)}`));
+    await call("DELETE", await tasksPath(c, org, `/${seg(id)}`));
     print(c.io, c.json, { data: { id, deleted: true } }, () => `deleted ${clean(id)}`, () => `Deleted task ${clean(id)}.`);
   };
 }
 
 const subPath = (c: Ctx, org: () => Promise<string>, sid?: string) =>
-  tasksPath(c, org, `/${enc(c.pos[3]!)}/subtasks${sid === undefined ? "" : `/${enc(sid)}`}`);
+  tasksPath(c, org, `/${seg(c.pos[3]!)}/subtasks${sid === undefined ? "" : `/${seg(sid)}`}`);
 
 function subAdd(c: Ctx): Plan {
   const body: Record<string, unknown> = { text: c.pos[4] };
@@ -108,6 +108,12 @@ const SPECS: Record<string, Spec> = {
 // Every task flag except --yes, which other commands (webhook delete) also take; cli.ts rejects these on other commands.
 export const TASK_FLAGS = [...new Set(Object.values(SPECS).flatMap((s) => s.flags))].filter((k) => k !== "yes");
 
+// Positionals that become path segments, by spec key.
+const ID_POS: Record<string, number[]> = {
+  get: [2], update: [2], done: [2], undone: [2], today: [2], star: [2], delete: [2],
+  "sub add": [3], "sub done": [3, 4], "sub delete": [3, 4],
+};
+
 // Validates everything synchronously (so usage errors exit 1 before credentials are read), then returns the closure.
 export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () => number): Plan {
   const [cmd, a, b] = pos;
@@ -123,6 +129,7 @@ export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () 
     if (!spec.flags.includes(k)) throw usage(`unknown option '--${k}' for ${cmd === "task" ? "task " + key : cmd}`);
   }
   if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`);
+  for (const i of ID_POS[key] ?? []) seg(pos[i]!);
   if (v.mine && v.who !== undefined) throw usage("give only one of --mine / --who");
   if (v.open && v.done) throw usage("give only one of --open / --done");
   if (v.tags === true) throw usage("--tags is only valid as --no-tags");
@@ -131,7 +138,7 @@ export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () 
 
 // ---- shared helpers
 const weekQuery = (c: Ctx) => (typeof c.v.week === "string" ? `?week=${enc(c.v.week)}` : "");
-const tasksPath = async (c: Ctx, org: () => Promise<string>, rest = "") => `/orgs/${enc(await org())}/tasks${rest}${weekQuery(c)}`;
+const tasksPath = async (c: Ctx, org: () => Promise<string>, rest = "") => `/orgs/${seg(await org())}/tasks${rest}${weekQuery(c)}`;
 const dash = (x: unknown) => (x === null || x === undefined || x === "" || (Array.isArray(x) && !x.length) ? "-" : clean(Array.isArray(x) ? x.join(",") : x));
 const aid = (x: any) => (x?.assignee?.id == null ? "-" : clean(x.assignee.id));
 const who = (a: any): string | null => (a ? (a.name == null ? `${clean(a.id)} (unknown)` : `${clean(a.name)}${a.kind ? ` (${clean(a.kind)})` : ""}`) : null);
@@ -166,7 +173,7 @@ function block(t: any, now: number): string {
 // ---- read commands
 function people(c: Ctx): Plan {
   return async (call, org) => {
-    const b = await call("GET", `/orgs/${enc(await org())}/people`);
+    const b = await call("GET", `/orgs/${seg(await org())}/people`);
     const rows: any[] = b.data;
     const status = (p: any) => (p.me ? "me" : p.paused ? "paused" : "-");
     print(c.io, c.json, b, () => rows.map((p) => [dash(p.id), dash(p.kind), dash(p.name), dash(p.email), status(p)].join("\t")).join("\n"),
@@ -178,7 +185,7 @@ function people(c: Ctx): Plan {
 function tags(c: Ctx): Plan {
   return async (call, org) => {
     const slug = await org();
-    const b = await call("GET", `/orgs/${enc(slug)}/tags`);
+    const b = await call("GET", `/orgs/${seg(slug)}/tags`);
     const rows: unknown[] = b.data;
     print(c.io, c.json, b, () => rows.map((x) => clean(x)).join("\n"),
       () => (rows.length ? rows.map((x) => clean(x)).join("\n") : `No tags in ${clean(slug)} yet.`));
@@ -226,7 +233,7 @@ function list(c: Ctx): Plan {
 // me -> data.me; otherwise /people by exact id or email, else an assignee id already in this list (revoked members).
 async function resolveWho(call: Api, org: () => Promise<string>, d: any, w: string): Promise<string> {
   if (w === "me") return d.me;
-  const ps: any[] = (await call("GET", `/orgs/${enc(await org())}/people`)).data;
+  const ps: any[] = (await call("GET", `/orgs/${seg(await org())}/people`)).data;
   const p = ps.find((x) => x.id === w || (typeof x.email === "string" && x.email.toLowerCase() === w.toLowerCase()));
   if (p) return p.id;
   const ids = new Set<string>();
@@ -237,7 +244,7 @@ async function resolveWho(call: Api, org: () => Promise<string>, d: any, w: stri
 
 function get(c: Ctx): Plan {
   return async (call, org) => {
-    const b = await call("GET", await tasksPath(c, org, `/${enc(c.pos[2]!)}`));
+    const b = await call("GET", await tasksPath(c, org, `/${seg(c.pos[2]!)}`));
     print(c.io, c.json, b, () => detail(b.data), () => block(b.data, c.now()));
   };
 }

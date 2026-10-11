@@ -98,6 +98,18 @@ test("AC18 toggle bodies", async () => {
   expect(last().search).toBe("?week=2026-10-05");
 });
 
+test("dot-segment ids and --org .. are usage errors: no request, parent task untouched", async () => {
+  for (const extra of [[], ["--json"]]) {
+    const r = await run1(["task", "sub", "delete", "tback001", "..", "--yes", ...extra]);
+    expect(r.code).toBe(1);
+  }
+  const o = await cli(["task", "get", "tback001", "--org", ".."], { env: owner });
+  expect(o.code).toBe(1);
+  expect(reqs().filter((q) => q.path.includes("/tasks"))).toHaveLength(0);
+  expect(reqs()).toHaveLength(0);
+  expect(Object.values(fake.state.tasks.acme!).some((w) => w.tasks.some((t: any) => t.id === "tback001"))).toBe(true);
+});
+
 test("AC19 delete", async () => {
   const no = await run1(["task", "delete", "tback001"]);
   expect(no.code).toBe(1);

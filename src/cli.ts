@@ -2,7 +2,7 @@ import { parseArgs } from "node:util";
 import { homedir, hostname } from "node:os";
 import {
   CliError, DEFAULT_HOST, api, defaultOrg, envKey, deleteCreds, deviceLogin, fail, loginWithToken, print, readCreds,
-  resolveHost, resolveOrg, resolveToken, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
+  resolveHost, resolveOrg, resolveToken, seg, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
 } from "./core";
 import { TASK_FLAGS, taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
@@ -35,9 +35,6 @@ const OPTIONS = {
   undo: { type: "boolean" }, tags: { type: "boolean" },
   "add-tag": { type: "string", multiple: true }, "remove-tag": { type: "string", multiple: true },
 } as const;
-// Flags that belong to the people/tasks/task family; any other command rejects them.
-
-const enc = encodeURIComponent;
 const SOURCE: Record<OrgSource, string> = {
   flag: "--org", env: "OLYMPUS_ORG", pin: "token pin", stored: "saved by olympus org use", only: "only membership",
 };
@@ -180,7 +177,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       want(2);
       plan = async (call, org) => {
         const slug = await org();
-        const body = await call("GET", `/orgs/${enc(slug)}/agents`);
+        const body = await call("GET", `/orgs/${seg(slug)}/agents`);
         print(io, json, body, () => body.data.map((a: any) => `${a.profile_name}\t${a.name}\t${a.paused ? "paused" : "active"}`).join("\n"), () => {
           const rows: any[] = body.data;
           if (!rows.length) return `No agents in ${clean(slug)} yet. Agents are created in the Olympus app.`;
@@ -196,7 +193,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
         });
       };
     } else if (cmd === "webhook") {
-      const wh = async (org: () => Promise<string>, id?: string) => `/orgs/${enc(await org())}/webhooks${id ? `/${enc(id)}` : ""}`;
+      const wh = async (org: () => Promise<string>, id?: string) => `/orgs/${seg(await org())}/webhooks${id === undefined ? "" : `/${seg(id)}`}`;
       const row = (w: any) => `${w.id}\t${w.name}\t${w.agent}\t${w.full_tools ? "full-tools" : "-"}\t${w.last_delivery_status ?? "-"}`;
       const rich = (w: any) => webhookBlock(w, now());
       const detail = (w: any) => Object.entries(w).map(([k, x]) => `${k}: ${x}`).join("\n");
@@ -218,6 +215,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
         };
       } else if (sub === "get") {
         want(3);
+        seg(arg!);
         plan = async (call, org) => { const b = await call("GET", await wh(org, arg)); print(io, json, b, () => detail(b.data), () => rich(b.data)); };
       } else if (sub === "create") {
         want(2);
@@ -232,6 +230,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
         };
       } else if (sub === "update") {
         want(3);
+        seg(arg!);
         const instructions = await instr();
         const body = {
           ...(v.name !== undefined && { name: v.name }), ...(v.agent !== undefined && { agent: v.agent }),
@@ -241,6 +240,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
         plan = async (call, org) => { const b = await call("PATCH", await wh(org, arg), body); print(io, json, b, () => detail(b.data), () => `Updated webhook ${clean(arg)}.\n\n${rich(b.data)}`); };
       } else if (sub === "delete") {
         want(3);
+        seg(arg!);
         if (!v.yes) throw usage("webhook delete needs --yes");
         plan = async (call, org) => {
           await call("DELETE", await wh(org, arg));

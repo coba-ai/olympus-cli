@@ -109,6 +109,13 @@ test("AC11 usage errors send no request, even with no token", async () => {
     ["tasks", "--help-me"],
     ["task", "constructor", "--week", "x"], ["task", "__proto__", "--yes"], ["task", "hasOwnProperty", "--open"], ["task", "toString"],
     ["task", "sub add", "tback001", "x", "y"],
+    ...[".", "..", ""].flatMap((id) => [
+      ["task", "get", id], ["task", "update", id, "--text", "n"], ["task", "done", id], ["task", "undone", id],
+      ["task", "today", id], ["task", "star", id], ["task", "delete", id, "--yes"],
+      ["task", "sub", "add", id, "text"], ["task", "sub", "done", id, "s1"], ["task", "sub", "done", "t1", id],
+      ["task", "sub", "delete", id, "s1", "--yes"], ["task", "sub", "delete", "t1", id, "--yes"],
+      ["webhook", "get", id], ["webhook", "update", id, "--name", "n"], ["webhook", "delete", id, "--yes"],
+    ]),
   ];
   for (const a of bads) {
     const r = await cli(a, { env: {} });
@@ -168,7 +175,7 @@ test("stored-org 404 keeps the credentials.json hint on people, tasks and tags",
 test("Retry-After text is cleaned on stderr and is not JSON", async () => {
   fake.state.next = { status: 503, body: { error: { code: "unavailable" } }, headers: { "Retry-After": "a\x9b31m" } };
   const r = await run1(["task", "done", "tback001"]);
-  expect(r.code).not.toBe(0);
+  expect(r.code).toBe(5);
   expect(r.err).toContain("retry after");
   noCtl(r.err);
   expect(() => JSON.parse(r.err)).toThrow();

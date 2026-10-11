@@ -29,6 +29,9 @@ export class CliError extends Error {
   }
 }
 export const usage = (message: string) => new CliError(1, { error: { code: "usage", message } });
+// A user-supplied path segment. "", "." and ".." survive encodeURIComponent and fetch resolves them as dot segments
+// (also as %2e%2e), turning "delete subtask .." into "delete the parent task" — so they are rejected, not encoded.
+export const seg = (s: string) => { if (s === "" || s === "." || s === "..") throw usage(`invalid id: "${s}"`); return encodeURIComponent(s); };
 
 export const DEFAULT_HOST = "https://app.tryolympus.ai";
 export type Creds = { host?: string; token?: string; org?: string };
