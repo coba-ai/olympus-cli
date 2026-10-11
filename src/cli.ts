@@ -4,6 +4,7 @@ import {
   CliError, DEFAULT_HOST, api, defaultOrg, envKey, deleteCreds, deviceLogin, fail, loginWithToken, print, readCreds,
   resolveHost, resolveOrg, resolveToken, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
 } from "./core";
+import { taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
 
 const USAGE = `usage: olympus <command> [flags]
@@ -12,6 +13,9 @@ const USAGE = `usage: olympus <command> [flags]
   webhook list | get <id> | delete <id> --yes
   webhook create --name N --agent PROFILE (--instructions T | --instructions-file PATH|-) [--full-tools]
   webhook update <id> [--name N] [--agent P] [--instructions T | --instructions-file PATH|-] [--[no-]full-tools]
+  people | tasks [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today]   (alias: task list)
+  task get <id> | add TEXT | update <id> | done <id> | undone <id> | today <id> | star <id> | delete <id> --yes
+  task sub add <id> TEXT | sub done <id> <sid> | sub delete <id> <sid> --yes   (all accept --week D)
 global flags: --json --host URL --org SLUG -h
 env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG
 exit: 0 ok, 1 usage, 2 auth, 3 not found, 4 forbidden, 5 server/network, 6 invalid, 130 cancelled
@@ -22,7 +26,14 @@ const OPTIONS = {
   help: { type: "boolean", short: "h" }, yes: { type: "boolean" }, name: { type: "string" },
   agent: { type: "string" }, instructions: { type: "string" }, "instructions-file": { type: "string" },
   "full-tools": { type: "boolean" }, "with-token": { type: "boolean" }, browser: { type: "boolean" },
+  week: { type: "string" }, who: { type: "string" }, desc: { type: "string" }, assign: { type: "string" },
+  text: { type: "string" }, section: { type: "string" }, tag: { type: "string", multiple: true },
+  mine: { type: "boolean" }, open: { type: "boolean" }, done: { type: "boolean" }, today: { type: "boolean" },
+  backlog: { type: "boolean" }, star: { type: "boolean" }, unassign: { type: "boolean" }, off: { type: "boolean" },
+  undo: { type: "boolean" }, tags: { type: "boolean" },
 } as const;
+// Flags that belong to the people/tasks/task family; any other command rejects them.
+const TASK_FLAGS = ["week", "who", "desc", "assign", "text", "section", "tag", "mine", "open", "done", "today", "backlog", "star", "unassign", "off", "undo", "tags"];
 
 const enc = encodeURIComponent;
 const SOURCE: Record<OrgSource, string> = {
@@ -61,10 +72,14 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     }
     const { values: v, positionals: pos } = parsed;
     json = !!v.json;
+    if (!["people", "tasks", "task"].includes(parsed.positionals[0] ?? "")) {
+      const f = TASK_FLAGS.find((k) => (v as Record<string, unknown>)[k] !== undefined);
+      if (f) throw usage(`unknown option '--${f}'`);
+    }
     if (v.help) { io.out(USAGE); return 0; }
     if (!pos.length) { io.err(USAGE); return 1; }
     const [cmd, sub, arg] = pos;
-    byId = cmd === "webhook" && arg !== undefined;
+    byId = (cmd === "webhook" && arg !== undefined) || (cmd === "task" && pos.length >= 3 && sub !== "list" && sub !== "add");
     const want = (n: number) => { if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`); };
     const now = () => (io.now ?? Date.now)();
     const warnEnv = () => { if (envKey(io)) io.err("warning: OLYMPUS_API_KEY is set and overrides stored credentials\n"); };
@@ -230,6 +245,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
           print(io, json, { data: { id: arg, deleted: true } }, () => `deleted ${arg}`, () => `Deleted webhook ${clean(arg)}.`);
         };
       } else throw usage(`unknown webhook command: ${sub ?? ""}`);
+    } else if (cmd === "people" || cmd === "tasks" || cmd === "task") {
+      plan = taskPlan(pos, v, io, json, now);
     } else throw usage(`unknown command: ${pos.join(" ")}`);
 
     // An env key makes a malformed file irrelevant, except to `org use`, which would overwrite what it cannot read.

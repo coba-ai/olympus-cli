@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { clean } from "./format";
 
 export type Io = {
   env: Record<string, string | undefined>;
@@ -335,13 +336,13 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   }
   const err: any = e.body?.error;
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
-  let line = msg ? `error: ${msg}` : `error: HTTP ${e.status ?? "error"}`;
+  let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
   if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : e.retryAfter})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;
   const fields = err?.details?.fields;
   if (fields && typeof fields === "object")
-    for (const [k, v] of Object.entries(fields)) line += `\n  ${k}: ${Array.isArray(v) ? v.join(", ") : String(v)}`;
+    for (const [k, v] of Object.entries(fields)) line += `\n  ${clean(k)}: ${clean(Array.isArray(v) ? v.join(", ") : String(v))}`;
   io.err(line + "\n");
   return e.exit;
 }
