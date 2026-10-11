@@ -178,6 +178,13 @@ describe("A5 status mapping", () => {
     expect([n.exit, n.body.error.code]).toEqual([5, "network_error"]);
     expect(JSON.stringify(n.body)).not.toContain(TOKENS.owner);
   });
+  test("per-call timeoutMs overrides the default", async () => {
+    fake.state.next = { status: 200, body: {}, delayMs: 300 };
+    const t = await thrown(api(fake.url, TOKENS.owner, 50)("GET", "/me"));
+    expect([t.exit, t.body.error.code]).toEqual([5, "network_error"]);
+    fake.state.next = { status: 200, body: {}, delayMs: 300 };
+    await expect(api(fake.url, TOKENS.owner, 50)("GET", "/me", undefined, 1000)).resolves.toBeDefined();
+  });
   test("request shape, 204 → null", async () => {
     const a = api(fake.url, TOKENS.owner);
     const made = await a("POST", "/orgs/acme/webhooks", { name: "n", agent: "hermes", instructions: "i" });

@@ -7,7 +7,7 @@ type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
 export type Plan = (call: Api, org: () => Promise<string>) => Promise<void>;
 
 // Flags every command accepts; the rest are per subcommand.
-const GLOBAL = ["json", "host", "org", "help"];
+export const GLOBAL = ["json", "host", "org", "help"];
 
 // ---- write commands: each build() throws its usage errors synchronously, before the closure exists.
 const item = (c: Ctx, b: any, sentence: string) => print(c.io, c.json, b, () => detail(b.data), () => `${sentence}\n\n${block(b.data, c.now())}`);
@@ -139,7 +139,7 @@ export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () 
 // ---- shared helpers
 const weekQuery = (c: Ctx) => (typeof c.v.week === "string" ? `?week=${enc(c.v.week)}` : "");
 const tasksPath = async (c: Ctx, org: () => Promise<string>, rest = "") => `/orgs/${seg(await org())}/tasks${rest}${weekQuery(c)}`;
-const dash = (x: unknown) => (x === null || x === undefined || x === "" || (Array.isArray(x) && !x.length) ? "-" : clean(Array.isArray(x) ? x.join(",") : x));
+export const dash = (x: unknown) => (x === null || x === undefined || x === "" || (Array.isArray(x) && !x.length) ? "-" : clean(Array.isArray(x) ? x.join(",") : x));
 const aid = (x: any) => (x?.assignee?.id == null ? "-" : clean(x.assignee.id));
 const who = (a: any): string | null => (a ? (a.name == null ? `${clean(a.id)} (unknown)` : `${clean(a.name)}${a.kind ? ` (${clean(a.kind)})` : ""}`) : null);
 

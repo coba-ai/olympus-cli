@@ -16,6 +16,8 @@ export type FakeState = {
   webhooks: Record<string, Webhook[]>;
   // org -> ISO Monday -> stored week; a week with no row is absent (reads answer version 0 without storing)
   tasks: TaskStore;
+  // org -> user id -> YYYY-MM-DD -> stored close of day; tests reset it
+  days: Record<string, Record<string, Record<string, { closed_at: string | null; score: number | null; entry: Item }>>>;
   // the server's "today" (UTC date, YYYY-MM-DD); tests pin it for goldens
   today: string;
   // overrides the clock behind done_at
@@ -54,7 +56,7 @@ const mondayOf = (day: string) => {
   return d.toISOString().slice(0, 10);
 };
 const validDay = (v: string) => { const t = Date.parse(`${v}T00:00:00Z`); return ISO_DAY.test(v) && !isNaN(t) && new Date(t).toISOString().slice(0, 10) === v; };
-const rid = (p: string) => p + Array.from(randomBytes(7), (b) => "0123456789abcdefghijklmnopqrstuvwxyz"[b % 36]).join("");
+const rid = (p: string, n = 7) => p + Array.from(randomBytes(n), (b) => "0123456789abcdefghijklmnopqrstuvwxyz"[b % 36]).join("");
 
 // Users present in an org: every WHO token with a role there (a pin to another org hides it). id = u_<WHO index + 1>.
 function usersOf(org: string) {
@@ -100,7 +102,7 @@ export function seedTasks(today: string): TaskStore {
 
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, today: new Date().toISOString().slice(0, 10) };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, today: new Date().toISOString().slice(0, 10) };
   state.tasks = seedTasks(state.today);
   const server = Bun.serve({
     port: 0,
@@ -166,7 +168,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         seg[0] === "api" && seg[1] === "v1" &&
         ((r === "me" && seg.length === 3) ||
           (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
-            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && seg[6] === "subtasks") || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)))));
+            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)))));
       if (!known) return notFound();
 
       const who = WHO[(req.headers.get("authorization") ?? "").replace(/^Bearer /, "")];
@@ -191,7 +193,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       const operator = who.roles[org!] === "operator";
       const forbidden = () => err(403, "forbidden", "You are not allowed to do that.");
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();
-      if (sub === "people" || sub === "tasks" || sub === "tags") return tasksRoute();
+      if (sub === "people" || sub === "tasks" || sub === "tags" || sub === "days") return tasksRoute();
       const list = state.webhooks[org!] ?? (state.webhooks[org!] = []);
       const strip = ({ instructions, ...rest }: Webhook) => rest;
 
@@ -265,6 +267,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         const me = people.find((p) => p.me)!;
 
         const q = u.searchParams;
+        if (sub === "days" && seg[5]) return dayOne(seg[5]);
         let week = mondayOf(state.today);
         if (q.has("week")) {
           const wk = q.get("week")!;
@@ -274,6 +277,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         const current = week === mondayOf(state.today);
         const store = (state.tasks[org!] ??= {});
         const row = store[week];
+        if (sub === "days") return req.method === "GET" ? dayList() : terr(404, "not_found", NOT_FOUND);
         const tid = seg[5], isSub = seg[6] === "subtasks", sid = seg[7];
         const m = req.method;
         if (!tid) {
@@ -296,6 +300,25 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         }
         const t = row?.tasks.find((x) => x.id === tid);
         if (!t) return terr(404, "not_found", NOT_FOUND);
+        const act = seg[6] === "delegate" || seg[6] === "breakdown" ? seg[6] : null;
+        if (act) {
+          if (m !== "POST") return terr(404, "not_found", NOT_FOUND);
+          const b = isObj(body) ? body : {};
+          const agent = typeof b.agent === "string" ? b.agent : "hermes";
+          row!.version++;
+          if (act === "delegate") {
+            t.delegated_to = agent;
+            t.delegated_at = nowIso();
+            const id = rid("w", 14);
+            return tsend(201, { data: { task: t, session: { id, title: null, agent, url: `${u.origin}/${org}/sessions/${id}` } } });
+          }
+          const added = ["First step", "Second step"].map((text) => {
+            const s = { id: rid("s"), text, done: false, done_at: null, assignee: null, today: false, order: t.subtasks.length };
+            t.subtasks.push(s);
+            return s;
+          });
+          return tsend(200, { data: { task: t, agent: AGENTS.find((a) => a.profile_name === agent)?.name ?? agent, added } });
+        }
         if (!isSub) {
           if (m === "GET") return tsend(200, { data: t });
           if (m === "DELETE") {
@@ -333,6 +356,46 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         row!.version++;
         return tsend(200, { data: t });
 
+        function dayView(day: string) {
+          const r = state.days[org!]?.[me.id]?.[day];
+          const e = r?.entry;
+          return {
+            day, closed: !!r?.closed_at, closed_at: r?.closed_at ?? null, score: r?.score ?? null,
+            entry: !r ? null : {
+              shipped: e!.shipped ?? "", blockers: e!.blockers ?? [], learnings: e!.learnings ?? [], reflection: e!.reflection ?? "",
+              summary: { tasks_created: 0, tasks_done: 0, one_thing_progress: 0, learnings: (e!.learnings ?? []).length, allocation: [] },
+              agent_note: null, week_close: false,
+            },
+          };
+        }
+        function dayList() {
+          let wk = mondayOf(state.today);
+          if (q.has("week")) {
+            if (!validDay(q.get("week")!)) return bad({ week: ["must be a date (YYYY-MM-DD)"] });
+            wk = mondayOf(q.get("week")!);
+          }
+          const days = [0, 1, 2, 3, 4].map((i) => {
+            const d = new Date(`${wk}T00:00:00Z`);
+            d.setUTCDate(d.getUTCDate() + i);
+            return dayView(d.toISOString().slice(0, 10));
+          });
+          return tsend(200, { data: { week: wk, days } });
+        }
+        function dayOne(day: string) {
+          const wd = validDay(day) ? new Date(`${day}T00:00:00Z`).getUTCDay() : 0;
+          if (wd < 1 || wd > 5) return bad({ day: ["must be a weekday (YYYY-MM-DD, Monday to Friday)"] });
+          if (req.method === "PUT") {
+            const b = isObj(body) ? body : {};
+            const mine = ((state.days[org!] ??= {})[me.id] ??= {});
+            const r = (mine[day] ??= { closed_at: null, score: null, entry: {} });
+            const items = (k: string, p: string) => (b[k] as string[]).map((text, i) => ({ id: `${p}${i + 1}`, text }));
+            for (const k of ["shipped", "reflection"]) if (k in b) r.entry[k] = b[k];
+            if (Array.isArray(b.blockers)) r.entry.blockers = items("blockers", "b");
+            if (Array.isArray(b.learnings)) r.entry.learnings = items("learnings", "l");
+            if (b.close !== false) r.closed_at = nowIso();
+          } else if (req.method !== "GET") return terr(404, "not_found", NOT_FOUND);
+          return tsend(200, { data: dayView(day) });
+        }
         function isObj(v: unknown): v is Record<string, any> {
           return typeof v === "object" && v !== null && !Array.isArray(v);
         }

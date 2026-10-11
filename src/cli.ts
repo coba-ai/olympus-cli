@@ -34,6 +34,8 @@ const OPTIONS = {
   backlog: { type: "boolean" }, star: { type: "boolean" }, unassign: { type: "boolean" }, off: { type: "boolean" },
   undo: { type: "boolean" }, tags: { type: "boolean" },
   "add-tag": { type: "string", multiple: true }, "remove-tag": { type: "string", multiple: true },
+  to: { type: "string" }, shipped: { type: "string" }, reflection: { type: "string" },
+  blocker: { type: "string", multiple: true }, learning: { type: "string", multiple: true }, draft: { type: "boolean" },
 } as const;
 const SOURCE: Record<OrgSource, string> = {
   flag: "--org", env: "OLYMPUS_ORG", pin: "token pin", stored: "saved by olympus org use", only: "only membership",
