@@ -12,6 +12,8 @@ export type Io = {
   now?: () => number;
   tty?: boolean;
   openBrowser?: (url: string) => void;
+  ask?: (prompt: string) => Promise<string | null>;
+  close?: () => void;
 };
 export type Exit = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 130;
 export type ApiErrorBody = { error: { code: string; message: string; details?: unknown } };
@@ -129,7 +131,7 @@ export type Me = {
   memberships: { org: { slug: string; name: string }; role: string }[];
   token: { name: string; last4: string; organization: { slug: string; name: string } | null };
 };
-export type Api = (method: "GET" | "POST" | "PATCH" | "DELETE", path: string, body?: unknown) => Promise<any>;
+export type Api = (method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown, timeoutMs?: number) => Promise<any>;
 
 export function exitForStatus(status: number): Exit {
   if (status === 401) return 2;
@@ -142,7 +144,8 @@ export function exitForStatus(status: number): Exit {
 const cancelled = () => new CliError(130, { error: { code: "cancelled", message: "login cancelled" } });
 
 export function api(host: string, token?: string, timeoutMs = 30_000, signal?: AbortSignal): Api {
-  return async (method, path, body) => {
+  return async (method, path, body, callTimeoutMs) => {
+    const ms = callTimeoutMs ?? timeoutMs;
     const url = `${host}/api/v1${path}`;
     const headers: Record<string, string> = { ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -154,7 +157,7 @@ export function api(host: string, token?: string, timeoutMs = 30_000, signal?: A
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         redirect: "manual",
-        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(ms), signal]) : AbortSignal.timeout(ms),
       });
       text = await res.text();
     } catch (e: any) {
