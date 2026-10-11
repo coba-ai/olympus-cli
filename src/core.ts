@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { clean } from "./format";
 
 export type Io = {
   env: Record<string, string | undefined>;
@@ -28,6 +29,9 @@ export class CliError extends Error {
   }
 }
 export const usage = (message: string) => new CliError(1, { error: { code: "usage", message } });
+// A user-supplied path segment. "", "." and ".." survive encodeURIComponent and fetch resolves them as dot segments
+// (also as %2e%2e), turning "delete subtask .." into "delete the parent task" — so they are rejected, not encoded.
+export const seg = (s: string) => { if (s === "" || s === "." || s === "..") throw usage(`invalid id: "${s}"`); return encodeURIComponent(s); };
 
 export const DEFAULT_HOST = "https://app.tryolympus.ai";
 export type Creds = { host?: string; token?: string; org?: string };
@@ -335,13 +339,13 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   }
   const err: any = e.body?.error;
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
-  let line = msg ? `error: ${msg}` : `error: HTTP ${e.status ?? "error"}`;
-  if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : e.retryAfter})`;
+  let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
+  if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;
   const fields = err?.details?.fields;
   if (fields && typeof fields === "object")
-    for (const [k, v] of Object.entries(fields)) line += `\n  ${k}: ${Array.isArray(v) ? v.join(", ") : String(v)}`;
+    for (const [k, v] of Object.entries(fields)) line += `\n  ${clean(k)}: ${clean(Array.isArray(v) ? v.join(", ") : String(v))}`;
   io.err(line + "\n");
   return e.exit;
 }

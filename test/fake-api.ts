@@ -8,10 +8,18 @@ export const TOKENS = {
 export const DEVICE_CODE = `dev_${randomBytes(16).toString("hex")}`;
 
 type Webhook = Record<string, any>;
+type Item = Record<string, any>;
+export type TaskStore = Record<string, Record<string, { version: number; tasks: Item[] }>>;
 export type FakeState = {
   next?: { status: number; body?: unknown; headers?: Record<string, string>; delayMs?: number };
-  requests: { method: string; path: string; auth: string | null; body: unknown }[];
+  requests: { method: string; path: string; search: string; auth: string | null; body: unknown }[];
   webhooks: Record<string, Webhook[]>;
+  // org -> ISO Monday -> stored week; a week with no row is absent (reads answer version 0 without storing)
+  tasks: TaskStore;
+  // the server's "today" (UTC date, YYYY-MM-DD); tests pin it for goldens
+  today: string;
+  // overrides the clock behind done_at
+  now?: () => number;
   // awaited after the request is logged, before `next` and routing (lets a test change the world mid-request)
   onRequest?: (r: { method: string; path: string }) => void | Promise<void>;
   // each poll shifts one script entry: "ok" -> token, "echo" -> 400 echoing device_code, empty -> pending, else 400 <code>
@@ -36,9 +44,64 @@ const WHO: Record<string, { email: string; roles: Record<string, string>; pin: s
   [TOKENS.pinnedGone]: { email: "gone@acme.test", roles: {}, pin: "acme" },
 };
 
+const PERSON_NAMES: Record<string, string> = {
+  [TOKENS.owner]: "Abe Owner", [TOKENS.teammate]: "Mia Mate", [TOKENS.pinned]: "Pat Pinned", [TOKENS.multi]: "Max Multi",
+};
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const mondayOf = (day: string) => {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+};
+const validDay = (v: string) => { const t = Date.parse(`${v}T00:00:00Z`); return ISO_DAY.test(v) && !isNaN(t) && new Date(t).toISOString().slice(0, 10) === v; };
+const rid = (p: string) => p + Array.from(randomBytes(7), (b) => "0123456789abcdefghijklmnopqrstuvwxyz"[b % 36]).join("");
+
+// Users present in an org: every WHO token with a role there (a pin to another org hides it). id = u_<WHO index + 1>.
+function usersOf(org: string) {
+  return Object.entries(WHO)
+    .map(([t, w], i) => ({ t, w, id: `u_${i + 1}` }))
+    .filter(({ w }) => w.roles[org] && (!w.pin || w.pin === org))
+    .map(({ t, w, id }) => ({ t, id, name: PERSON_NAMES[t]!, email: w.email }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+const ref = (p: { id: string; name: string; kind: string }) => ({ id: p.id, name: p.name, kind: p.kind });
+
+export function seedTasks(today: string): TaskStore {
+  const owner = { id: "u_1", name: PERSON_NAMES[TOKENS.owner]!, kind: "user" };
+  const mate = { id: "u_2", name: PERSON_NAMES[TOKENS.teammate]!, kind: "user" };
+  let order = 0;
+  const item = (id: string, text: string, o: Item = {}): Item => ({
+    id, text, description: "", section: "the_rest", order: order++, done: false, done_at: null, assignee: null, tags: [],
+    today: false, one_thing: false, added_on: today, delegated_to: null, delegated_at: null, subtasks: [], ...o,
+  });
+  const sub = (id: string, text: string, i: number, o: Item = {}): Item => ({
+    id, text, done: false, done_at: null, assignee: null, today: false, order: i, ...o,
+  });
+  return {
+    acme: {
+      [mondayOf(today)]: {
+        version: 1,
+        tasks: [
+          item("tstar001", "Star task", { assignee: owner, one_thing: true }),
+          item("trest001", "Ship the pricing page", {
+            assignee: mate, tags: ["pricing", "web"], description: "Line one",
+            subtasks: [sub("s0000001", "Draft copy", 0, { assignee: owner, today: true }), sub("s0000002", "Review", 1)],
+          }),
+          item("tdone001", "Finished task", { done: true, done_at: `${today}T08:00:00.000Z`, assignee: owner }),
+          item("tback001", "Backlog task", { section: "backlog" }),
+          item("tunk0001", "Orphaned assignee", { assignee: { id: "u_9", name: null, kind: null } }),
+          item("tlegacy1", "Legacy one thing", { section: "one_thing", one_thing: true }),
+        ],
+      },
+    },
+    beta: {},
+  };
+}
+
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] } };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, today: new Date().toISOString().slice(0, 10) };
+  state.tasks = seedTasks(state.today);
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -52,7 +115,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         body = text;
         malformed = true;
       }
-      state.requests.push({ method: req.method, path: u.pathname, auth: req.headers.get("authorization"), body });
+      state.requests.push({ method: req.method, path: u.pathname, search: u.search, auth: req.headers.get("authorization"), body });
       await state.onRequest?.({ method: req.method, path: u.pathname });
       const send = (status: number, b?: unknown, headers: Record<string, string> = {}) =>
         status === 204
@@ -102,7 +165,8 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       const known =
         seg[0] === "api" && seg[1] === "v1" &&
         ((r === "me" && seg.length === 3) ||
-          (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)))));
+          (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
+            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && seg[6] === "subtasks") || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)))));
       if (!known) return notFound();
 
       const who = WHO[(req.headers.get("authorization") ?? "").replace(/^Bearer /, "")];
@@ -127,6 +191,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       const operator = who.roles[org!] === "operator";
       const forbidden = () => err(403, "forbidden", "You are not allowed to do that.");
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();
+      if (sub === "people" || sub === "tasks" || sub === "tags") return tasksRoute();
       const list = state.webhooks[org!] ?? (state.webhooks[org!] = []);
       const strip = ({ instructions, ...rest }: Webhook) => rest;
 
@@ -175,6 +240,180 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         return send(200, { data: strip(w) });
       }
       return notFound();
+
+      // people + tasks: only what a CLI can observe. No board sort, today cap, per-person one_thing rule or tag normalisation.
+      function tasksRoute() {
+        const nsHdr = { "Cache-Control": "no-store" };
+        const tsend = (status: number, b?: unknown) => send(status, b, nsHdr);
+        const terr = (status: number, code: string, message: string, details?: unknown) => err(status, code, message, details, nsHdr);
+        const bad = (fields: Record<string, string[]>) => terr(422, "invalid", "Validation failed.", { fields });
+        const token = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+        const people = [
+          ...usersOf(org!).map((p) => ({ id: p.id, name: p.name, kind: "user", email: p.email, me: p.t === token })),
+          ...[...AGENTS].sort((a, b) => Number(b.primary) - Number(a.primary))
+            .map((a) => ({ id: a.profile_name, name: a.name, kind: "agent", paused: a.paused, me: false })),
+        ];
+        if (sub === "people") return req.method === "GET" ? tsend(200, { data: people }) : terr(404, "not_found", NOT_FOUND);
+        if (sub === "tags") {
+          if (req.method !== "GET") return terr(404, "not_found", NOT_FOUND);
+          const counts = new Map<string, number>();
+          for (const wk of Object.values(state.tasks[org!] ?? {}))
+            for (const t of wk.tasks) for (const g of t.tags ?? []) counts.set(g, (counts.get(g) ?? 0) + 1);
+          // stable sort keeps first-seen order on ties
+          return tsend(200, { data: [...counts].sort((a, b) => b[1] - a[1]).slice(0, 50).map(([g]) => g) });
+        }
+        const me = people.find((p) => p.me)!;
+
+        const q = u.searchParams;
+        let week = mondayOf(state.today);
+        if (q.has("week")) {
+          const wk = q.get("week")!;
+          if (!validDay(wk)) return bad({ week: ["must be a date (YYYY-MM-DD)"] });
+          week = mondayOf(wk);
+        }
+        const current = week === mondayOf(state.today);
+        const store = (state.tasks[org!] ??= {});
+        const row = store[week];
+        const tid = seg[5], isSub = seg[6] === "subtasks", sid = seg[7];
+        const m = req.method;
+        if (!tid) {
+          if (m === "GET")
+            return tsend(200, { data: { week, current, version: row?.version ?? 0, me: me.id, tasks: (row?.tasks ?? []) } });
+          if (m !== "POST") return terr(404, "not_found", NOT_FOUND);
+          const b = isObj(body) ? body : {};
+          const r = fields(b, true);
+          if (r.f) return bad(r.f);
+          const wr = (store[week] ??= { version: 0, tasks: [] });
+          const t: Item = {
+            id: rid("t"), text: "", description: "", section: "the_rest", order: wr.tasks.length, done: false, done_at: null,
+            assignee: null, tags: [], today: false, one_thing: false, added_on: state.today, delegated_to: null, delegated_at: null,
+            subtasks: [],
+          };
+          apply(t, r.set!);
+          wr.tasks.push(t);
+          wr.version++;
+          return tsend(201, { data: t });
+        }
+        const t = row?.tasks.find((x) => x.id === tid);
+        if (!t) return terr(404, "not_found", NOT_FOUND);
+        if (!isSub) {
+          if (m === "GET") return tsend(200, { data: t });
+          if (m === "DELETE") {
+            row!.tasks.splice(row!.tasks.indexOf(t), 1);
+            row!.version++;
+            return tsend(204);
+          }
+          if (m !== "PATCH") return terr(404, "not_found", NOT_FOUND);
+          const r = fields(isObj(body) ? body : {}, false, t);
+          if (r.f) return bad(r.f);
+          apply(t, r.set!);
+          row!.version++;
+          return tsend(200, { data: t });
+        }
+        if (!sid) {
+          if (m !== "POST") return terr(404, "not_found", NOT_FOUND);
+          const r = subFields(isObj(body) ? body : {}, true);
+          if (r.f) return bad(r.f);
+          t.subtasks.push({ id: rid("s"), text: "", done: false, done_at: null, assignee: null, today: false, order: t.subtasks.length });
+          apply(t.subtasks[t.subtasks.length - 1], r.set!);
+          row!.version++;
+          return tsend(201, { data: t });
+        }
+        const s = t.subtasks.find((x: Item) => x.id === sid);
+        if (!s) return terr(404, "not_found", NOT_FOUND);
+        if (m === "DELETE") {
+          t.subtasks.splice(t.subtasks.indexOf(s), 1);
+          row!.version++;
+          return tsend(200, { data: t });
+        }
+        if (m !== "PATCH") return terr(404, "not_found", NOT_FOUND);
+        const r = subFields(isObj(body) ? body : {}, false);
+        if (r.f) return bad(r.f);
+        apply(s, r.set!);
+        row!.version++;
+        return tsend(200, { data: t });
+
+        function isObj(v: unknown): v is Record<string, any> {
+          return typeof v === "object" && v !== null && !Array.isArray(v);
+        }
+        function nowIso() {
+          return new Date(state.now?.() ?? Date.now()).toISOString();
+        }
+        // string -> {id,name,kind} | error message
+        function resolve(v: unknown): { ok: Item | null } | { err: string } {
+          if (v === null) return { ok: null };
+          if (typeof v !== "string") return { err: "must be a string" };
+          const key = v === "me" ? me.id : v;
+          const p = people.find((x) => x.id === key || ("email" in x && x.email.toLowerCase() === v.toLowerCase()));
+          if (!p) return { err: "must be a member or agent of this organization" };
+          if ("paused" in p && p.paused) return { err: "is paused" };
+          return { ok: ref(p) };
+        }
+        function flags(b: Record<string, any>, f: Record<string, string[]>, set: Item, keys: string[]) {
+          for (const k of keys) if (k in b && typeof b[k] !== "boolean") f[k] = ["must be true or false"];
+          if (b.today === true && !current) f.today = ["can only be set on the current week"];
+          for (const k of keys) if (!f[k] && k in b) set[k] = b[k];
+        }
+        function fields(b: Record<string, any>, create: boolean, cur?: Item) {
+          const f: Record<string, string[]> = {};
+          const set: Item = {};
+          for (const k of ["text", "description", "section"])
+            if (k in b && typeof b[k] !== "string") f[k] = ["must be a string"];
+          if (!f.text && (create || "text" in b) && !(b.text ?? "").trim()) f.text = ["can't be blank"];
+          if (!f.section && "section" in b && !["the_rest", "backlog"].includes(b.section)) f.section = ["must be the_rest or backlog"];
+          if ("tags" in b && !(Array.isArray(b.tags) && b.tags.every((x: unknown) => typeof x === "string"))) f.tags = ["must be an array of strings"];
+          for (const k of ["text", "description", "section", "tags"]) if (!f[k] && k in b) set[k] = b[k];
+          const strs = (k: string) => {
+            if (!(k in b)) return;
+            if (!(Array.isArray(b[k]) && b[k].every((x: unknown) => typeof x === "string"))) f[k] = ["must be an array of strings"];
+            else if ("tags" in b) f.tags = [`can't be combined with ${k}`];
+          };
+          strs("add_tags");
+          strs("remove_tags");
+          if (cur && !f.tags && !f.add_tags && !f.remove_tags && ("add_tags" in b || "remove_tags" in b)) {
+            const clean = (k: string) => (b[k] ?? []).map((x: string) => x.trim()).filter(Boolean);
+            const rm = clean("remove_tags");
+            const out = (cur.tags ?? []).filter((g: string) => !rm.includes(g));
+            for (const g of clean("add_tags")) if (!out.includes(g)) out.push(g);
+            set.tags = out;
+          }
+          let assignee = cur?.assignee ?? null;
+          if ("assignee" in b) {
+            const r = resolve(b.assignee);
+            if ("err" in r) f.assignee = [r.err];
+            else set.assignee = assignee = r.ok;
+          }
+          flags(b, f, set, ["done", "today", "one_thing"]);
+          if (b.one_thing === true && !f.one_thing) {
+            if (!current) f.one_thing = ["can only be set on the current week"];
+            else if (!assignee && !f.assignee) f.one_thing = ["needs an assignee"];
+          }
+          if (f.one_thing) delete set.one_thing;
+          return Object.keys(f).length ? { f } : { set };
+        }
+        function subFields(b: Record<string, any>, create: boolean) {
+          const f: Record<string, string[]> = {};
+          const set: Item = {};
+          if ("text" in b && typeof b.text !== "string") f.text = ["must be a string"];
+          else if ((create || "text" in b) && !(b.text ?? "").trim()) f.text = ["can't be blank"];
+          else if ("text" in b) set.text = b.text;
+          if ("assignee" in b) {
+            const r = resolve(b.assignee);
+            if ("err" in r) f.assignee = [r.err];
+            else set.assignee = r.ok;
+          }
+          flags(b, f, set, ["done", "today"]);
+          return Object.keys(f).length ? { f } : { set };
+        }
+        function apply(x: Item, set: Item) {
+          const { done, ...rest } = set;
+          Object.assign(x, rest);
+          if (done !== undefined) {
+            x.done_at = done ? x.done_at ?? nowIso() : null;
+            x.done = done;
+          }
+        }
+      }
 
       function invalid(fields: Record<string, string[]>) {
         return err(422, "invalid", "Validation failed.", { fields });
