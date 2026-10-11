@@ -13,8 +13,10 @@ const USAGE = `usage: olympus <command> [flags]
   webhook list | get <id> | delete <id> --yes
   webhook create --name N --agent PROFILE (--instructions T | --instructions-file PATH|-) [--full-tools]
   webhook update <id> [--name N] [--agent P] [--instructions T | --instructions-file PATH|-] [--[no-]full-tools]
-  people | tasks [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today]   (alias: task list)
+  people | tasks [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today] [--tag T]... [--backlog]   (alias: task list)
+  tags   (org tags, most used first)
   task get <id> | add TEXT | update <id> | done <id> | undone <id> | today <id> | star <id> | delete <id> --yes
+  task update <id> [--text T] [--desc T] [--assign W | --unassign] [--section S] [--tag T]... [--no-tags] [--add-tag T]... [--remove-tag T]...
   task sub add <id> TEXT | sub done <id> <sid> | sub delete <id> <sid> --yes   (all accept --week D)
 global flags: --json --host URL --org SLUG -h
 env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG
@@ -31,9 +33,10 @@ const OPTIONS = {
   mine: { type: "boolean" }, open: { type: "boolean" }, done: { type: "boolean" }, today: { type: "boolean" },
   backlog: { type: "boolean" }, star: { type: "boolean" }, unassign: { type: "boolean" }, off: { type: "boolean" },
   undo: { type: "boolean" }, tags: { type: "boolean" },
+  "add-tag": { type: "string", multiple: true }, "remove-tag": { type: "string", multiple: true },
 } as const;
 // Flags that belong to the people/tasks/task family; any other command rejects them.
-const TASK_FLAGS = ["week", "who", "desc", "assign", "text", "section", "tag", "mine", "open", "done", "today", "backlog", "star", "unassign", "off", "undo", "tags"];
+const TASK_FLAGS = ["week", "who", "desc", "assign", "text", "section", "tag", "mine", "open", "done", "today", "backlog", "star", "unassign", "off", "undo", "tags", "add-tag", "remove-tag"];
 
 const enc = encodeURIComponent;
 const SOURCE: Record<OrgSource, string> = {
@@ -72,7 +75,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     }
     const { values: v, positionals: pos } = parsed;
     json = !!v.json;
-    if (!["people", "tasks", "task"].includes(parsed.positionals[0] ?? "")) {
+    if (!["people", "tasks", "task", "tags"].includes(parsed.positionals[0] ?? "")) {
       const f = TASK_FLAGS.find((k) => (v as Record<string, unknown>)[k] !== undefined);
       if (f) throw usage(`unknown option '--${f}'`);
     }
@@ -245,7 +248,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
           print(io, json, { data: { id: arg, deleted: true } }, () => `deleted ${arg}`, () => `Deleted webhook ${clean(arg)}.`);
         };
       } else throw usage(`unknown webhook command: ${sub ?? ""}`);
-    } else if (cmd === "people" || cmd === "tasks" || cmd === "task") {
+    } else if (cmd === "people" || cmd === "tasks" || cmd === "task" || cmd === "tags") {
       plan = taskPlan(pos, v, io, json, now);
     } else throw usage(`unknown command: ${pos.join(" ")}`);
 

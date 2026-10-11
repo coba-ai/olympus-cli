@@ -100,7 +100,7 @@ test("AC10 filters", async () => {
 test("AC11 usage errors send no request, even with no token", async () => {
   const bads = [
     ["tasks", "--mine", "--who", "me"], ["tasks", "--open", "--done"], ["tasks", "extra"], ["people", "extra"], ["task", "get"],
-    ["task", "get", "a", "b"], ["people", "--week", "x"], ["task", "get", "x", "--mine"], ["task", "list", "--tag", "x"],
+    ["task", "get", "a", "b"], ["people", "--week", "x"], ["task", "get", "x", "--mine"], ["task", "list", "--star"],
     ["task", "get", "x", "--yes"], ["task", "update", "x", "--tags"], ["task"], ["task", "nope"], ["task", "sub"], ["task", "sub", "nope"],
     ["task", "people"], ["tasks", "--name", "n"], ["task", "add", "t"], ["task", "delete", "x", "--yes"], ["task", "sub", "add", "t", "x"],
     ["webhook", "list", "--week", "x"], ["webhook", "list", "--week", "x", "--help"], ["whoami", "--mine"], ["login", "--tag", "a"],
@@ -198,4 +198,32 @@ test("AC15 help lists the family; unknown --who/flag guard; token never printed"
     expect(r.code).not.toBe(0);
     expect(r.out + r.err).not.toContain(TOKENS.owner);
   }
+});
+
+test("tags command, --tag and --backlog filters", async () => {
+  expect((await run1(["tags"])).out).toBe("pricing\nweb\n");
+  expect(JSON.parse((await run1(["tags", "--json"])).out)).toEqual({ data: ["pricing", "web"] });
+  expect((await run1(["tags"], true)).out).toBe("pricing\nweb\n");
+  fake.state.tasks.acme!["2026-10-05"]!.tasks[0]!.tags = [EVIL];
+  noCtl((await run1(["tags"])).out);
+  fake.state.tasks = seedTasks(fake.state.today);
+  fake.state.tasks.acme!["2026-10-05"]!.tasks = [];
+  expect((await run1(["tags"], true)).out).toBe("No tags in acme yet.\n");
+  expect((await run1(["tags"])).out).toBe("");
+  expect((await cli(["tags", "--week", "x"], { env: {} })).code).toBe(1);
+  expect((await cli(["tags", "extra"], { env: {} })).code).toBe(1);
+  fake.state.tasks = seedTasks(fake.state.today);
+  const ids = async (a: string[]) => (await run1(a)).out.split("\n").filter((l) => /^t/.test(l)).map((l) => l.split("\t")[0]);
+  expect(await ids(["tasks", "--tag", "pricing"])).toEqual(["trest001"]);
+  expect(await ids(["tasks", "--tag", "pricing", "--tag", "web"])).toEqual(["trest001"]);
+  expect(await ids(["tasks", "--tag", "pricing", "--tag", "nope"])).toEqual([]);
+  expect(await ids(["tasks", "--tag", "Pricing"])).toEqual([]);
+  expect(await ids(["tasks", "--backlog"])).toEqual(["tback001"]);
+  expect(await ids(["tasks", "--backlog", "--tag", "pricing"])).toEqual([]);
+  expect(await ids(["tasks", "--tag", "web", "--open", "--who", "u_2"])).toEqual(["trest001"]);
+  const j = JSON.parse((await run1(["tasks", "--backlog", "--json"])).out);
+  expect(j.data.tasks.map((t: any) => t.id)).toEqual(["tback001"]);
+  expect((await cli(["task", "get", "x", "--tag", "a"], { env: {} })).code).toBe(1);
+  expect((await cli(["task", "update", "x", "--add-tag", "a", "--remove-tag", "b", "--week", "x", "--mine"], { env: {} })).code).toBe(1);
+  expect((await cli(["webhook", "list", "--add-tag", "a"], { env: {} })).code).toBe(1);
 });

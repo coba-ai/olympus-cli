@@ -9,17 +9,18 @@ export type Plan = (call: Api, org: () => Promise<string>) => Promise<void>;
 // Flags every command accepts; the rest are per subcommand.
 const GLOBAL = ["json", "host", "org", "help"];
 // Flags that take a value: a non-string here is a usage error (parseArgs cannot produce one today; this is the net).
+// "add-tag"/"remove-tag" are multiple-string like "tag"; they are only checked by the allowlist.
 const STRINGS = ["week", "who", "text", "desc", "assign", "section"];
 
 // Wave 3 sets `build` on the write commands; a command with no `build` is recognised but not available yet.
 type Spec = { flags: string[]; n: number; build?: (c: Ctx) => Plan };
 const W = ["week"];
 const SPECS: Record<string, Spec> = {
-  people: { flags: [], n: 1 },
-  list: { flags: [...W, "mine", "who", "open", "done", "today"], n: 2 },
+  people: { flags: [], n: 1 }, tags: { flags: [], n: 1 },
+  list: { flags: [...W, "mine", "who", "open", "done", "today", "tag", "backlog"], n: 2 },
   get: { flags: W, n: 3 },
   add: { flags: [...W, "desc", "assign", "backlog", "today", "star", "tag"], n: 3 },
-  update: { flags: [...W, "text", "desc", "assign", "unassign", "section", "tag", "tags"], n: 3 },
+  update: { flags: [...W, "text", "desc", "assign", "unassign", "section", "tag", "tags", "add-tag", "remove-tag"], n: 3 },
   done: { flags: W, n: 3 }, undone: { flags: W, n: 3 },
   today: { flags: [...W, "off"], n: 3 }, star: { flags: [...W, "off"], n: 3 },
   delete: { flags: [...W, "yes"], n: 3 },
@@ -31,9 +32,9 @@ const SPECS: Record<string, Spec> = {
 // Validates everything synchronously (so usage errors exit 1 before credentials are read), then returns the closure.
 export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () => number): Plan {
   const [cmd, a, b] = pos;
-  const key = cmd === "people" ? "people" : cmd === "tasks" ? "list" : a === "sub" ? (b ? `sub ${b}` : "sub") : (a ?? "");
+  const key = cmd === "people" || cmd === "tags" ? cmd : cmd === "tasks" ? "list" : a === "sub" ? (b ? `sub ${b}` : "sub") : (a ?? "");
   const spec = SPECS[key];
-  if (!spec || key === "people" !== (cmd === "people")) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
+  if (!spec || (key === "people" || key === "tags") !== (cmd === "people" || cmd === "tags")) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
   const n = cmd === "tasks" ? 1 : spec.n;
   for (const [k, x] of Object.entries(v)) {
     if (x === undefined || GLOBAL.includes(k)) continue;
@@ -46,6 +47,7 @@ export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () 
   if (v.tags === true) throw usage("--tags is only valid as --no-tags");
   const c: Ctx = { pos, v, io, json, now };
   if (key === "people") return people(c);
+  if (key === "tags") return tags(c);
   if (key === "list") return list(c);
   if (key === "get") return get(c);
   if (!spec.build) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
@@ -98,11 +100,21 @@ function people(c: Ctx): Plan {
   };
 }
 
+function tags(c: Ctx): Plan {
+  return async (call, org) => {
+    const slug = await org();
+    const b = await call("GET", `/orgs/${enc(slug)}/tags`);
+    const rows: unknown[] = b.data;
+    print(c.io, c.json, b, () => rows.map((x) => clean(x)).join("\n"),
+      () => (rows.length ? rows.map((x) => clean(x)).join("\n") : `No tags in ${clean(slug)} yet.`));
+  };
+}
+
 const involves = (t: any, f: (x: any) => boolean) => f(t) || (t.subtasks ?? []).some(f);
 
 function list(c: Ctx): Plan {
   const { v } = c;
-  const filtered = !!(v.mine || v.who !== undefined || v.open || v.done || v.today);
+  const filtered = !!(v.mine || v.who !== undefined || v.open || v.done || v.today || v.backlog || (v.tag as string[] | undefined)?.length);
   return async (call, org) => {
     const b = await call("GET", await tasksPath(c, org));
     const d = b.data;
@@ -113,6 +125,9 @@ function list(c: Ctx): Plan {
       tasks = tasks.filter((t) => involves(t, (x) => x.assignee?.id === w));
     }
     if (v.today) tasks = tasks.filter((t) => involves(t, (x) => x.today === true));
+    if (v.backlog) tasks = tasks.filter((t) => t.section === "backlog");
+    const want = (v.tag as string[] | undefined) ?? [];
+    if (want.length) tasks = tasks.filter((t) => want.every((g) => (t.tags ?? []).includes(g)));
     if (v.open) tasks = tasks.filter((t) => !t.done);
     if (v.done) tasks = tasks.filter((t) => t.done);
     // Filters narrow data.tasks only; every other key stays as the server sent it.

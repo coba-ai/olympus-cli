@@ -165,7 +165,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       const known =
         seg[0] === "api" && seg[1] === "v1" &&
         ((r === "me" && seg.length === 3) ||
-          (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) ||
+          (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
             (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && seg[6] === "subtasks") || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)))));
       if (!known) return notFound();
 
@@ -191,7 +191,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       const operator = who.roles[org!] === "operator";
       const forbidden = () => err(403, "forbidden", "You are not allowed to do that.");
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();
-      if (sub === "people" || sub === "tasks") return tasksRoute();
+      if (sub === "people" || sub === "tasks" || sub === "tags") return tasksRoute();
       const list = state.webhooks[org!] ?? (state.webhooks[org!] = []);
       const strip = ({ instructions, ...rest }: Webhook) => rest;
 
@@ -254,6 +254,14 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
             .map((a) => ({ id: a.profile_name, name: a.name, kind: "agent", paused: a.paused, me: false })),
         ];
         if (sub === "people") return req.method === "GET" ? tsend(200, { data: people }) : terr(404, "not_found", NOT_FOUND);
+        if (sub === "tags") {
+          if (req.method !== "GET") return terr(404, "not_found", NOT_FOUND);
+          const counts = new Map<string, number>();
+          for (const wk of Object.values(state.tasks[org!] ?? {}))
+            for (const t of wk.tasks) for (const g of t.tags ?? []) counts.set(g, (counts.get(g) ?? 0) + 1);
+          // stable sort keeps first-seen order on ties
+          return tsend(200, { data: [...counts].sort((a, b) => b[1] - a[1]).slice(0, 50).map(([g]) => g) });
+        }
         const me = people.find((p) => p.me)!;
 
         const q = u.searchParams;

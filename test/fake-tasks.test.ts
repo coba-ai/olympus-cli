@@ -159,3 +159,14 @@ test("AC7 routing: unknown paths 404 before auth, log has search, path unchanged
   expect(fake.state.requests[0]).toMatchObject({ method: "GET", path: "/api/v1/orgs/acme/tasks", search: "?week=2026-10-07" });
   expect((await api("GET", "/tasks", undefined, TOKENS.owner, "zzz")).status).toBe(404);
 });
+
+test("tags: org-wide, most used first, no-store, auth and membership like people", async () => {
+  fake.state.tasks.acme![W]!.tasks[0]!.tags = ["web"];
+  fake.state.tasks.acme!["2026-09-28"] = { version: 1, tasks: [{ id: "told0001", text: "old", tags: ["web", "old"], subtasks: [] }] };
+  const r = await api("GET", "/tags");
+  expect(r.status).toBe(200);
+  expect(r.h.get("cache-control")).toBe("no-store");
+  expect(r.json).toEqual({ data: ["web", "pricing", "old"] });
+  expect((await api("GET", "/tags", undefined, "bad")).status).toBe(401);
+  expect((await api("GET", "/tags", undefined, TOKENS.pinned, "beta")).status).toBe(404);
+});
