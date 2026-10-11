@@ -337,3 +337,35 @@ test("Ctrl-C in the same burst as queued answers cancels: exit 130, no PUT", asy
   expect(r.code).toBe(130);
   expect(reqs().map((q) => q.method)).toEqual(["GET"]);
 });
+
+function burst(lines: string[], end: "close" | "SIGINT") {
+  const rl: any = new EventEmitter();
+  rl.setPrompt = () => {};
+  rl.close = () => rl.emit("close");
+  let first = true;
+  rl.prompt = () => {
+    if (!first) return;
+    first = false;
+    queueMicrotask(() => {
+      for (const l of lines) rl.emit("line", l);
+      rl.emit(end);
+    });
+  };
+  return lineAsker(rl);
+}
+
+test("Ctrl-D after the last answer in the same burst still saves", async () => {
+  const r = await run1(["day", "close", "2026-10-07"], true, burst(["a", "", "", "r"], "close"));
+  expect(r.code).toBe(0);
+  expect(reqs().map((q) => q.method)).toEqual(["GET", "PUT"]);
+  const b: any = reqs()[1]!.body;
+  expect(b.shipped).toBe("a");
+  expect(b.reflection).toBe("r");
+});
+
+test("Ctrl-D at a question that still needs an answer cancels: exit 130, no PUT", async () => {
+  const r = await run1(["day", "close", "2026-10-07"], true, burst(["a"], "close"));
+  expect(r.code).toBe(130);
+  expect(r.err + r.out).toContain("cancelled");
+  expect(reqs().map((q) => q.method)).toEqual(["GET"]);
+});

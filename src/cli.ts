@@ -312,9 +312,10 @@ export function lineAsker(rl: LineReader): (prompt: string) => Promise<string | 
     if (cancelled) return Promise.reject(cancel());
     if (typed.length) return Promise.resolve(typed.shift()!);
     if (closed) return Promise.resolve(null);
-    rl.setPrompt(prompt);
+    const p = new Promise<string | null>((res, rej) => { pending = { res, rej }; });
+    rl.setPrompt(prompt); // pending is set first so an event emitted synchronously by prompt() settles this ask
     rl.prompt();
-    return new Promise<string | null>((res, rej) => { pending = { res, rej }; });
+    return p;
   };
 }
 

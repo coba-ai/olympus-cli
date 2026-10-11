@@ -69,3 +69,9 @@ test("SIGINT with lines already queued cancels the next ask", async () => {
   expect(e.exit).toBe(130);
   expect(e.body.error.code).toBe("cancelled");
 });
+
+test("a line emitted synchronously by prompt() settles that ask", async () => {
+  const { rl, ask } = stub();
+  rl.prompt = () => { rl.shown++; rl.emit("line", "sync"); };
+  expect(await ask("Q? ")).toBe("sync");
+});
