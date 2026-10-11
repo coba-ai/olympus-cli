@@ -18,7 +18,7 @@ or in the app under **Settings → API tokens**; the value is shown once. Revoke
 ## Responses
 
 Success bodies are `{"data": …}`. Ids are strings: organization slug, agent `profile_name`,
-webhook id `wh_…`. The organization is part of the path.
+webhook id `wh_…`, task id `t` + 7 base36 characters, subtask id `s` + 7. The organization is part of the path.
 
 Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`details` only when there is something in it).
 
@@ -47,6 +47,18 @@ GET    /orgs/:org/webhooks/:id      → {data:{…, instructions}}
 POST   /orgs/:org/webhooks          {name, agent, instructions, full_tools?}  → 201 {data:{…}, secret}
 PATCH  /orgs/:org/webhooks/:id      {name?, agent?, instructions?, full_tools?} → {data:{…}}
 DELETE /orgs/:org/webhooks/:id      → 204
+
+GET    /orgs/:org/people            → {data:[{id, name, kind:"user"|"agent", email?, paused?, me}]}
+GET    /orgs/:org/tags              → {data:["pricing","urgent",…]}
+
+GET    /orgs/:org/tasks[?week]                           → {data:{week, current, version, me, tasks:[item…]}}
+GET    /orgs/:org/tasks/:id[?week]                       → {data:item}
+POST   /orgs/:org/tasks[?week]                           {text, description?, assignee?, section?, tags?, today?, one_thing?} → 201 {data:item}
+PATCH  /orgs/:org/tasks/:id[?week]                       {text?, description?, assignee?, section?, tags?, add_tags?, remove_tags?, done?, today?, one_thing?} → {data:item}
+DELETE /orgs/:org/tasks/:id[?week]                       → 204
+POST   /orgs/:org/tasks/:id/subtasks[?week]              {text, assignee?} → 201 {data:item}
+PATCH  /orgs/:org/tasks/:id/subtasks/:sid[?week]         {text?, done?, assignee?, today?} → {data:item}
+DELETE /orgs/:org/tasks/:id/subtasks/:sid[?week]         → {data:item}
 ```
 
 - `token.organization` is `{slug, name}` for a token limited to one organization, otherwise `null`.
@@ -91,3 +103,68 @@ curl -X POST "$WEBHOOK_URL" \
   -H "X-Request-ID: $(uuidgen)" \
   --data "$BODY"
 ```
+
+## Tasks
+
+Any member of the organization, `teammate` included, can read and write tasks; there is no role gate.
+Every `people` and tasks response carries `Cache-Control: no-store`. An unknown task or subtask id (in
+that week) is a 404 `not_found`.
+
+**People.** Members first (by name; `kind:"user"`, `id:"u_<n>"`, `email`), then every agent, the primary
+first (`kind:"agent"`, `id` is the `profile_name`, `paused`). `me:true` is on your own row only.
+**Tags.** `GET /tags` returns the organization's tags across all weeks, most used first, at most 50.
+
+**Week.** Tasks live in weeks. `?week=YYYY-MM-DD` works on every tasks route; any date is accepted and
+normalised to that week's Monday (the response's `week`). Without it you get the current week. A
+malformed value is 422 with `fields.week`. Reading a week that has no tasks returns `version:0,
+tasks:[]` and stores nothing; writing to it creates it. `current` says whether `week` is the current
+week; `me` is your person id. `tasks` is in board order: the starred (`one_thing`) task first, then
+`the_rest`, then `backlog`, each by `order` then id.
+
+**Item.**
+
+```jsonc
+{
+  "id": "t8f3k2a", "text": "Ship the pricing page", "description": "",
+  "section": "the_rest",          // "the_rest" | "backlog"; older tasks may read "one_thing"
+  "order": 0, "done": false, "done_at": null,       // done_at: ISO 8601 or null
+  "assignee": {"id": "u_12", "name": "Abraham Kuri", "kind": "user"} | null,
+                                  // an id that no longer exists reads {"id":"u_9","name":null,"kind":null}
+  "tags": ["pricing"],
+  "today": false,                 // flagged for today
+  "one_thing": false,             // starred: the person's one thing for the day
+  "added_on": "2026-10-05" | null,
+  "delegated_to": null, "delegated_at": null,       // read-only
+  "subtasks": [{"id": "s1x2y3z", "text": "…", "done": false, "done_at": null,
+                "assignee": {…} | null, "today": false, "order": 0}]
+}
+```
+
+A new task is `done:false`, with no tags or subtasks unless given, at the end of its section; a new
+subtask goes at the end of its parent's list. Subtask routes (POST answers 201) return the **parent**
+item, including after a subtask is deleted. Task `DELETE` answers 204 with no body.
+
+**Input rules.** Types are strict, and every failure is 422 `invalid` with `details.fields`. Unknown body
+keys are ignored.
+
+- `text`, `description`, `section` are strings. `text` is required and non-blank on create, and
+  non-blank when present on update.
+- `section` accepts `the_rest` or `backlog`; moving a task puts it at the end of the new section.
+- `tags` is an array of strings (trimmed, blanks dropped, duplicates removed, order kept) and replaces
+  the list. `add_tags` / `remove_tags` (same shape) edit it instead, so concurrent edits never drop each
+  other's tags. Sending `tags` together with either is 422 `fields.tags`. Tags are exact strings
+  (`Urgent` is not `urgent`).
+- `done`, `today`, `one_thing` are JSON booleans. `done:true` sets `done_at` to now; `false` clears it.
+  Repeating either is fine.
+- `assignee` is a string, or `null` to unassign: `"me"`, a person id (`"u_12"`, `"zeus"`) or a member's
+  email (case-insensitive). Anything that matches nobody in the organization is 422 `fields.assignee`
+  (`must be a member or agent of this organization`); a paused agent is `is paused`.
+- `today:true` flags the item for today. Refused with 422 `fields.today` when the week is not the
+  current week, or when the owner is a person (or unassigned) who already has 3 items flagged today,
+  counting tasks and subtasks. Agents have no cap. `today:false` removes the flag.
+- `one_thing:true` stars the task as its assignee's one thing for the day. Refused with 422
+  `fields.one_thing` when the week is not the current week, the task has no assignee, or that person
+  already has a one thing that day (the message names the other task). `one_thing:false` removes it; a
+  task with the older `one_thing` section moves to the end of `the_rest`.
+- Every write bumps the week's `version`.
+- Subtasks take `text`, `done`, `assignee` and `today` with the same rules.

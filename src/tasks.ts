@@ -29,6 +29,91 @@ const SPECS: Record<string, Spec> = {
   "sub delete": { flags: [...W, "yes"], n: 5 },
 };
 
+// ---- write commands: each build() throws its usage errors synchronously, before the closure exists.
+const item = (c: Ctx, b: any, sentence: string) => print(c.io, c.json, b, () => detail(b.data), () => `${sentence}\n\n${block(b.data, c.now())}`);
+const need = (c: Ctx, name: string) => { if (!c.v.yes) throw usage(`${name} needs --yes`); };
+const tagList = (c: Ctx, k: string) => (c.v[k] as string[] | undefined) ?? [];
+
+function patch(sentence: (id: string) => string, body: (c: Ctx) => Record<string, unknown>): (c: Ctx) => Plan {
+  return (c) => {
+    const b = body(c);
+    const id = c.pos[2]!;
+    return async (call, org) => item(c, await call("PATCH", await tasksPath(c, org, `/${enc(id)}`), b), sentence(clean(id)));
+  };
+}
+
+SPECS.add!.build = (c) => {
+  const { v } = c;
+  const body: Record<string, unknown> = { text: c.pos[2] };
+  if (v.desc !== undefined) body.description = v.desc;
+  if (v.assign !== undefined) body.assignee = v.assign;
+  if (v.backlog) body.section = "backlog";
+  if (v.today) body.today = true;
+  if (v.star) body.one_thing = true;
+  if (tagList(c, "tag").length) body.tags = tagList(c, "tag");
+  return async (call, org) => {
+    const b = await call("POST", await tasksPath(c, org), body);
+    item(c, b, `Added task ${clean(b.data.id)}.`);
+  };
+};
+
+SPECS.update!.build = (c) => {
+  const { v } = c;
+  if (v.assign !== undefined && v.unassign) throw usage("give only one of --assign / --unassign");
+  const set = tagList(c, "tag").length > 0;
+  if (set && v.tags === false) throw usage("give only one of --tag / --no-tags");
+  const add = tagList(c, "add-tag"), rem = tagList(c, "remove-tag");
+  if ((add.length || rem.length) && (set || v.tags === false)) throw usage("--add-tag / --remove-tag cannot be combined with --tag or --no-tags");
+  const body: Record<string, unknown> = {};
+  if (v.text !== undefined) body.text = v.text;
+  if (v.desc !== undefined) body.description = v.desc;
+  if (v.section !== undefined) body.section = v.section;
+  if (v.assign !== undefined) body.assignee = v.assign;
+  if (v.unassign) body.assignee = null;
+  if (set) body.tags = tagList(c, "tag");
+  if (v.tags === false) body.tags = [];
+  if (add.length) body.add_tags = add;
+  if (rem.length) body.remove_tags = rem;
+  if (!Object.keys(body).length) throw usage("task update needs at least one field to change");
+  return patch((id) => `Updated task ${id}.`, () => body)(c);
+};
+
+SPECS.done!.build = patch((id) => `Marked ${id} done.`, () => ({ done: true }));
+SPECS.undone!.build = patch((id) => `Marked ${id} not done.`, () => ({ done: false }));
+SPECS.today!.build = (c) => patch((id) => (c.v.off ? `Removed ${id} from today.` : `Marked ${id} for today.`), () => ({ today: !c.v.off }))(c);
+SPECS.star!.build = (c) => patch((id) => (c.v.off ? `Unstarred ${id}.` : `Starred ${id}.`), () => ({ one_thing: !c.v.off }))(c);
+
+SPECS.delete!.build = (c) => {
+  need(c, "task delete");
+  const id = c.pos[2]!;
+  return async (call, org) => {
+    await call("DELETE", await tasksPath(c, org, `/${enc(id)}`));
+    print(c.io, c.json, { data: { id, deleted: true } }, () => `deleted ${clean(id)}`, () => `Deleted task ${clean(id)}.`);
+  };
+};
+
+const subPath = (c: Ctx, org: () => Promise<string>, sid?: string) =>
+  tasksPath(c, org, `/${enc(c.pos[3]!)}/subtasks${sid === undefined ? "" : `/${enc(sid)}`}`);
+
+SPECS["sub add"]!.build = (c) => {
+  const body: Record<string, unknown> = { text: c.pos[4] };
+  if (c.v.assign !== undefined) body.assignee = c.v.assign;
+  return async (call, org) => {
+    const b = await call("POST", await subPath(c, org), body);
+    const subs: any[] = b.data.subtasks ?? [];
+    item(c, b, `Added subtask ${clean(subs[subs.length - 1]?.id)} to ${clean(c.pos[3])}.`);
+  };
+};
+
+SPECS["sub done"]!.build = (c) => async (call, org) =>
+  item(c, await call("PATCH", await subPath(c, org, c.pos[4]!), { done: !c.v.undo }), `Marked subtask ${clean(c.pos[4])} ${c.v.undo ? "not done" : "done"}.`);
+
+SPECS["sub delete"]!.build = (c) => {
+  need(c, "task sub delete");
+  return async (call, org) =>
+    item(c, await call("DELETE", await subPath(c, org, c.pos[4]!)), `Deleted subtask ${clean(c.pos[4])} from ${clean(c.pos[3])}.`);
+};
+
 // Validates everything synchronously (so usage errors exit 1 before credentials are read), then returns the closure.
 export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () => number): Plan {
   const [cmd, a, b] = pos;

@@ -102,7 +102,9 @@ test("AC11 usage errors send no request, even with no token", async () => {
     ["tasks", "--mine", "--who", "me"], ["tasks", "--open", "--done"], ["tasks", "extra"], ["people", "extra"], ["task", "get"],
     ["task", "get", "a", "b"], ["people", "--week", "x"], ["task", "get", "x", "--mine"], ["task", "list", "--star"],
     ["task", "get", "x", "--yes"], ["task", "update", "x", "--tags"], ["task"], ["task", "nope"], ["task", "sub"], ["task", "sub", "nope"],
-    ["task", "people"], ["tasks", "--name", "n"], ["task", "add", "t"], ["task", "delete", "x", "--yes"], ["task", "sub", "add", "t", "x"],
+    ["task", "people"], ["tasks", "--name", "n"], ["task", "delete", "x"], ["task", "sub", "delete", "t", "s"], ["task", "update", "x"],
+    ["task", "update", "x", "--assign", "a", "--unassign"], ["task", "update", "x", "--tag", "a", "--no-tags"],
+    ["task", "update", "x", "--add-tag", "a", "--tag", "b"], ["task", "add"], ["task", "sub", "add", "t"],
     ["webhook", "list", "--week", "x"], ["webhook", "list", "--week", "x", "--help"], ["whoami", "--mine"], ["login", "--tag", "a"],
     ["tasks", "--help-me"],
   ];

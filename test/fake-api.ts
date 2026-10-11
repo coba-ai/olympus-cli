@@ -364,6 +364,20 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
           if (!f.section && "section" in b && !["the_rest", "backlog"].includes(b.section)) f.section = ["must be the_rest or backlog"];
           if ("tags" in b && !(Array.isArray(b.tags) && b.tags.every((x: unknown) => typeof x === "string"))) f.tags = ["must be an array of strings"];
           for (const k of ["text", "description", "section", "tags"]) if (!f[k] && k in b) set[k] = b[k];
+          const strs = (k: string) => {
+            if (!(k in b)) return;
+            if (!(Array.isArray(b[k]) && b[k].every((x: unknown) => typeof x === "string"))) f[k] = ["must be an array of strings"];
+            else if ("tags" in b) f.tags = [`can't be combined with ${k}`];
+          };
+          strs("add_tags");
+          strs("remove_tags");
+          if (cur && !f.tags && !f.add_tags && !f.remove_tags && ("add_tags" in b || "remove_tags" in b)) {
+            const clean = (k: string) => (b[k] ?? []).map((x: string) => x.trim()).filter(Boolean);
+            const rm = clean("remove_tags");
+            const out = (cur.tags ?? []).filter((g: string) => !rm.includes(g));
+            for (const g of clean("add_tags")) if (!out.includes(g)) out.push(g);
+            set.tags = out;
+          }
           let assignee = cur?.assignee ?? null;
           if ("assignee" in b) {
             const r = resolve(b.assignee);

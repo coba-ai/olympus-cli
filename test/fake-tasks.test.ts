@@ -170,3 +170,22 @@ test("tags: org-wide, most used first, no-store, auth and membership like people
   expect((await api("GET", "/tags", undefined, "bad")).status).toBe(401);
   expect((await api("GET", "/tags", undefined, TOKENS.pinned, "beta")).status).toBe(404);
 });
+
+test("AC30 add_tags / remove_tags: exact strings, strict arrays, not with tags", async () => {
+  await api("PATCH", "/tasks/trest001", { tags: ["a", "b"] });
+  const r = await api("PATCH", "/tasks/trest001", { add_tags: [" c ", "a", " "], remove_tags: ["b", "B"] });
+  expect(r.status).toBe(200);
+  expect(r.json.data.tags).toEqual(["a", "c"]);
+  expect((await api("PATCH", "/tasks/trest001", { remove_tags: ["zz"] })).json.data.tags).toEqual(["a", "c"]);
+  for (const b of [{ add_tags: "a" }, { remove_tags: [1] }, { add_tags: null }]) {
+    const x = await api("PATCH", "/tasks/trest001", b);
+    expect(x.status).toBe(422);
+    expect(fieldsOf(x)[Object.keys(b)[0]!]).toBeArray();
+  }
+  for (const k of ["add_tags", "remove_tags"]) {
+    const x = await api("PATCH", "/tasks/trest001", { tags: ["q"], [k]: ["z"] });
+    expect(x.status).toBe(422);
+    expect(fieldsOf(x).tags).toBeArray();
+  }
+  expect((await api("GET", "/tasks/trest001")).json.data.tags).toEqual(["a", "c"]);
+});
