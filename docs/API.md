@@ -218,7 +218,7 @@ has `entry:null`, `closed:false`, `closed_at:null`, `score:null`.
   "shipped": "…", "reflection": "…",
   "blockers":  [{"id": "b1", "text": "…"}],
   "learnings": [{"id": "l1", "text": "…"}],
-  "summary": {"tasks_created": 0, "tasks_done": 0, "one_thing_progress": null, "learnings": 0,
+  "summary": {"tasks_created": 0, "tasks_done": 0, "one_thing_progress": …, "learnings": 0,
               "allocation": [{"tag": "pricing", "count": 2}]},
   "agent_note": null,             // string once the agent has written one
   "week_close": false
@@ -231,7 +231,7 @@ has `entry:null`, `closed:false`, `closed_at:null`, `score:null`.
   strings that **replace** the stored list (ids are assigned `b1…` / `l1…` in order). `shipped` and
   `reflection` are strings.
 - **`close`** is a boolean, default `true`: the entry is marked closed and `closed_at` is set.
-  `close:false` saves a draft and leaves `closed_at` as it was (an already closed day stays closed).
-- **Read-only.** `summary`, `score` and `agent_note` are computed by the server; sending them is
-  ignored, as are other unknown keys. Closing a week is not available through the API.
+  `close:false` saves a draft and leaves `closed_at` as it was; the response's `closed` says whether the day is closed.
+- **Read-only.** `summary`, `score` and `agent_note` are computed by the server; they cannot be set
+  through this endpoint. Closing a week is not available through the API.
 - Types are strict; a wrong type is 422 on that field.

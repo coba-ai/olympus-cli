@@ -291,8 +291,11 @@ type LineReader = Pick<Interface, "on" | "setPrompt" | "prompt" | "close">;
 // Measured on Bun 1.3: question() drops lines that arrive between questions and a pending one never settles on close,
 // so lines are queued here instead. Ctrl-C reaches readline as a "SIGINT" event only once the tty is raw; before that
 // the default signal kills the process (also 130).
+const cancel = () => new CliError(130, { error: { code: "cancelled", message: "cancelled; nothing was saved" } });
+
 export function lineAsker(rl: LineReader): (prompt: string) => Promise<string | null> {
   let closed = false;
+  let cancelled = false; // sticky: Ctrl-C also voids answers that were typed ahead
   const typed: string[] = []; // lines that arrived while no question was pending (type-ahead, paste)
   let pending: { res: (s: string | null) => void; rej: (e: Error) => void } | undefined;
   rl.on("line", (l) => { const p = pending; pending = undefined; if (p) p.res(l); else typed.push(l); });
@@ -300,10 +303,13 @@ export function lineAsker(rl: LineReader): (prompt: string) => Promise<string | 
   rl.on("SIGINT", () => {
     const p = pending;
     pending = undefined;
+    cancelled = true;
+    typed.length = 0;
     rl.close();
-    p?.rej(new CliError(130, { error: { code: "cancelled", message: "cancelled; nothing was saved" } }));
+    p?.rej(cancel());
   });
   return (prompt) => {
+    if (cancelled) return Promise.reject(cancel());
     if (typed.length) return Promise.resolve(typed.shift()!);
     if (closed) return Promise.resolve(null);
     rl.setPrompt(prompt);

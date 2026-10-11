@@ -95,6 +95,7 @@ function closePlan(c: Ctx): Plan {
     if (!isEmpty(shipped)) body.shipped = shipped;
     if (blockers.length) body.blockers = blockers;
     if (learnings.length) body.learnings = learnings;
+    c.io.close?.(); // leave raw mode so Ctrl-C during the PUT takes the default signal
     if (!isEmpty(reflection)) body.reflection = reflection;
     if (cur.data.entry === null && !Object.keys(body).some((k) => k !== "close")) throw stop("nothing entered; nothing was saved");
     await send(call, org, body);

@@ -59,3 +59,13 @@ test("SIGINT while pending rejects 130 cancelled and closes", async () => {
   expect(e.body.error.code).toBe("cancelled");
   expect(closed).toBe(true);
 });
+
+test("SIGINT with lines already queued cancels the next ask", async () => {
+  const { rl, ask } = stub();
+  rl.emit("line", "queued");
+  rl.emit("SIGINT");
+  const e = await ask("Q? ").catch((x) => x);
+  expect(e).toBeInstanceOf(CliError);
+  expect(e.exit).toBe(130);
+  expect(e.body.error.code).toBe("cancelled");
+});

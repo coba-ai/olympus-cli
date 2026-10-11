@@ -3,7 +3,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CliError, type Exit } from "../src/core";
-import { processIo, run } from "../src/cli";
+import { EventEmitter } from "node:events";
+import { lineAsker, processIo, run } from "../src/cli";
 import { startFake, TOKENS } from "./fake-api";
 
 const fake = startFake();
@@ -294,7 +295,7 @@ test("AC23 token sweep: day commands x 401/403/404/422/503 x TTY x --json, plus 
     for (const json of [[], ["--json"]])
       for (const c of cmds)
         for (const status of statuses) {
-          const prompting = c.length === 3;
+          const prompting = c[1] === "close" && c.length === 3;
           if (prompting && json.length) continue; // --json never prompts: a usage error, covered by AC20
           const s = script(["x"]);
           next(status, { error: { code: "e", message: "no", details: { fields: { day: ["bad"] } } } });
@@ -310,10 +311,29 @@ test("AC24 help lists the day lines; processIo offers ask only on a terminal", a
   const r = await cli(["--help"]);
   for (const l of [
     "  day [DATE] | day show [DATE] | day list [--week D]   (DATE: YYYY-MM-DD, default today)",
+    "  task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT]   (both accept --week D)",
     "  day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]",
   ]) expect(r.out).toContain(l + "\n");
   const io = processIo();
   expect(typeof io.ask === "function").toBe(process.stdin.isTTY === true && process.stderr.isTTY === true);
   expect(typeof io.close).toBe("function");
   io.close!();
+});
+
+test("Ctrl-C in the same burst as queued answers cancels: exit 130, no PUT", async () => {
+  const rl: any = new EventEmitter();
+  rl.setPrompt = () => {};
+  rl.close = () => rl.emit("close");
+  let first = true;
+  rl.prompt = () => {
+    if (!first) return;
+    first = false;
+    queueMicrotask(() => { // input arrives after the question is pending, as with a real tty
+      for (const l of ["a", "", "", "r"]) rl.emit("line", l);
+      rl.emit("SIGINT");
+    });
+  };
+  const r = await run1(["day", "close", "2026-10-07"], true, lineAsker(rl));
+  expect(r.code).toBe(130);
+  expect(reqs().map((q) => q.method)).toEqual(["GET"]);
 });
