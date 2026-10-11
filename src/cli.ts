@@ -1,9 +1,11 @@
 import { parseArgs } from "node:util";
+import { createInterface, type Interface } from "node:readline";
 import { homedir, hostname } from "node:os";
 import {
   CliError, DEFAULT_HOST, api, defaultOrg, envKey, deleteCreds, deviceLogin, fail, loginWithToken, print, readCreds,
   resolveHost, resolveOrg, resolveToken, seg, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
 } from "./core";
+import { DAY_FLAGS, dayPlan } from "./days";
 import { TASK_FLAGS, taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
 
@@ -18,6 +20,9 @@ const USAGE = `usage: olympus <command> [flags]
   task get <id> | add TEXT | update <id> | done <id> | undone <id> | today <id> | star <id> | delete <id> --yes
   task update <id> [--text T] [--desc T] [--assign W | --unassign] [--section S] [--tag T]... [--no-tags] [--add-tag T]... [--remove-tag T]...
   task sub add <id> TEXT | sub done <id> <sid> | sub delete <id> <sid> --yes   (all accept --week D)
+  task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT]   (both accept --week D)
+  day [DATE] | day show [DATE] | day list [--week D]   (DATE: YYYY-MM-DD, default today)
+  day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]
 global flags: --json --host URL --org SLUG -h
 env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG
 exit: 0 ok, 1 usage, 2 auth, 3 not found, 4 forbidden, 5 server/network, 6 invalid, 130 cancelled
@@ -73,8 +78,9 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     }
     const { values: v, positionals: pos } = parsed;
     json = !!v.json;
-    if (!["people", "tasks", "task", "tags"].includes(parsed.positionals[0] ?? "")) {
-      const f = TASK_FLAGS.find((k) => (v as Record<string, unknown>)[k] !== undefined);
+    const given = (k: string) => (v as Record<string, unknown>)[k] !== undefined;
+    if (!["people", "tasks", "task", "tags", "day"].includes(parsed.positionals[0] ?? "")) {
+      const f = [...TASK_FLAGS, ...DAY_FLAGS].find(given);
       if (f) throw usage(`unknown option '--${f}'`);
     }
     if (v.help) { io.out(USAGE); return 0; }
@@ -251,6 +257,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       } else throw usage(`unknown webhook command: ${sub ?? ""}`);
     } else if (cmd === "people" || cmd === "tasks" || cmd === "task" || cmd === "tags") {
       plan = taskPlan(pos, v, io, json, now);
+    } else if (cmd === "day") {
+      plan = dayPlan(pos, v, io, json, now);
     } else throw usage(`unknown command: ${pos.join(" ")}`);
 
     // An env key makes a malformed file irrelevant, except to `org use`, which would overwrite what it cannot read.
@@ -279,9 +287,35 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
 }
 
 export function processIo(): Io {
+  let rl: Interface | undefined;
+  let closed = false;
+  const typed: string[] = []; // lines that arrived while no question was pending (type-ahead, paste)
+  let pending: { res: (s: string | null) => void; rej: (e: Error) => void } | undefined;
+  // Measured on Bun 1.3: question() drops lines that arrive between questions and a pending one never settles on close,
+  // so lines are queued here instead. Ctrl-C reaches readline as a "SIGINT" event only once the tty is raw; before that
+  // the default signal kills the process (also 130).
+  const ask = (prompt: string) => {
+    if (!rl) {
+      rl = createInterface({ input: process.stdin, output: process.stderr });
+      rl.on("line", (l) => { const p = pending; pending = undefined; if (p) p.res(l); else typed.push(l); });
+      rl.on("close", () => { closed = true; const p = pending; pending = undefined; p?.res(null); });
+      rl.on("SIGINT", () => {
+        const p = pending;
+        pending = undefined;
+        rl!.close();
+        p?.rej(new CliError(130, { error: { code: "cancelled", message: "cancelled; nothing was saved" } }));
+      });
+    }
+    if (typed.length) return Promise.resolve(typed.shift()!);
+    if (closed) return Promise.resolve(null);
+    rl.setPrompt(prompt);
+    rl.prompt();
+    return new Promise<string | null>((res, rej) => { pending = { res, rej }; });
+  };
   return {
     env: process.env, home: homedir(), tty: process.stdout.isTTY === true, stdin: () => Bun.stdin.text(),
     out: (s) => void process.stdout.write(s), err: (s) => void process.stderr.write(s),
+    ...(process.stdin.isTTY && process.stderr.isTTY ? { ask } : {}), close: () => rl?.close(),
     openBrowser: (url) => {
       try {
         Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdio: ["ignore", "ignore", "ignore"], detached: true }).unref();
@@ -291,10 +325,13 @@ export function processIo(): Io {
 }
 
 if (import.meta.main) {
+  const io = processIo();
   try {
-    process.exitCode = await run(process.argv.slice(2), processIo());
+    process.exitCode = await run(process.argv.slice(2), io);
   } catch (e) {
     process.stderr.write(`error: internal: ${(e as Error)?.message ?? String(e)}\n`);
     process.exitCode = 5;
+  } finally {
+    io.close?.();
   }
 }

@@ -86,6 +86,36 @@ function subDelete(c: Ctx): Plan {
     item(c, await call("DELETE", await subPath(c, org, c.pos[4]!)), `Deleted subtask ${clean(c.pos[4])} from ${clean(c.pos[3])}.`);
 }
 
+// breakdown waits on the agent; the server may take up to ~90 s, so this overrides the default timeout for that call only.
+export const BREAKDOWN_TIMEOUT_MS = 100_000;
+
+function delegate(c: Ctx): Plan {
+  const body = c.v.to === undefined ? {} : { agent: c.v.to };
+  return async (call, org) => {
+    const b = await call("POST", await tasksPath(c, org, `/${seg(c.pos[2]!)}/delegate`), body);
+    const s = b.data?.session ?? {};
+    print(c.io, c.json, b,
+      () => [`agent: ${dash(s.agent)}`, `session: ${dash(s.id)}`, `title: ${dash(s.title)}`, `url: ${dash(s.url)}`].join("\n"),
+      () => [`Delegated task ${clean(c.pos[2])} to ${dash(s.agent)}.`, ...(s.title ? [`Title: ${clean(s.title)}`] : []), `Session: ${dash(s.url)}`].join("\n"));
+  };
+}
+
+function breakdown(c: Ctx): Plan {
+  const body = c.v.agent === undefined ? {} : { agent: c.v.agent };
+  return async (call, org) => {
+    const path = await tasksPath(c, org, `/${seg(c.pos[2]!)}/breakdown`);
+    if (c.io.tty && !c.json) c.io.err(`Asking ${c.v.agent === undefined ? "the agent" : clean(c.v.agent)} to break down task ${clean(c.pos[2])}...\n`);
+    const b = await call("POST", path, body, BREAKDOWN_TIMEOUT_MS);
+    const added: any[] = b.data?.added ?? [];
+    const id = clean(c.pos[2]);
+    print(c.io, c.json, b,
+      () => [`agent: ${dash(b.data?.agent)}`, ...added.map((x) => `added: ${dash(x.id)}\t${dash(x.text)}`)].join("\n"),
+      () => added.length
+        ? [`${dash(b.data?.agent)} added ${added.length} ${added.length === 1 ? "subtask" : "subtasks"} to task ${id}:`, ...added.map((x) => `  ${dash(x.id)}  ${dash(x.text)}`)].join("\n")
+        : `${dash(b.data?.agent)} added no subtasks to task ${id}.`);
+  };
+}
+
 // n = expected positionals (including the command word).
 type Spec = { flags: string[]; n: number; build: (c: Ctx) => Plan };
 const W = ["week"];
@@ -100,17 +130,19 @@ const SPECS: Record<string, Spec> = {
   today: { flags: [...W, "off"], n: 3, build: (c) => patch(c, { today: !c.v.off }, (id) => (c.v.off ? `Removed ${id} from today.` : `Marked ${id} for today.`)) },
   star: { flags: [...W, "off"], n: 3, build: (c) => patch(c, { one_thing: !c.v.off }, (id) => (c.v.off ? `Unstarred ${id}.` : `Starred ${id}.`)) },
   delete: { flags: [...W, "yes"], n: 3, build: del },
+  delegate: { flags: [...W, "to"], n: 3, build: delegate },
+  breakdown: { flags: [...W, "agent"], n: 3, build: breakdown },
   "sub add": { flags: [...W, "assign"], n: 5, build: subAdd },
   "sub done": { flags: [...W, "undo"], n: 5, build: subDone },
   "sub delete": { flags: [...W, "yes"], n: 5, build: subDelete },
 };
 
-// Every task flag except --yes, which other commands (webhook delete) also take; cli.ts rejects these on other commands.
-export const TASK_FLAGS = [...new Set(Object.values(SPECS).flatMap((s) => s.flags))].filter((k) => k !== "yes");
+// Every task flag except --yes and --agent, which other commands (webhook delete/create) also take; cli.ts rejects these on other commands.
+export const TASK_FLAGS = [...new Set(Object.values(SPECS).flatMap((s) => s.flags))].filter((k) => k !== "yes" && k !== "agent");
 
 // Positionals that become path segments, by spec key.
 const ID_POS: Record<string, number[]> = {
-  get: [2], update: [2], done: [2], undone: [2], today: [2], star: [2], delete: [2],
+  get: [2], update: [2], done: [2], undone: [2], today: [2], star: [2], delete: [2], delegate: [2], breakdown: [2],
   "sub add": [3], "sub done": [3, 4], "sub delete": [3, 4],
 };
 
