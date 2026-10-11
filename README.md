@@ -43,6 +43,11 @@ olympus task update <id> [--text T] [--desc T] [--assign W | --unassign] [--sect
                          [--tag T]... | [--no-tags] | [--add-tag T]... [--remove-tag T]...
 olympus task today <id> [--off] | star <id> [--off]
 olympus task sub add <id> TEXT [--assign W] | sub done <id> <sid> [--undo] | sub delete <id> <sid> --yes
+olympus task delegate <id> [--to AGENT]         # open an agent session for the task
+olympus task breakdown <id> [--agent AGENT]     # ask an agent to add subtasks (can take ~90 s)
+olympus day [DATE] | day show [DATE]            # one day's close-of-day entry; DATE is YYYY-MM-DD, default today
+olympus day list [--week D]                     # the week's five weekdays
+olympus day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]
 ```
 
 Global flags: `--json`, `--host URL`, `--org SLUG`, `-h/--help`. No flag takes a token.
@@ -66,6 +71,35 @@ and requires every tag given; `--backlog` keeps the backlog section. `--mine` wi
 `--open` with `--done`, are usage errors. An unknown `--who` is exit 6. Text that starts with `-` needs
 `--` (`olympus task add -- "-x"`).
 
+Agents and days:
+
+- `task delegate` opens a new agent session for a task, using the task's text and description, and
+  records the agent on the task. `--to` names an agent (`olympus agents list`); without it the task's
+  assignee is used if it is an active agent, otherwise the organization's primary agent. It is **not
+  idempotent**: running it again opens another session. It takes `--week` like the other task commands.
+- `task breakdown` asks an agent to propose subtasks and appends them to the task (a task holds at
+  most 5, and one that is full is exit 6). `--agent` works like `--to`. The call waits for the agent and
+  can take up to about 90 seconds; the CLI allows 100 s. If the agent fails or answers badly the server
+  replies `502 agent_failed` and the CLI exits 5 with the agent's message; nothing is saved. If you
+  interrupt it (or it times out) the subtasks may still have been added, so check with `task get <id>`
+  before running it again.
+- `day` shows your own close-of-day entry for one weekday (Monday to Friday; the default is today in
+  your local time zone, so a weekend "today" is exit 6). `day list` shows the week's five days.
+  `--week` takes any date in the week. Only your own entries are visible.
+- `day close` saves what you give it and closes the day; `--draft` saves without closing. Fields you
+  do not give are left as they were, but `--blocker` and `--learning` replace the whole list. With no
+  content flag (`--shipped`, `--blocker`, `--learning`, `--reflection`) it asks questions, but only when
+  stdin and stderr are both terminals and `--json` is off. Otherwise it is a usage error (exit 1)
+  and never waits on stdin, so scripts cannot hang. Re-closing a day from a script means
+  re-sending the content you want kept. Week close is not available from the CLI.
+
+When it asks, `day close` first reads the day (so a bad token, organization or date fails before the
+first question), then asks for shipped, blockers (one per line), learnings (one per line) and a
+reflection. Enter skips a question; an empty line ends a list. Ctrl-D or Ctrl-C cancels: exit 130, nothing
+saved. If every answer is empty and the day has nothing saved yet, nothing is saved either (exit 130).
+The wording of prompts and of terminal-mode confirmations is not a stable interface; the piped forms
+below are.
+
 ## Environment
 
 | Variable | Meaning |
@@ -88,7 +122,7 @@ characters in server text are stripped from stdout on a terminal and server text
 scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
 emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms. `--json` prints the API body as-is (the one exception: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent), one compact line
 (`org list` → `{data:[…]}`, `org use` → `{data:{org}}`, `delete` → `{data:{id,deleted:true}}`,
-`logout` → `{data:{deleted}}`, `task delete` → `{data:{id,deleted:true}}`; `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
+`logout` → `{data:{deleted}}`, `task delete` → `{data:{id,deleted:true}}`; `task delegate`, `task breakdown`, `day …` → the response body; `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
 usage errors are `{"error":{"code":"usage",…}}`. A token is never printed.
 
 **Piped tasks output** (tab-separated; every server string has control characters stripped, so a tab or
@@ -105,6 +139,16 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `delegated_to:`, `delegated_at:`, then one `subtask: sid<TAB>open|done<TAB>assignee-id|-<TAB>today|-<TAB>text`
   line per subtask. Empty and null values print `-`; `--json` is the lossless form.
 - `task delete` prints `deleted <id>`.
+- `task delegate`, four lines: `agent: <name>`, `session: <session id>`, `title: <title|->`,
+  `url: <session URL>`.
+- `task breakdown`: `agent: <name>`, then one `added: <sid><TAB><text>` line per new subtask (none if the
+  agent added nothing).
+- `day show` / `day [DATE]`, and what `day close` prints after saving: `day:`, `closed:` (`true|false`),
+  `closed_at:`, `score:`, `shipped:`, `reflection:`, `agent_note:` (empty values print `-`), then one
+  `blocker: <id><TAB><text>` and one `learning: <id><TAB><text>` line per item. A day with nothing saved
+  prints the same lines with `-` for the empty ones. The `summary` is in `--json` only.
+- `day list`: five rows, Monday to Friday, `day<TAB>closed|draft|-<TAB>score|-<TAB>shipped|-`
+  (`draft` = saved but not closed, `-` = nothing saved).
 
 | Exit | Meaning |
 |---|---|
@@ -115,7 +159,7 @@ newline in task text never splits a row; nothing is printed for an empty list):
 | 4 | forbidden (403) |
 | 5 | server / network / redirect / 429 / anything unexpected |
 | 6 | invalid (400, 422) |
-| 130 | cancelled (Ctrl-C during login; credentials untouched) |
+| 130 | cancelled (Ctrl-C during login, credentials untouched; or a cancelled `day close` prompt, nothing saved) |
 
 ## `.env` is not loaded by the binary
 

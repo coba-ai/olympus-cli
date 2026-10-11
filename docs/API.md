@@ -31,7 +31,8 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 409 | `machine_needs_update` / `route_missing` | the organization's agent machine needs an update, or no longer has this webhook |
 | 422 | `invalid` | `details.fields` is `{field: ["message", …]}` |
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
-| 503 | `machine_not_ready` | the agent machine is unreachable; nothing was saved |
+| 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
+| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved |
 | 503 | `machine_uncertain` | an update may have been half-applied on the machine; read the webhook again |
 
 Limit: 60 requests per minute per token.
@@ -59,6 +60,12 @@ DELETE /orgs/:org/tasks/:id[?week]                       → 204
 POST   /orgs/:org/tasks/:id/subtasks[?week]              {text, assignee?} → 201 {data:item}
 PATCH  /orgs/:org/tasks/:id/subtasks/:sid[?week]         {text?, done?, assignee?, today?} → {data:item}
 DELETE /orgs/:org/tasks/:id/subtasks/:sid[?week]         → {data:item}
+POST   /orgs/:org/tasks/:id/delegate[?week]              {agent?} → 201 {data:{task:item, session:{id, title, agent, url}}}
+POST   /orgs/:org/tasks/:id/breakdown[?week]             {agent?} → {data:{task:item, agent, added:[subtask…]}}
+
+GET    /orgs/:org/days[?week]                            → {data:{week, days:[{day, closed, closed_at, score, entry}]}}
+GET    /orgs/:org/days/:day                              → {data:{day, closed, closed_at, score, entry|null}}
+PUT    /orgs/:org/days/:day                              {shipped?, blockers?, learnings?, reflection?, close?} → {data:{…as GET…}}
 ```
 
 - `token.organization` is `{slug, name}` for a token limited to one organization, otherwise `null`.
@@ -168,3 +175,63 @@ keys are ignored.
   task with the older `one_thing` section moves to the end of `the_rest`.
 - Every write bumps the week's `version`.
 - Subtasks take `text`, `done`, `assignee` and `today` with the same rules.
+
+## Agents on tasks
+
+`POST /tasks/:id/delegate` and `POST /tasks/:id/breakdown` start an agent session, so they need a role
+that may start one (members who can do so from the app); anyone else gets 403. Reading the task is
+also required, and an unknown task id (in that week) is 404. `?week` selects the week the task id
+belongs to.
+
+`agent` (optional) is an agent's `profile_name`. Without it the task's assignee is used if it is an
+active agent, otherwise the organization's primary agent. An unknown or paused agent, or an
+organization with no agent at all, is 422 `fields.agent`.
+
+**Delegate.** Opens a new session for the agent, seeded with the stored task's text and description
+(the body cannot supply them), then records on the task `delegated_to` and `delegated_at`. The answer is
+201 with the updated `task` and the `session`: `id`, `title` (a string or `null` while it is untitled),
+`agent` (a display string; do not parse it) and `url` (an absolute link to the session). Calling it again
+opens another session. The session is opened before it is recorded on the task: if the task is deleted
+in between you get 404 and the session still exists.
+
+**Breakdown.** Asks the agent for subtasks and appends them, up to 5 per task, then returns the updated
+`task`, the agent's display name in `agent`, and `added`, the new subtask items in order. The request is
+synchronous and can take up to about 90 seconds, so clients should allow at least 90 s (the CLI waits
+100 s). Errors, none of which saves anything: 422 `fields.subtasks` when the task already has 5; 422
+`fields.agent`; 503 `machine_not_ready` when the agent machine is not connected or unreachable; and
+502 `agent_failed` when the agent's reply was unusable, too slow or refused, with a human-readable
+`message`. If a client gives up waiting, the subtasks may still land; read the task to find out.
+
+## Days (close of day)
+
+A day is a weekday, `YYYY-MM-DD`, Monday to Friday; anything malformed or on a weekend is 422
+`fields.day`. These routes only ever show and change **your own** entries, never a teammate's.
+`?week` on `GET /days` works as for tasks (any date, normalised to Monday; malformed is 422
+`fields.week`). Responses carry `Cache-Control: no-store`.
+
+`GET /days` returns the week's five weekdays in order. `closed` is true once the entry has been closed
+(`closed_at` is then an ISO 8601 time); `score` is the stored score or `null`. A day with nothing saved
+has `entry:null`, `closed:false`, `closed_at:null`, `score:null`.
+
+```jsonc
+"entry": {
+  "shipped": "…", "reflection": "…",
+  "blockers":  [{"id": "b1", "text": "…"}],
+  "learnings": [{"id": "l1", "text": "…"}],
+  "summary": {"tasks_created": 0, "tasks_done": 0, "one_thing_progress": null, "learnings": 0,
+              "allocation": [{"tag": "pricing", "count": 2}]},
+  "agent_note": null,             // string once the agent has written one
+  "week_close": false
+}
+```
+
+`PUT /days/:day` saves the entry and answers with the same shape as `GET /days/:day`.
+
+- **Merge.** Keys you do not send keep their stored value. `blockers` and `learnings` are arrays of
+  strings that **replace** the stored list (ids are assigned `b1…` / `l1…` in order). `shipped` and
+  `reflection` are strings.
+- **`close`** is a boolean, default `true`: the entry is marked closed and `closed_at` is set.
+  `close:false` saves a draft and leaves `closed_at` as it was (an already closed day stays closed).
+- **Read-only.** `summary`, `score` and `agent_note` are computed by the server; sending them is
+  ignored, as are other unknown keys. Closing a week is not available through the API.
+- Types are strict; a wrong type is 422 on that field.

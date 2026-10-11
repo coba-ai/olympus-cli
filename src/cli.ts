@@ -286,31 +286,41 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
   }
 }
 
-export function processIo(): Io {
-  let rl: Interface | undefined;
+type LineReader = Pick<Interface, "on" | "setPrompt" | "prompt" | "close">;
+
+// Measured on Bun 1.3: question() drops lines that arrive between questions and a pending one never settles on close,
+// so lines are queued here instead. Ctrl-C reaches readline as a "SIGINT" event only once the tty is raw; before that
+// the default signal kills the process (also 130).
+export function lineAsker(rl: LineReader): (prompt: string) => Promise<string | null> {
   let closed = false;
   const typed: string[] = []; // lines that arrived while no question was pending (type-ahead, paste)
   let pending: { res: (s: string | null) => void; rej: (e: Error) => void } | undefined;
-  // Measured on Bun 1.3: question() drops lines that arrive between questions and a pending one never settles on close,
-  // so lines are queued here instead. Ctrl-C reaches readline as a "SIGINT" event only once the tty is raw; before that
-  // the default signal kills the process (also 130).
-  const ask = (prompt: string) => {
-    if (!rl) {
-      rl = createInterface({ input: process.stdin, output: process.stderr });
-      rl.on("line", (l) => { const p = pending; pending = undefined; if (p) p.res(l); else typed.push(l); });
-      rl.on("close", () => { closed = true; const p = pending; pending = undefined; p?.res(null); });
-      rl.on("SIGINT", () => {
-        const p = pending;
-        pending = undefined;
-        rl!.close();
-        p?.rej(new CliError(130, { error: { code: "cancelled", message: "cancelled; nothing was saved" } }));
-      });
-    }
+  rl.on("line", (l) => { const p = pending; pending = undefined; if (p) p.res(l); else typed.push(l); });
+  rl.on("close", () => { closed = true; const p = pending; pending = undefined; p?.res(null); });
+  rl.on("SIGINT", () => {
+    const p = pending;
+    pending = undefined;
+    rl.close();
+    p?.rej(new CliError(130, { error: { code: "cancelled", message: "cancelled; nothing was saved" } }));
+  });
+  return (prompt) => {
     if (typed.length) return Promise.resolve(typed.shift()!);
     if (closed) return Promise.resolve(null);
     rl.setPrompt(prompt);
     rl.prompt();
     return new Promise<string | null>((res, rej) => { pending = { res, rej }; });
+  };
+}
+
+export function processIo(): Io {
+  let rl: Interface | undefined;
+  let asker: ReturnType<typeof lineAsker> | undefined;
+  const ask = (prompt: string) => {
+    if (!asker) {
+      rl = createInterface({ input: process.stdin, output: process.stderr });
+      asker = lineAsker(rl);
+    }
+    return asker(prompt);
   };
   return {
     env: process.env, home: homedir(), tty: process.stdout.isTTY === true, stdin: () => Bun.stdin.text(),
