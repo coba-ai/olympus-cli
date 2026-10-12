@@ -35,7 +35,7 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
 | 503 | `crm_unavailable` | the CRM cannot be reached right now; see `Retry-After` (seconds) |
-| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)); with an `Idempotency-Key` the message says to retry with the same key (see [Idempotent creates](#idempotent-creates)) |
+| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)); with an `Idempotency-Key` follow the message: it says whether a retry with the same key is safe or to read the record and not repeat the request (see [Idempotent creates](#idempotent-creates)) |
 | 503 | `machine_uncertain` | an update may have been half-applied on the machine; read the webhook again |
 
 Limit: 60 requests per minute per token.
@@ -411,7 +411,7 @@ tasks answer 409 `machine_needs_update` while the organization's agent machine h
 to support them; try again later. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
 `details.saved` (true: the change may already be saved) and `details.id` (on create). When `saved` is true no
 `Retry-After` is sent and you must not retry blindly: read the record first. A create sent with an
-`Idempotency-Key` does not change that: with `saved` true, read the record (`details.id`) and retry with the same key only if it is not there. Without `saved`, retry with the same key (below).
+`Idempotency-Key` does not change that: with `saved` true, follow the message, which says whether a retry with the same key is safe (the agent machine confirmed it stored the key) or to read the record (`details.id`) and not repeat the request. Without `saved` (network error, timeout), look for the record first and retry with the same key if it is missing (below).
 
 ## Idempotent creates
 
@@ -438,7 +438,7 @@ POST /orgs/:org/crm/pipelines        POST /orgs/:org/crm/companies/:id/tasks
   machine has not been updated and did not store the key, so a retry could create a duplicate. Look for
   the record before retrying.
 - **Unsure outcome.** A 503 `machine_not_ready` with `details.saved` and a key sent means the create may or
-  may not have happened. When `saved` is true, read the record first (`details.id`), and retry with the same `Idempotency-Key` only if it is not there; a machine that has not been updated does not store the key.
+  may not have happened. When `saved` is true, follow the message: it says whether a retry with the same `Idempotency-Key` is safe or to read the record (`details.id`) and not repeat the request; a machine that has not been updated does not store the key.
 
 ## Subscriptions
 

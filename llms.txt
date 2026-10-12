@@ -49,7 +49,7 @@ Exit codes (use them, not message text):
 | 2 | auth | token missing, wrong or revoked: ask a person for a new one |
 | 3 | not found | wrong id, wrong week, or an org you cannot see. Tasks are per week: retry with `--week` |
 | 4 | forbidden | your role cannot do this (e.g. a `teammate` writing webhooks, CRM or subscriptions) |
-| 5 | server / network / rate limit / CRM temporarily unavailable | retry once after a pause (for `crm_unavailable`, the seconds stated) unless `--json` stderr has `details.saved: true` (the write may have landed: read the record; read the record first; retry a CRM create only if it is missing, with the same `--idempotency-key`); limit is 60 requests per minute per token |
+| 5 | server / network / rate limit / CRM temporarily unavailable | retry once after a pause (for `crm_unavailable`, the seconds stated) unless `--json` stderr has `details.saved: true` (the write may have landed: follow the server message, which says whether a retry with the same `--idempotency-key` is safe or to read the record and not repeat the request); limit is 60 requests per minute per token |
 | 6 | invalid, conflict (record changed since you read it), CRM not set up | read `error.code` (see Rules); do not retry unchanged |
 | 130 | cancelled | |
 
@@ -156,7 +156,7 @@ olympus crm deal delete <id> --yes
 
 - `--version V` (from `get --json` `.data.version`): if the record changed since, the write fails with exit 6 `conflict`. Without it the last writer wins for the fields you send.
 - `--add-tag` / `--remove-tag` is a read then a write, not atomic (unlike task tags): on exit 6 run it again.
-- Idempotent creates: pass your own `--idempotency-key K` (a fresh UUID) on `crm deal add|note|task add`, `crm person|company add`, `crm person|company task add` and `crm pipeline add`. After exit 5, retry with the SAME K: it replays instead of creating, unless the agent machine is not updated yet, so check for the record first. If you passed no key, the generated one is not shown in piped or `--json` output: look for the record (`crm search` / `get`) before retrying, even if the error message says to retry with the same key. An agent machine that has not been updated may not honour the key, so check for the record then too.
+- Idempotent creates: pass your own `--idempotency-key K` (a fresh UUID) on `crm deal add|note|task add`, `crm person|company add`, `crm person|company task add` and `crm pipeline add`. After exit 5 with `details.saved: true`, follow the server message. After exit 5 without `saved` (network, timeout), look for the record first; if it is missing, retry with the SAME K: it replays instead of creating, unless the agent machine is not updated yet. A terminal shows the key it sent; if you passed no key in piped or `--json` mode, the generated one is not shown: look for the record (`crm search` / `get`) before retrying. An agent machine that has not been updated may not honour the key, so check for the record then too.
 - Pipeline add/update/archive are operator actions: do them only when the person asks.
 - Exit 6 `crm_not_set_up`: stop and tell the person. Exit 5 `crm_unavailable`: retry after the stated seconds.
 
@@ -188,7 +188,7 @@ olympus subscription delete <id> --yes
 - Before changing a task, read it (`task get`) so you act on the right id and week.
 - Exit 4: report the server's message. Exit 6: read `error.code` from `--json` stderr. `conflict`: `get` again, then retry once. `crm_not_set_up`: stop and tell the person. `invalid`: fix the input; never resend it unchanged.
 - `subscription create` is not idempotent: after exit 5, list before retrying. For CRM creates see the idempotency line under CRM.
-- Exit 5 with `details.saved: true` in --json stderr: the write may have happened. `get`/list the record (create returns `details.id`); retry a CRM create (same `--idempotency-key`) only if it is not there. Exit 5 without `saved` (network, timeout): retry with the same key.
+- Exit 5 with `details.saved: true` in --json stderr: the write may have happened. follow the server message: it says whether a retry with the same `--idempotency-key` is safe (the agent machine confirmed it stored the key) or to read the record (create returns `details.id`) and not repeat the request. Exit 5 without `saved` (network, timeout): look for the record first (`crm search` / `get`); if it is missing, retry with the same `--idempotency-key`.
 - `--stage` needs `--pipeline` on `crm deals` and `deal add`.
 - Prefer `--json` and read ids from it. Never guess an id.
 - Do not `delegate` or `breakdown` on your own initiative; they start work for other agents.

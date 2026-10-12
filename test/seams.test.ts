@@ -71,7 +71,7 @@ test("idempotencyKey", () => {
     expect(() => idempotencyKey(bad)).toThrow("--idempotency-key must be 1-128 characters from A-Z a-z 0-9 _ . : -");
 });
 
-const HINT = "To retry with the same key, run the same command with --idempotency-key K9";
+const HINT = "The idempotency key sent was K9; to retry with it, add --idempotency-key K9";
 async function failing(status: number | "network", tty: boolean, json: boolean) {
   let call;
   if (status === "network") call = api("http://127.0.0.1:1", "t");
@@ -103,7 +103,7 @@ test("create sends the key; hint only on exit 5, terminal, not --json", async ()
   expect(n.err.trimEnd().split("\n").at(-1)).toBe(HINT);
 });
 
-test("no hint when the server says the create may be saved", async () => {
+test("saved create: server message as-is, then only the key sent", async () => {
   fake.state.next = { status: 503, body: { error: { code: "machine_not_ready", message: "boom", details: { saved: true, id: "d_9" } } } };
   let err = "";
   try {
@@ -113,7 +113,7 @@ test("no hint when the server says the create may be saved", async () => {
     const code = fail({ env: {}, home: "", stdin: async () => "", out() {}, err: (s) => { err += s; }, tty: true }, false, e as CliError);
     expect(code).toBe(5);
   }
-  expect(err).toBe("error: boom\n");
+  expect(err).toBe(`error: boom\n${HINT}\n`);
 });
 
 test("other exits never get the hint", async () => {
