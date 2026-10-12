@@ -35,7 +35,7 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
 | 503 | `crm_unavailable` | the CRM cannot be reached right now; see `Retry-After` (seconds) |
-| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write whose `details.saved` is `true` (see [CRM](#crm)) |
+| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)) |
 | 503 | `machine_uncertain` | an update may have been half-applied on the machine; read the webhook again |
 
 Limit: 60 requests per minute per token.
@@ -323,7 +323,7 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
   "tags": ["…"], "archived": false, "version": "<opaque>", "open_deals": 0 }
 
 // person and company, single-record responses also carry
-"deals": [{"id": "…", "name": "…", "pipeline": "<pipeline id>", "stage": {"name": "…", "kind": "…"}, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
+"deals": [{"id": "…", "name": "…", "pipeline": {"id": "…", "name": "…"} | null, "stage": {"name": "…", "kind": "…"} | null, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
 // pipeline (live pipelines and stages only)

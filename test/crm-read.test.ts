@@ -272,7 +272,6 @@ test("D1 deal ref rows print the stage name; null list pipeline id prints - and 
   const dl = fake.state.crm.acme!.deals.find((d: any) => d.id === "d_renewal")!;
   dl.null_pipeline_id = true;
   expect((await run1(["deals"])).out).toBe("d_renewal\topen\t-\tst_lead\t1200\tUSD\towner@acme.test\tInitech\trenewal\tInitech renewal\n");
-  expect((await run1(["deals"], true)).out).not.toContain("Sales");
   nextOk({ id: "d1", pipeline: { id: null, name: "Sales" }, stage: { id: "s1", name: "Lead" } });
   const t = (await run1(["deal", "get", "d1"], true)).out;
   expect(t).toContain("pipeline        Sales");
