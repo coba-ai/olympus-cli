@@ -108,8 +108,10 @@ Subscriptions (`olympus subscription …`) send signed HTTP events to your URL w
 exit 4). `create` and `rotate-secret` print the signing `secret` once; it cannot be read again. Rotating
 makes no promise that the old secret keeps working. `delete` never prompts and requires `--yes`.
 `--event` is repeatable and replaces the list on `update`; `--active` / `--inactive` switch delivery.
-`ping` sends one test event: it is delivered whatever `events` says, does not count toward
-`consecutive_failures`, and exits 0 whether or not your URL answered, so read `delivered`. Verifying
+`ping` sends one test event (it is not an event type you can subscribe to): it does not count toward
+`consecutive_failures` and exits 0 whether or not your URL answered, so read `delivered`; `status` is `-` on a
+network failure and `error` says why. It can be rate limited (exit 5: retry after the stated seconds). A
+subscription pauses after 20 failed events in a row; re-enable it with `update <id> --active`. Verifying
 signatures: [`docs/API.md`](docs/API.md#receiving-events).
 
 Agents and days:

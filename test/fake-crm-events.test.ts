@@ -165,6 +165,12 @@ test("AC5 subscriptions: operator only, validation, secret once, ping, delete", 
   expect((await sub("GET", "", undefined, TOKENS.teammate)).status).toBe(403);
   expect((await sub("GET", "/sub_000000000001", undefined, TOKENS.teammate)).status).toBe(403);
   expect((await sub("GET", "/nope")).status).toBe(404);
+  expect((await sub("GET", "/nope", undefined, TOKENS.teammate)).status).toBe(403);
+  for (const [m, p] of [["PATCH", "/nope"], ["DELETE", "/nope"], ["POST", "/nope/ping"]]) expect((await sub(m!, p!, {}, TOKENS.teammate)).status).toBe(403);
+  for (const m of ["POST", "PATCH"]) {
+    const r = await sub(m, m === "POST" ? "" : "/sub_000000000001", { name: "n", url: "u", events: ["ping"] });
+    expect([m, r.status, r.json.error.details.fields.events === undefined]).toEqual([m, 422, false]);
+  }
   expect((await sub("GET", "/sub_000000000001")).json.data.name).toBe("seed");
 
   const c = await sub("POST", "", { name: "n", url: "https://x.test/h", events: ["*"] });
@@ -175,7 +181,7 @@ test("AC5 subscriptions: operator only, validation, secret once, ping, delete", 
   expect((await sub("GET", `/${c.json.data.id}`)).json.secret).toBeUndefined();
   for (const events of [[], ["bogus"], "task.created", undefined, ["*", "task.created"]])
     expect((await sub("POST", "", { name: "n", url: "u", events })).json.error.details.fields.events).toBeDefined();
-  const m = await sub("POST", "", { events: ["ping"] });
+  const m = await sub("POST", "", { events: ["task.created"] });
   expect(m.status).toBe(422);
   expect(Object.keys(m.json.error.details.fields).sort()).toEqual(["name", "url"]);
 
@@ -191,7 +197,7 @@ test("AC5 subscriptions: operator only, validation, secret once, ping, delete", 
 
   const et = await api("GET", "/event_types", undefined, TOKENS.teammate);
   expect(et.status).toBe(200);
-  expect(et.json.data).toEqual(["task.created", "task.updated", "task.completed", "task.reopened", "task.assigned", "task.deleted", "task.delegated", "ping"]);
+  expect(et.json.data).toEqual(["task.created", "task.updated", "task.completed", "task.reopened", "task.assigned", "task.deleted", "task.delegated"]);
   fake.state.subscriptions = seedSubscriptions();
   expect((await sub("GET", "")).json.data).toHaveLength(1);
 });

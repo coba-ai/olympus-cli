@@ -367,7 +367,8 @@ after `Retry-After` seconds), 409 `conflict` (above), plus the existing 409 `mac
 
 Subscriptions send task events to your URL ([Receiving events](#receiving-events)). **Every route here
 needs `operator`, reads included**: a subscriber URL can itself be a secret. A member who is not an operator
-gets 403 `forbidden`.
+gets 403 `forbidden` on every route here, even for an id that does not exist. For an operator, an unknown
+id is 404.
 
 ```
 GET    /orgs/:org/subscriptions                       → {data:[sub]}
@@ -388,15 +389,18 @@ GET    /orgs/:org/event_types                         → {data:["task.created",
   "consecutive_failures": 0, "created_at": "…" }
 ```
 
-- `events` is a non-empty list of types from `GET /event_types`, or `["*"]` for all of them. An unknown
-  type is 422 `fields.events`. A `url` that is not `https`, or that points at a private address, is 422
+- `events` is a non-empty list of types from `GET /event_types` (the seven `task.*` types), or `["*"]` for
+  all of them. An unknown type is 422 `fields.events`; so is `"ping"`, which is not subscribable. A `url` that is not `https`, or that points at a private address, is 422
   `fields.url`.
 - At most 10 subscriptions per organization (422 `fields.base`).
 - The `secret` is returned once, on create and on `rotate_secret`, and cannot be read again. Rotating
   replaces it; do not rely on the old secret still working.
 - `ping` sends one `ping` event synchronously and makes a single attempt. It is delivered whatever `events`
   says and does not change `consecutive_failures`. The answer is `delivered` (a 2xx came back), the HTTP
-  `status` (or `null`) and a short `error` string (or `null`).
+  `status` (`null` on a network failure) and a short `error` string (or `null`): `HTTP <n>`, `timeout`,
+  `could not connect`, `TLS error` or `address not allowed or not found`. The ping event has `week: null`,
+  `actor: null` and `data: {}`. One ping runs at a time, and at most 6 a minute per subscription; beyond
+  that it is 429 `rate_limited` with `Retry-After`.
 - `PATCH` with `active: true` re-enables a subscription and resets `consecutive_failures` to 0.
 
 ## Receiving events
@@ -408,14 +412,14 @@ When a task on the weekly board changes (from the app, the API or an agent), Oly
 
 | type | fires when |
 |---|---|
-| `task.created` | a task is added |
+| `task.created` | a task is added (alone: no `task.updated`) |
 | `task.updated` | any change to an existing task: text, description, section, tags, flags, assignee, done, subtasks, delegation |
 | `task.completed` | a task becomes done (also sends `task.updated`) |
 | `task.reopened` | a done task is reopened (also sends `task.updated`) |
-| `task.assigned` | the assignee changes (also sends `task.updated`) |
-| `task.delegated` | a task is delegated to an agent (also sends `task.updated`) |
-| `task.deleted` | a task is deleted |
-| `ping` | only from the `ping` endpoint; always delivered |
+| `task.assigned` | the assignee changes, including to nobody (also sends `task.updated`) |
+| `task.delegated` | `delegated_to` becomes non-null (also sends `task.updated`) |
+| `task.deleted` | a task is deleted (alone: no `task.updated`) |
+| `ping` | not subscribable and not in `GET /event_types`; only sent by the `ping` endpoint |
 
 The specific types are sent in addition to `task.updated`, so subscribe to what you want. Reordering alone
 sends nothing. A change to a subtask is a `task.updated` of the parent task, with `changes.subtasks`. A
@@ -435,8 +439,8 @@ task and type, after it has been saved.
 { "id": "evt_…", "type": "task.completed", "created_at": "2026-10-12T15:04:05Z",
   "organization": {"slug": "acme"},
   "subscription": "sub_…",
-  "actor": {"id": "u_12", "name": "Ann Lee", "kind": "user"} | null,   // null when unknown
-  "week": "2026-10-12",
+  "actor": {"id": "u_12", "name": "Ann Lee", "kind": "user"} | null,   // null when unknown (and on ping)
+  "week": "2026-10-12",   // null on ping
   "data": {
     "task": {…},      // the task item, as GET /orgs/:org/tasks/:id returns it; for task.deleted, its last state
     "changes": {"done": {"from": false, "to": true}}   // {field: {from, to}}; omitted on created and deleted
@@ -453,8 +457,9 @@ UTF-8 JSON of at most 256 KB; if it would be larger, `description` fields are tr
 - One request per event and subscription. Timeouts: 5 s to connect, 10 s to read. Redirects are not
   followed; a 3xx counts as a failure. Any 2xx is success.
 - Network errors, timeouts, 408, 429 and 5xx are retried, up to 6 attempts in all, with a growing delay
-  (up to about an hour). Any other 4xx is not retried.
-- Delivery is at-least-once: dedupe on `X-Request-ID`. Order is not guaranteed.
+  (roughly n⁴ × 3 s, about 49 minutes across the 6 attempts). Any other 4xx is not retried.
+- Delivery is best-effort at-least-once: duplicates are possible, so dedupe on `X-Request-ID`. An event can
+  be lost if the server stops between saving the task and queueing the event. Order is not guaranteed.
 - After 20 failed events in a row the subscription is switched off (`active: false`). Re-enable it with
   `PATCH` `active: true`, which resets the counter. A success resets it too.
 - URLs must be `https`. Private, loopback, link-local and cloud-metadata addresses are refused when sending.

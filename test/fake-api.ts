@@ -357,7 +357,7 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
   return NF;
 }
 
-const EVENT_TYPES = ["task.created", "task.updated", "task.completed", "task.reopened", "task.assigned", "task.deleted", "task.delegated", "ping"];
+const EVENT_TYPES = ["task.created", "task.updated", "task.completed", "task.reopened", "task.assigned", "task.deleted", "task.delegated"];
 
 export function seedSubscriptions(): Record<string, Item[]> {
   return {
@@ -371,7 +371,7 @@ export function seedSubscriptions(): Record<string, Item[]> {
 
 // path = segments after /subscriptions. Operator only, reads included.
 function subsApi(L: Item[], method: string, path: string[], body: unknown, operator: boolean): Res {
-  if (!operator) return FORBIDDEN;
+  if (!operator) return FORBIDDEN; // before the id is looked up: a teammate never learns whether an id exists
   const b: Item = typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Item) : {};
   const [id, act] = path;
   const secret = () => randomBytes(32).toString("hex");

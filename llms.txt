@@ -165,6 +165,8 @@ olympus subscription delete <id> --yes
 ```
 
 - Everything here needs the `operator` role (reads too), except `event-types`.
+- `ping` is not an event type you can subscribe to. It may be rate limited (exit 5: wait the stated seconds).
+- After 20 failed events in a row a subscription is paused; `update <id> --active` re-enables it, only if the person asks.
 - Store a printed secret immediately; it cannot be read again. Never print it again or put it in a log or ticket.
 - Payload and signature verification: docs/API.md, "Receiving events".
 

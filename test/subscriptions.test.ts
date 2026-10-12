@@ -45,9 +45,9 @@ test("AC15 requests: paths and bodies", async () => {
   expect(last().body).toEqual({ name: "N", url: "https://x.test/h", events: ["task.created", "task.deleted"] });
   await sub(["subscription", "create", "--name", "N", "--url", "https://x.test/h", "--event", "*"]);
   expect(last().body).toEqual({ name: "N", url: "https://x.test/h", events: ["*"] });
-  await sub(["subscription", "update", ID, "--name", "M", "--url", "https://y.test", "--event", "ping", "--inactive"]);
+  await sub(["subscription", "update", ID, "--name", "M", "--url", "https://y.test", "--event", "task.created", "--inactive"]);
   expect([last().method, last().path]).toEqual(["PATCH", `/api/v1/orgs/acme/subscriptions/${ID}`]);
-  expect(last().body).toEqual({ name: "M", url: "https://y.test", events: ["ping"], active: false });
+  expect(last().body).toEqual({ name: "M", url: "https://y.test", events: ["task.created"], active: false });
   await sub(["subscription", "update", ID, "--active"]);
   expect(last().body).toEqual({ active: true });
   await sub(["subscription", "rotate-secret", ID]);
@@ -62,7 +62,7 @@ test("AC15 requests: paths and bodies", async () => {
 
 test("AC15 usage errors: exit 1, zero requests, no token needed", async () => {
   const bad = [
-    ["subscription", "create", "--url", "u", "--event", "ping"], ["subscription", "create", "--name", "n", "--event", "ping"],
+    ["subscription", "create", "--url", "u", "--event", "task.created"], ["subscription", "create", "--name", "n", "--event", "task.created"],
     ["subscription", "create", "--name", "n", "--url", "u"], ["subscription", "update", ID],
     ["subscription", "update", ID, "--active", "--inactive"], ["subscription", "update", ID, "--no-active"], ["subscription", "update", ID, "--no-inactive"],
     ["subscription", "delete", ID], ["subscription", "get", ".."], ["subscription", "get", "."], ["subscription", "get", ""],
@@ -103,7 +103,7 @@ test("AC15 delete never prompts and prints deleted <id> / json / sentence", asyn
 });
 
 test("AC16 secret appears once on create and rotate-secret, every mode", async () => {
-  const create = ["subscription", "create", "--name", "N", "--url", "https://x.test/h", "--event", "ping"];
+  const create = ["subscription", "create", "--name", "N", "--url", "https://x.test/h", "--event", "task.created"];
   for (const args of [create, ["subscription", "rotate-secret", ID]]) {
     for (const mode of ["piped", "tty", "json"]) {
       const r = await sub(mode === "json" ? [...args, "--json"] : args, mode === "tty");
@@ -122,7 +122,7 @@ test("AC16 secret appears once on create and rotate-secret, every mode", async (
 
 test("AC16 an injected data.secret still prints the secret once (piped and TTY)", async () => {
   for (const tty of [false, true]) {
-    fake.state.next = { status: 200, body: { data: { id: ID, name: "n", secret: "LEAK1", events: ["ping"], active: true }, secret: "REAL1" } };
+    fake.state.next = { status: 200, body: { data: { id: ID, name: "n", secret: "LEAK1", events: ["task.created"], active: true }, secret: "REAL1" } };
     const r = await sub(["subscription", "rotate-secret", ID], tty);
     expect(count(r.out, "REAL1")).toBe(1);
     expect(r.out).not.toContain("LEAK1");
@@ -133,13 +133,13 @@ test("AC16 an injected data.secret still prints the secret once (piped and TTY)"
 test("AC17 piped goldens", async () => {
   expect((await sub(["subscription", "list"])).out).toBe(`${ID}\tactive\ttask.completed\t-\t0\thttps://example.test/hook\tseed\n`);
   expect((await sub(["subscription", "get", ID])).out).toBe(SEED_DETAIL);
-  const u = await sub(["subscription", "update", ID, "--inactive", "--event", "task.created", "--event", "ping"]);
-  expect(u.out).toBe(SEED_DETAIL.replace("events: task.completed", "events: task.created,ping").replace("active: true", "active: false"));
+  const u = await sub(["subscription", "update", ID, "--inactive", "--event", "task.created", "--event", "task.deleted"]);
+  expect(u.out).toBe(SEED_DETAIL.replace("events: task.completed", "events: task.created,task.deleted").replace("active: true", "active: false"));
   expect((await sub(["subscription", "ping", ID])).out).toBe("delivered: true\nstatus: 200\nerror: -\n");
   fake.state.next = { status: 200, body: { data: { delivered: false, status: null, error: "connection refused" } } };
   const p = await sub(["subscription", "ping", ID]);
   expect([p.code, p.out]).toEqual([0, "delivered: false\nstatus: -\nerror: connection refused\n"]);
-  expect((await sub(["event-types"])).out).toBe("task.created\ntask.updated\ntask.completed\ntask.reopened\ntask.assigned\ntask.deleted\ntask.delegated\nping\n");
+  expect((await sub(["event-types"])).out).toBe("task.created\ntask.updated\ntask.completed\ntask.reopened\ntask.assigned\ntask.deleted\ntask.delegated\n");
   fake.state.subscriptions.acme = [];
   const e = await sub(["subscription", "list"]);
   expect([e.code, e.out]).toEqual([0, ""]);
@@ -175,7 +175,7 @@ test("AC17 hostile server strings never reach stdout", async () => {
   for (const tty of [false, true]) {
     for (const [args, body] of [
       [["subscription", "list"], { data: [bad] }], [["subscription", "get", "s"], { data: bad }], [["subscription", "update", "s", "--active"], { data: bad }],
-      [["subscription", "create", "--name", "n", "--url", "u", "--event", "ping"], { data: bad, secret: EVIL }], [["subscription", "rotate-secret", "s"], { data: bad, secret: EVIL }],
+      [["subscription", "create", "--name", "n", "--url", "u", "--event", "task.created"], { data: bad, secret: EVIL }], [["subscription", "rotate-secret", "s"], { data: bad, secret: EVIL }],
       [["subscription", "ping", "s"], { data: { delivered: false, status: EVIL, error: EVIL } }], [["subscription", "ping", "s"], { data: { delivered: true, status: EVIL } }], [["event-types"], { data: [EVIL] }],
     ] as [string[], unknown][]) {
       fake.state.next = { status: 200, body };
@@ -188,7 +188,7 @@ test("AC17 hostile server strings never reach stdout", async () => {
 
 test("AC18 errors: teammate 4, event-types ok, 404 -> 3, 422 -> 6", async () => {
   const mate = { OLYMPUS_API_KEY: TOKENS.teammate };
-  for (const a of [["subscription", "list"], ["subscription", "get", ID], ["subscription", "create", "--name", "n", "--url", "u", "--event", "ping"],
+  for (const a of [["subscription", "list"], ["subscription", "get", ID], ["subscription", "create", "--name", "n", "--url", "u", "--event", "task.created"],
     ["subscription", "update", ID, "--active"], ["subscription", "delete", ID, "--yes"], ["subscription", "rotate-secret", ID], ["subscription", "ping", ID]]) {
     const r = await cli([...a, "--org", "acme"], { env: mate });
     expect([a.join(" "), r.code]).toEqual([a.join(" "), 4]);
@@ -208,7 +208,7 @@ test("AC18 errors: teammate 4, event-types ok, 404 -> 3, 422 -> 6", async () => 
 });
 
 test("AC18 token and secret sweep: errors never print the token, all exit non-zero", async () => {
-  const cmds = [["subscription", "list"], ["subscription", "create", "--name", "n", "--url", "u", "--event", "ping"], ["subscription", "rotate-secret", ID], ["subscription", "ping", ID], ["event-types"]];
+  const cmds = [["subscription", "list"], ["subscription", "create", "--name", "n", "--url", "u", "--event", "task.created"], ["subscription", "rotate-secret", ID], ["subscription", "ping", ID], ["event-types"]];
   for (const status of [401, 403, 404, 422, 503]) {
     for (const a of cmds) {
       for (const tty of [false, true]) {
@@ -239,4 +239,35 @@ test("a null data body does not crash list, get or ping", async () => {
       expect([args.join(" "), r.code, r.err.includes("internal")]).toEqual([args.join(" "), 0, false]);
     }
   }
+});
+
+test("E1 ping is not subscribable: create and update exit 6 naming events", async () => {
+  for (const a of [["subscription", "create", "--name", "n", "--url", "u", "--event", "ping"], ["subscription", "update", ID, "--event", "ping"]]) {
+    const r = await sub(a);
+    expect([r.code, r.err]).toEqual([6, expect.stringContaining("events")]);
+  }
+});
+
+test("E1 ping rate limited: 429 exits 5 with retry-after", async () => {
+  const body = { error: { code: "rate_limited", message: "Too many pings" } };
+  fake.state.next = { status: 429, body, headers: { "Retry-After": "10" } };
+  const r = await sub(["subscription", "ping", ID]);
+  expect([r.code, r.out, r.err]).toEqual([5, "", "error: Too many pings (retry after 10s)\n"]);
+  fake.state.next = { status: 429, body, headers: { "Retry-After": "10" } };
+  const j = await sub(["subscription", "ping", ID, "--json"]);
+  expect(j.code).toBe(5);
+  expect(JSON.parse(j.err)).toEqual(body);
+});
+
+test("E1 ping network failure: null status, exit 0", async () => {
+  const data = { delivered: false, status: null, error: "timeout" };
+  fake.state.next = { status: 200, body: { data } };
+  expect(await sub(["subscription", "ping", ID])).toMatchObject({ code: 0, out: "delivered: false\nstatus: -\nerror: timeout\n" });
+  fake.state.next = { status: 200, body: { data } };
+  expect(await sub(["subscription", "ping", ID], true)).toMatchObject({ code: 0, out: `Ping to ${ID}: not delivered (timeout)\n` });
+});
+
+test("E1 unknown id: teammate gets 403 (exit 4), operator 404 (exit 3)", async () => {
+  expect((await cli(["subscription", "get", "nope", "--org", "acme"], { env: { OLYMPUS_API_KEY: TOKENS.teammate } })).code).toBe(4);
+  expect((await sub(["subscription", "get", "nope"])).code).toBe(3);
 });
