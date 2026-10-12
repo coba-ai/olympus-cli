@@ -101,7 +101,7 @@ export function subscriptionPlan(pos: string[], v: Opts, io: Io, json: boolean, 
   if (!spec) throw usage(`unknown subscription command: ${pos.slice(1).join(" ")}`);
   for (const [k, x] of Object.entries(v)) {
     if (x === undefined || GLOBAL.includes(k)) continue;
-    if (!spec.flags.includes(k)) throw usage(`unknown option '--${k}' for ${key}`);
+    if (!spec.flags.includes(k)) throw usage(`unknown option '--${x === false ? "no-" : ""}${k}' for subscription ${key}`);
   }
   if (pos.length !== spec.n) throw usage(`expected ${spec.n} argument(s) in: ${pos.join(" ")}`);
   if (spec.n === 3) seg(pos[2]!);

@@ -42,7 +42,7 @@ const nm = (x: any): string | null => {
   return y == null || y === "" ? null : String(y);
 };
 const tt = (f: string, x: any, now: number): string | null =>
-  f.endsWith("_at") || f === "in_stage_since" ? (x == null ? null : Date.parse(x) > now ? new Date(Date.parse(x)).toISOString().slice(0, 16).replace("T", " ") + " UTC" : when(x, now)) : SC.includes(f) ? nm(sc(x)) : f === "archived" ? (x === true ? "yes" : null) : nm(x);
+  f.endsWith("_at") || f === "in_stage_since" ? (x == null ? null : when(x, now)) : SC.includes(f) ? nm(sc(x)) : f === "archived" ? (x === true ? "yes" : null) : nm(x);
 
 const detail = (kind: Kind, d: any) => [
   ...KIND[kind].fields.map((f) => `${f}: ${cell(f, d[f])}`),

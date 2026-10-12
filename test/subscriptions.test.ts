@@ -79,6 +79,15 @@ test("AC15 usage errors: exit 1, zero requests, no token needed", async () => {
   }
 });
 
+test("create --no-active names the flag the user typed", async () => {
+  for (const f of ["active", "inactive"]) {
+    const r = await cli(["subscription", "create", "--name", "n", "--url", "u", "--event", "e", `--no-${f}`], { stdin: "" });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(`unknown option '--no-${f}' for subscription create`);
+    expect(reqs().length).toBe(0);
+  }
+});
+
 test("AC15 delete never prompts and prints deleted <id> / json / sentence", async () => {
   let asked = false;
   const home = await mkdtemp(join(tmpdir(), "oly-"));

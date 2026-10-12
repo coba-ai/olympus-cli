@@ -32,6 +32,14 @@ export function ago(iso: string | null | undefined, now: number): string {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return clean(iso);
   const s = (now - t) / 1000;
+  if (s < 0) { // future: up to 5 min ahead is clock skew; "+Nd", not "in Nd", because test/cli.test.ts:562 (frozen) needs one token before the paren
+    const f = -s;
+    if (f <= 300) return "just now";
+    if (f < 3600) return `+${Math.floor(f / 60)}m`;
+    if (f < 86400) return `+${Math.floor(f / 3600)}h`;
+    if (f < 30 * 86400) return `+${Math.floor(f / 86400)}d`;
+    return new Date(t).toISOString().slice(0, 10);
+  }
   if (s < 45) return "just now";
   if (s < 3600) return `${Math.max(1, Math.floor(s / 60))}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
