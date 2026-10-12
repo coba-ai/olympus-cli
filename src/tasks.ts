@@ -7,7 +7,14 @@ type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
 export type Plan = (call: Api, org: () => Promise<string>) => Promise<void>;
 
 // Flags every command accepts; the rest are per subcommand.
-export const GLOBAL = ["json", "host", "org", "help"];
+const GLOBAL = ["json", "host", "org", "help"];
+// Rejects any flag outside `allowed` (+ GLOBAL), in the order typed; a negated boolean (value false) is named as typed, `--no-x`.
+export function checkFlags(v: Opts, allowed: string[], where?: string): void {
+  for (const [k, x] of Object.entries(v)) {
+    if (x === undefined || GLOBAL.includes(k) || allowed.includes(k)) continue;
+    throw usage(`unknown option '--${x === false ? "no-" : ""}${k}'${where ? " for " + where : ""}`);
+  }
+}
 
 // ---- write commands: each build() throws its usage errors synchronously, before the closure exists.
 const item = (c: Ctx, b: any, sentence: string) => print(c.io, c.json, b, () => detail(b.data), () => `${sentence}\n\n${block(b.data, c.now())}`);
@@ -153,10 +160,7 @@ export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () 
   const spec = Object.hasOwn(SPECS, key) && (isSub || !key.includes(" ")) && !(cmd === "task" && (key === "people" || key === "tags")) ? SPECS[key] : undefined;
   if (!spec) throw usage(`unknown task command: ${pos.slice(1).join(" ")}`);
   const n = cmd === "tasks" ? 1 : spec.n;
-  for (const [k, x] of Object.entries(v)) {
-    if (x === undefined || GLOBAL.includes(k)) continue;
-    if (!spec.flags.includes(k)) throw usage(`unknown option '--${k}' for ${cmd === "task" ? "task " + key : cmd}`);
-  }
+  checkFlags(v, spec.flags, cmd === "task" ? "task " + key : cmd);
   if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`);
   for (const i of ID_POS[key] ?? []) seg(pos[i]!);
   if (v.mine && v.who !== undefined) throw usage("give only one of --mine / --who");

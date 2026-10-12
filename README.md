@@ -49,7 +49,7 @@ olympus task breakdown <id> [--agent AGENT]     # ask an agent to add subtasks (
 olympus day [DATE] | day show [DATE]            # one day's close-of-day entry; DATE is YYYY-MM-DD, default today
 olympus day list [--week D]                     # the week's five weekdays
 olympus day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]
-olympus crm pipelines | crm tags [--entity E] | crm search QUERY [--entity E]
+olympus crm pipelines [--archived] | crm tags [--entity E] | crm search QUERY [--entity E]
 olympus crm deals [--pipeline ID] [--stage ID|none] [--status S] [--owner EMAIL|me|none] [--q T] [--archived] [--sort S] [--page N]
 olympus crm people | companies [--q T] [--archived] [--sort S] [--page N]
 olympus crm deal get <id> | add NAME | update <id> | move <id> STAGE_ID | owner <id> EMAIL|me|--none | archive <id> [--undo]
@@ -62,6 +62,15 @@ olympus crm deal person <id> PERSON_ID | --new NAME [--email E]
 olympus crm deal note <id> TEXT|-               # - reads the note from stdin
 olympus crm deal task add <id> TITLE [--due ISO] [--assign W] | task done <id> <task_id> [--undo]
 olympus crm person|company get <id> | archive <id> [--undo]
+olympus crm deal|person|company deletion-preview <id> | delete <id> --yes
+olympus crm deal unlink-company <id> | unlink-person <id>
+olympus crm task done <task_id> [--undo]        # any record's task, by task id
+olympus crm person|company task add <id> TITLE [--due ISO] [--assign W]
+olympus crm pipeline get <id> | archive <id> [--undo]
+olympus crm pipeline add NAME --stage NAME:KIND... [--currency C]...
+olympus crm pipeline update <id> [--name T] [--stage [ID=]NAME:KIND]... [--remove STAGE_ID:MOVE_TO_ID]...
+                                 [--restore ID]... [--currency C]... [--version V]
+olympus crm <create command> ... [--idempotency-key K]   # deal|person|company add, deal note, deal|person|company task add, pipeline add
 olympus crm person add NAME [--email E] [--phone P] [--job-title T] [--linkedin-url U] [--company ID | --new-company NAME]
 olympus crm company add NAME [--domain D] [--website U] [--industry T] [--linkedin-url U] [--phone P] [--city C]
 olympus crm person|company update <id> [--name T] [the add flags] [--notes T] [tag flags] [--version V]
@@ -91,17 +100,53 @@ and requires every tag given; `--backlog` keeps the backlog section. `--mine` wi
 `--open` with `--done`, are usage errors. An unknown `--who` is exit 6. Text that starts with `-` needs
 `--` (`olympus task add -- "-x"`).
 
-CRM (`olympus crm …`): any member can read; writing needs the `operator` role (a teammate gets exit 4).
-Records are deals, people and companies. `--version V` on an `update` is optional. Sent, the update is
-refused when the record changed since you read it (exit 6, "it changed since you read it"); omitted, the
-last writer wins for the fields you send. `--add-tag` / `--remove-tag` read the record and then write it
-with the version they read, so they are **not atomic**: on exit 6, run the command again.
-Any tag flag together with other fields is two server writes; if the second fails, the first stays.
-`archive` hides a record and is reversible with `--undo`; it needs no `--yes`. `--archived` on a list
-shows only archived records, `--sort` and `--page` are passed to the server (one page at a time), and
-`--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one
+CRM (`olympus crm …`): any member can read; writing needs the `operator` role (a teammate gets exit 4). Records are
+deals, people and companies. `--version V` on an `update` is optional. Sent, the update is refused when the record
+changed since you read it (exit 6, "it changed since you read it"); omitted, the last writer wins for the fields you
+send. `--add-tag` / `--remove-tag` read the record and then write it with the version they read, so they are **not
+atomic**: on exit 6, run the command again. Any tag flag together with other fields is two server writes; if the
+second fails, the first stays. `archive` hides a record and is reversible with `--undo`; it needs no `--yes`.
+`--archived` on a list shows only archived records, `--sort` and `--page` are passed to the server (one page at a
+time), and `--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one
 (`retry after Ns`) is exit 5. Exit 5 with `details.saved: true` (in `--json` stderr) means the change may already be
-saved: read the record, do not retry. `--stage` needs `--pipeline`.
+saved. For a create, follow the server message: it says whether a retry with the same `--idempotency-key` (below) is
+safe (the agent machine confirmed it stored the key) or to read the record (`details.id`) and not repeat the request;
+for any other write, read the record and do not retry. Exit 5 without `saved` (network error, timeout): look for the
+record first (`crm search` / `get`); if it is missing, retry with the same key. `--stage` needs `--pipeline`.
+
+`delete` removes a record for good and **cannot be undone** (unlike `archive`, which `--undo` reverses). It needs
+`--yes`, never prompts, and without `--yes` is exit 1 with no request. On a terminal it first fetches
+`deletion-preview` and prints the counts of what goes with the record (one extra request), then deletes; if the
+preview fails, nothing is deleted. Piped or with `--json` it sends the one delete. `deletion-preview` alone changes
+nothing. `deal unlink-company` / `unlink-person` detach the deal's company or person; `crm task done` marks any
+record's task done by its task id (`--undo` reopens it). `person|company task add` works like `deal task add`.
+Person and company detail list at most 10 open tasks, so after `task add` the new task may not be shown (the
+confirmation names no task id).
+
+Pipelines: reads are open to any member, but every pipeline write (`add`, `update`, `archive`) is operator only
+(a teammate gets exit 4). `pipelines --archived` includes archived pipelines. `--stage NAME:KIND` (`open`,
+`won` or `lost`; the kind is whatever follows the **last** colon, so a name may contain colons) is repeatable and
+sets the order; `pipeline add` needs at least one. `pipeline update` sends only what you give it, with no read
+first: `--stage` is then the **full ordered list of live stages**, and `ID=NAME:KIND` keeps the existing stage
+`ID` (renaming or reordering it) while a plain `NAME:KIND` is a new stage. A live stage left out of the list must
+be named in `--remove STAGE_ID:MOVE_TO_ID`, which moves its deals to `MOVE_TO_ID`; the server refuses the update
+otherwise (exit 6). `--restore ID` brings back an archived stage. `--currency` is repeatable and replaces the list.
+`--version V` works as on records.
+
+Idempotent creates: `deal|person|company add`, `deal note`, `deal|person|company task add` and `pipeline add`
+each send a fresh random `Idempotency-Key`. `--idempotency-key K` (1-128 characters from `A-Z a-z 0-9 _ . : -`)
+sends your own instead: the same K on a retry returns the original record rather than creating a second one, for
+24 hours. On a terminal, an exit-5 failure of a create ends with the key it sent
+(`The idempotency key sent was <key> (--idempotency-key <key> reuses it)`); the server message above it decides
+whether to retry. Piped or with `--json` that line is not printed, so scripts and agents should **always pass their
+own key** (a fresh UUID) on every create. After exit 5, retry with that same key only when the server message says to
+retry with the same Idempotency-Key; when it says "do not repeat the request", read the record instead. After a
+network error or timeout, look for the record (`crm search` / `get`) first and retry with the same key only if it is
+missing. An agent machine that has not been updated yet may not honour the key; the API says so in a response header
+(`Idempotency-Key-Honored: false`). The CLI does not show that header, so unless you know the organization's agent
+machine is up to date, look for the record before retrying even when the message says to retry with the same key.
+`crm person add --new-company` that exits 6 on `idempotency_key`: the company may already be saved (`details.id`
+in `--json`); do not retry with that key. Keys are per organization and last 24 hours.
 
 Subscriptions (`olympus subscription …`) send signed HTTP events to your URL when things happen
 (`olympus event-types` lists the names). They are **operator only, reads included** (a teammate gets
@@ -112,7 +157,8 @@ makes no promise that the old secret keeps working. `delete` never prompts and r
 `consecutive_failures` and exits 0 whether or not your URL answered, so read `delivered`; `status` is `-` on a
 network failure and `error` says why. It can be rate limited (exit 5: retry after the stated seconds). A
 subscription pauses after 20 failed events in a row; re-enable it with `update <id> --active`. Verifying
-signatures: [`docs/API.md`](docs/API.md#receiving-events).
+signatures: [`docs/API.md`](docs/API.md#receiving-events). Delivery is at-least-once, so receivers dedupe on
+`X-Request-ID` (keep seen ids at least 25 hours); events can arrive late or out of order.
 
 Agents and days:
 
@@ -162,7 +208,7 @@ Empty values count as unset. Stored credentials: `~/.config/olympus/credentials.
 ## Output and exit codes
 
 Human mode depends on where stdout goes. On a terminal you get headers, aligned columns, relative
-times ("3h ago"), a `*` on the default org in `org list`, and full-sentence confirmations; control
+times ("3h ago"; a time in the future reads `+5m`, `+3h` or `+8d`, and beyond 30 days it is the ISO date, while piped and `--json` output are unaffected), a `*` on the default org in `org list`, and full-sentence confirmations; control
 characters in server text are stripped from stdout on a terminal and server text in error messages is cleaned on stderr too (except with `--json`, where stderr is the error body as sent). Piped or redirected, you get plain tab-separated lines that
 scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
 emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms. `--json` prints the API body as-is (the one exception: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent), one compact line
@@ -207,7 +253,23 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `website`, `industry`, `linkedin_url`, `phone`, `city`, `tags`, `archived`, `version`, `notes`.
   Related rows follow, tab-separated: deals `note: id  created_at  author  body` and
   `task: id  status  due_at|-  assignee  title`; people `deal: id  status  stage-name  name`; companies
-  `person: id  email  full_name` and `deal: id  status  stage-name  name` (deal refs carry the stage name, not an id). Pass the `version` back as `--version`.
+  `person: id  email  full_name` and `deal: id  status  stage-name  name` (deal refs carry the stage name, not an id).
+  After those, all three kinds print `interaction: occurred_at  kind  direction  summary` lines (none if there
+  are none), and people and companies also print `task: id  status  due_at|-  assignee  title` lines (after the
+  `deal:` lines, before `interaction:`). A deal with `legacy_notes` prints a `legacy_notes: <text>` line right
+  after `version:` (flattened to one line); unlike every other field it is **absent**, not `-`, when empty.
+  Pass the `version` back as `--version`.
+- `crm deal|person|company deletion-preview <id>`: `entity:`, `id:`, `name:`, then one
+  `impact: <key><TAB><count>` line per key the server returns, in its order. The keys are server-defined (they
+  vary by record kind and can change), so print or loop over them all rather than expecting a fixed set.
+  `crm ... delete` prints `deleted <id>`; `--json` prints `{"data":{"id":…,"deleted":true}}`.
+- `crm task done` prints one line, `task: id  status  due_at|-  assignee  title`. `deal unlink-company` /
+  `unlink-person` and `person|company task add` print the whole deal, person or company as above.
+- `crm pipeline get`, `add`, `update` and `archive` print `id:`, `name:`, `currencies:` (comma-joined or `-`),
+  `archived:` (`true|false`), `version:`, then one `stage: id<TAB>kind<TAB>name` line per live stage and one
+  `archived_stage: id<TAB>kind<TAB>name` line per archived stage, in the server's order.
+  `crm pipelines --archived` marks an archived pipeline by `pipeline:archived` in the second column of its row
+  (live ones stay `pipeline`; stage rows are unchanged).
 - `subscription list`: `id  active|inactive  event,event  last-status|-  consecutive-failures  url  name`.
 - `subscription get`, `create`, `update` and `rotate-secret`: `id:`, `name:`, `url:`, `events:`
   (comma-joined), `active:` (`true|false`), `created_by:` (user id), `last_delivery_at:`,

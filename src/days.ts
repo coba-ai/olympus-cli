@@ -1,6 +1,6 @@
 import { CliError, print, seg, usage, type Io } from "./core";
 import { clean, keyValue, table, when } from "./format";
-import { dash, GLOBAL, type Plan } from "./tasks";
+import { checkFlags, dash, type Plan } from "./tasks";
 
 type Opts = Record<string, unknown>;
 type Ctx = { date: string; v: Opts; io: Io; json: boolean; now: () => number };
@@ -122,10 +122,7 @@ export function dayPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () =
   const key = named ? word! : "show";
   const spec = SUBS[key]!;
   const [min, max] = named ? spec.n : [1, 2];
-  for (const [k, x] of Object.entries(v)) {
-    if (x === undefined || GLOBAL.includes(k)) continue;
-    if (!spec.flags.includes(k)) throw usage(`unknown option '--${k}' for day${named ? " " + key : ""}`);
-  }
+  checkFlags(v, spec.flags, "day" + (named ? " " + key : ""));
   if (pos.length < min || pos.length > max) throw usage(`expected ${min === max ? min : `${min}-${max}`} argument(s) in: ${pos.join(" ")}`);
   const date = (named ? pos[2] : pos[1]) ?? localDate(now());
   if (key !== "list") seg(date);

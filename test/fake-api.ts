@@ -12,7 +12,7 @@ type Item = Record<string, any>;
 export type TaskStore = Record<string, Record<string, { version: number; tasks: Item[] }>>;
 export type FakeState = {
   next?: { status: number; body?: unknown; headers?: Record<string, string>; delayMs?: number };
-  requests: { method: string; path: string; search: string; auth: string | null; body: unknown }[];
+  requests: { method: string; path: string; search: string; auth: string | null; body: unknown; idem: string | null }[];
   webhooks: Record<string, Webhook[]>;
   // org -> ISO Monday -> stored week; a week with no row is absent (reads answer version 0 without storing)
   tasks: TaskStore;
@@ -26,6 +26,8 @@ export type FakeState = {
   onRequest?: (r: { method: string; path: string }) => void | Promise<void>;
   // org -> stored CRM records; tests reset it with seedCrm()
   crm: Record<string, CrmStore>;
+  // org + " " + Idempotency-Key -> the first create it covered; tests reset it with {}
+  idempotency: Record<string, { fp: string; status: number; body: unknown }>;
   // org -> subscriptions; tests reset it with seedSubscriptions()
   subscriptions: Record<string, Item[]>;
   // each poll shifts one script entry: "ok" -> token, "echo" -> 400 echoing device_code, empty -> pending, else 400 <code>
@@ -172,21 +174,21 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
   };
   // core = the shape nested in a deal; detail adds the related arrays; the list row is narrower than either.
   const cOut = (c: Item, mode: "core" | "detail" | "row") => {
-    const { version, website, linkedin_url, phone, notes, ...slim } = c;
+    const { version, website, linkedin_url, phone, notes, tasks, interactions, ...slim } = c;
     const ds = S.deals.filter((d) => d.company_id === c.id);
     const ps = S.people.filter((p) => p.company_id === c.id);
     if (mode === "row") return { ...slim, ...arch(c), people: ps.length, open_deals: ds.filter(open).length, open_value: String(ds.filter(open).reduce((a, d) => a + Number(d.amount ?? 0), 0)), currencies: [...new Set(ds.map((d) => d.currency).filter(Boolean))] };
     const full = { ...slim, website, linkedin_url, phone, notes, ...arch(c), version, deal_count: ds.length };
-    return mode === "core" ? full : { ...full, deals: ds.map(dref), people: ps.map((p) => ({ id: p.id, full_name: p.full_name, email: p.email, job_title: p.job_title })) };
+    return mode === "core" ? full : { ...full, deals: ds.map(dref), people: ps.map((p) => ({ id: p.id, full_name: p.full_name, email: p.email, job_title: p.job_title })), ...pick(c, ["interactions", "tasks"]) };
   };
   const pOut = (p: Item, mode: "core" | "detail" | "row") => {
-    const { version, company_id, linkedin_url, notes, ...slim } = p;
+    const { version, company_id, linkedin_url, notes, tasks, interactions, ...slim } = p;
     const c = co(company_id);
     const ds = S.deals.filter((d) => d.person_id === p.id);
     const head = { ...slim, ...arch(p), company: c ? { id: c.id, name: c.name } : null };
     if (mode === "row") return { ...head, open_deals: ds.filter(open).length };
     const full = { ...head, linkedin_url, notes, version, deal_count: ds.length };
-    return mode === "core" ? full : { ...full, deals: ds.map(dref) };
+    return mode === "core" ? full : { ...full, deals: ds.map(dref), ...pick(p, ["interactions", "tasks"]) };
   };
   // null_pipeline_id (test-injected) makes the list row's pipeline id null, as the server may send.
   const dRow = (d: Item) => ({ ...base(d), ...(d.null_pipeline_id && base(d).pipeline ? { pipeline: { id: null, name: base(d).pipeline!.name } } : {}), company_name: co(d.company_id)?.name ?? null, person_name: pe(d.person_id)?.full_name ?? null, person_email: pe(d.person_id)?.email ?? null });
@@ -196,7 +198,7 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
     return {
       ...base(d), lost_reason: d.lost_reason, created_at: d.created_at, version: d.version, pipeline_currencies: l?.p.currencies ?? [],
       company: c ? cOut(c, "core") : null, person: p ? pOut(p, "core") : null, stages: l?.p.stages ?? [], history: d.history,
-      notes: d.notes, notes_count: d.notes.length, tasks: d.tasks,
+      notes: d.notes, notes_count: d.notes.length, tasks: d.tasks, ...pick(d, ["interactions", "legacy_notes"]),
     };
   };
   const touch = (x: Item) => { x.version = ver(); if ("updated_at" in x) x.updated_at = now(); };
@@ -234,7 +236,60 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
   const [c, id, act, tid] = path;
   const M = method;
   if (M !== "GET" && !write) return FORBIDDEN;
-  if (c === "pipelines" && M === "GET") return [200, { data: S.pipelines.map((p) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies })) }];
+  if (c === "pipelines") {
+    const inc = q.get("archived") === "include";
+    const pd = (p: Item) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies, version: (p.version ??= ver()), archived: !!p.archived_at, archived_stages: p.archived_stages ?? [] });
+    if (!id && M === "GET") return [200, { data: S.pipelines.filter((p) => inc || !p.archived_at).map((p) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies, archived: !!p.archived_at })) }];
+    const kinds = (v: unknown) => Array.isArray(v) && v.length > 0 && v.every((s) => !blank(s?.name) && ["open", "won", "lost"].includes(s?.kind));
+    if (!id && M === "POST") {
+      if (blank(b.name)) return inv({ name: ["can't be blank"] });
+      if (!kinds(b.stages)) return inv({ stages: ["are invalid"] });
+      const p: Item = { id: `p_${rid("", 6)}`, name: b.name, currencies: b.currencies ?? [], version: ver(), stages: b.stages.map((s: Item, position: number) => ({ id: `st_${rid("", 6)}`, name: s.name, kind: s.kind, position })), archived_stages: [] };
+      S.pipelines.push(p);
+      return [201, { data: pd(p) }];
+    }
+    const p = S.pipelines.find((x) => x.id === id);
+    if (!p) return NF;
+    if (!act && M === "GET") return [200, { data: pd(p) }];
+    if (!act && M === "PATCH") {
+      const s = stale(p, b.version, pd);
+      if (s) return s;
+      if ("name" in b) p.name = b.name;
+      if ("currencies" in b) p.currencies = b.currencies;
+      p.archived_stages ??= [];
+      for (const rs of b.restores ?? []) { const i = p.archived_stages.findIndex((x: Item) => x.id === rs); if (i >= 0) p.stages.push(...p.archived_stages.splice(i, 1)); }
+      if (b.stages) {
+        const old: Item[] = p.stages;
+        p.stages = b.stages.map((s: Item) => ({ ...old.find((o) => o.id === s.id), id: s.id ?? `st_${rid("", 6)}`, name: s.name, kind: s.kind }));
+        for (const o of old.filter((o) => !p.stages.some((s: Item) => s.id === o.id))) {
+          p.archived_stages.push({ id: o.id, name: o.name, kind: o.kind });
+          for (const d of S.deals.filter((d) => d.stage_id === o.id)) d.stage_id = (b.removals ?? []).find((r: Item) => r.stage === o.id)?.move_to ?? d.stage_id;
+        }
+      }
+      p.stages.forEach((s: Item, i: number) => (s.position = i));
+      p.version = ver();
+      return [200, { data: pd(p) }];
+    }
+    if (act === "archive" && M === "POST") { p.archived_at = b.archived === false ? null : now(); p.version = ver(); return [200, { data: pd(p) }]; }
+    return NF;
+  }
+  if (c === "tasks" && id && M === "PATCH") {
+    for (const x of [...S.deals, ...S.people, ...S.companies]) {
+      const t = (x.tasks ?? []).find((t: Item) => t.id === id);
+      if (t) { t.status = b.done === false ? "open" : "done"; return [200, { data: pick(t, ["id", "title", "status", "due_at", "assignee"]) }]; }
+    }
+    return NF;
+  }
+  const kind = ({ deals: "deal", people: "person", companies: "company" } as Record<string, string>)[c ?? ""];
+  if (kind && id && ((act === "deletion_preview" && M === "GET") || (!act && M === "DELETE"))) {
+    const list = c === "deals" ? S.deals : c === "people" ? S.people : S.companies;
+    const x = list.find((r) => r.id === id);
+    if (!x) return NF;
+    if (M === "DELETE") { list.splice(list.indexOf(x), 1); return [204]; }
+    const ds = S.deals.filter((d) => d.person_id === id || d.company_id === id).length;
+    const impact = c === "deals" ? { notes: x.notes.length, tasks: x.tasks.length } : c === "people" ? { deals_unlinked: ds } : { people_unlinked: S.people.filter((p) => p.company_id === id).length, deals_unlinked: ds };
+    return [200, { data: { entity: kind, id, name: x.name ?? x.full_name, impact } }];
+  }
   if (c === "tags" && M === "GET") {
     const e = q.get("entity");
     const all = [...(e && e !== "deal" ? [] : S.deals), ...(e && e !== "person" ? [] : S.people), ...(e && e !== "company" ? [] : S.companies)];
@@ -275,6 +330,12 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
       return [200, { data: out(x) }];
     }
     if (act === "archive" && M === "POST") { x.archived_at = b.archived === false ? null : now(); touch(x); return [200, { data: out(x) }]; }
+    if (act === "tasks" && M === "POST") {
+      if (blank(b.title)) return inv({ title: ["can't be blank"] });
+      (x.tasks ??= []).push({ id: `ct_${rid("", 6)}`, title: b.title, status: "open", due_at: b.due_at ?? null, assignee: who(b.assignee) });
+      touch(x);
+      return [201, { data: out(x) }];
+    }
     return NF;
   }
   if (c !== "deals") return NF;
@@ -337,6 +398,7 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
     d[key] = r;
     return ok(d);
   }
+  if ((act === "company" || act === "person") && M === "DELETE") { d[`${act}_id`] = null; return ok(d); }
   if (act === "notes" && M === "POST") {
     if (blank(b.body)) return inv({ body: ["can't be blank"] });
     d.notes.push({ id: `n_${rid("", 6)}`, author: me, body: b.body, created_at: now() });
@@ -413,7 +475,7 @@ function subsApi(L: Item[], method: string, path: string[], body: unknown, opera
 
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10) };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10) };
   state.tasks = seedTasks(state.today);
   const server = Bun.serve({
     port: 0,
@@ -428,7 +490,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         body = text;
         malformed = true;
       }
-      state.requests.push({ method: req.method, path: u.pathname, search: u.search, auth: req.headers.get("authorization"), body });
+      state.requests.push({ method: req.method, path: u.pathname, search: u.search, auth: req.headers.get("authorization"), body, idem: req.headers.get("idempotency-key") });
       await state.onRequest?.({ method: req.method, path: u.pathname });
       const send = (status: number, b?: unknown, headers: Record<string, string> = {}) =>
         status === 204
@@ -480,7 +542,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         ((r === "me" && seg.length === 3) ||
           (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
             (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)) ||
-            (sub === "crm" && seg.length >= 6 && seg.length <= 9 && ["pipelines", "tags", "search", "deals", "people", "companies"].includes(seg[5]!)) ||
+            (sub === "crm" && seg.length >= 6 && seg.length <= 9 && ["pipelines", "tags", "search", "tasks", "deals", "people", "companies"].includes(seg[5]!)) ||
             (sub === "subscriptions" && seg.length >= 5 && seg.length <= 7) || (sub === "event_types" && seg.length === 5))));
       if (!known) return notFound();
 
@@ -506,7 +568,18 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       const operator = who.roles[org!] === "operator";
       const forbidden = () => err(403, "forbidden", "You are not allowed to do that.");
       const reply = ([st, o]: Res) => send(st, o);
-      if (sub === "crm") return reply(crmApi((state.crm[org!] ??= { pipelines: [], deals: [], people: [], companies: [] }), req.method, seg.slice(5), u.searchParams, body, operator, who.email));
+      if (sub === "crm") {
+        const run = () => crmApi((state.crm[org!] ??= { pipelines: [], deals: [], people: [], companies: [] }), req.method, seg.slice(5), u.searchParams, body, operator, who.email);
+        const route = `${req.method} ${seg.slice(5).join("/")}`;
+        const key = req.headers.get("idempotency-key");
+        if (key === null || !operator || !/^POST (pipelines|deals|people|companies|deals\/[^/]+\/(notes|tasks)|(people|companies)\/[^/]+\/tasks)$/.test(route)) return reply(run());
+        if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(key)) return reply(inv({ idempotency_key: ["is invalid"] }));
+        const slot = `${org} ${key}`, fp = `${route} ${JSON.stringify(body ?? null)}`, hit = state.idempotency[slot];
+        if (hit) return hit.fp === fp ? send(hit.status, hit.body, { "Idempotent-Replayed": "true" }) : reply(inv({ idempotency_key: ["was already used for a different request"] }));
+        const [st, o] = run();
+        if (st < 300) state.idempotency[slot] = { fp, status: st, body: o };
+        return send(st, o);
+      }
       if (sub === "subscriptions") return reply(subsApi((state.subscriptions[org!] ??= []), req.method, seg.slice(5), body, operator));
       if (sub === "event_types") return req.method === "GET" ? send(200, { data: EVENT_TYPES }) : notFound();
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();

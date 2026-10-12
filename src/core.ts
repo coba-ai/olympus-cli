@@ -26,6 +26,7 @@ export class CliError extends Error {
     readonly retryAfter?: string,
     readonly location?: string,
     readonly status?: number,
+    public retryHint?: string,
   ) {
     super(body.error.message);
   }
@@ -131,7 +132,24 @@ export type Me = {
   memberships: { org: { slug: string; name: string }; role: string }[];
   token: { name: string; last4: string; organization: { slug: string; name: string } | null };
 };
-export type Api = (method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown, timeoutMs?: number) => Promise<any>;
+export type Api = (method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown, timeoutMs?: number, headers?: Record<string, string>) => Promise<any>;
+
+const KEY = /^[A-Za-z0-9_.:-]{1,128}$/;
+export function idempotencyKey(given?: string): string {
+  if (given === undefined) return crypto.randomUUID();
+  if (!KEY.test(given)) throw usage("--idempotency-key must be 1-128 characters from A-Z a-z 0-9 _ . : -");
+  return given;
+}
+
+// POST with an Idempotency-Key; on exit 5 (outcome unknown) the error carries the hint fail() prints on a terminal.
+export async function create(call: Api, path: string, body: unknown, key: string): Promise<any> {
+  try {
+    return await call("POST", path, body, undefined, { "Idempotency-Key": key });
+  } catch (e) {
+    if (e instanceof CliError && e.exit === 5) e.retryHint = `The idempotency key sent was ${key} (--idempotency-key ${key} reuses it)`;
+    throw e;
+  }
+}
 
 export function exitForStatus(status: number, code?: string): Exit {
   if (status === 409 && (code === "conflict" || code === "crm_not_set_up")) return 6;
@@ -145,10 +163,10 @@ export function exitForStatus(status: number, code?: string): Exit {
 const cancelled = () => new CliError(130, { error: { code: "cancelled", message: "login cancelled" } });
 
 export function api(host: string, token?: string, timeoutMs = 30_000, signal?: AbortSignal): Api {
-  return async (method, path, body, callTimeoutMs) => {
+  return async (method, path, body, callTimeoutMs, extra) => {
     const ms = callTimeoutMs ?? timeoutMs;
     const url = `${host}/api/v1${path}`;
-    const headers: Record<string, string> = { ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json" };
+    const headers: Record<string, string> = { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let res: Response;
     let text: string;
@@ -345,13 +363,14 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
   let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
   if (e.status === 409 && err?.code === "conflict") line += " (it changed since you read it; read it again and retry)";
-  // saved: the write may have landed, so the server message stands alone: no retry hint, even if a Retry-After came back.
+  // saved: the write may have landed, so no Retry-After text is added. The server message is printed as-is and decides whether to retry; the CLI adds only the key it sent (below).
   if (e.retryAfter && err?.details?.saved !== true) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;
   const fields = err?.details?.fields;
   if (fields && typeof fields === "object")
     for (const [k, v] of Object.entries(fields)) line += `\n  ${clean(k)}: ${clean(Array.isArray(v) ? v.join(", ") : String(v))}`;
+  if (e.exit === 5 && e.retryHint && io.tty) line += `\n${e.retryHint}`;
   io.err(line + "\n");
   return e.exit;
 }
