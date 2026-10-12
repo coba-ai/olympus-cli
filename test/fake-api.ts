@@ -290,7 +290,7 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
     const d: Item = {
       id: `d_${rid("", 6)}`, ...nul(["amount", "currency", "next_action", "lost_reason", "company_id", "person_id"]), currency: p.currencies[0] ?? null,
       stage_id: st.id, in_stage_since: now(), owner_email: who(b.owner ?? "me"), tags: [], archived_at: null, updated_at: now(), created_at: now(),
-      history: [], notes: [], tasks: [], ...ids, ...pick(b, ["amount", "currency", "next_action"]),
+      history: [], notes: [], tasks: [], ...ids, ...pick(b, ["name", "amount", "currency", "next_action"]),
     };
     if (d.amount != null) d.amount = String(d.amount);
     S.deals.push(d);

@@ -16,7 +16,7 @@ export type Io = {
   close?: () => void;
 };
 export type Exit = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 130;
-export type ApiErrorBody = { error: { code: string; message: string; details?: unknown } };
+type ApiErrorBody = { error: { code: string; message: string; details?: unknown } };
 
 // `location` (host of an unfollowed 3xx) and `status` (HTTP status) are additions to the pin; fail() uses them.
 export class CliError extends Error {

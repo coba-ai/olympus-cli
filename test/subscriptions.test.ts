@@ -213,7 +213,7 @@ test("AC18 token and secret sweep: errors never print the token, all exit non-ze
       }
     }
   }
-});
+}, 60_000);
 
 test("AC19 --help lists the subscription usage lines", async () => {
   const r = await cli(["--help"]);

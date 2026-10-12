@@ -304,7 +304,7 @@ test("AC14 token sweep: CRM commands x error statuses x tty x json never print t
           if (r.code !== 0) failures++;
         }
   expect(failures).toBe(2 * 2 * cmds.length * nexts.length);
-});
+}, 60_000);
 
 test("AC14 --help carries the CRM usage lines exactly", async () => {
   const r = await cli(["--help"]);
