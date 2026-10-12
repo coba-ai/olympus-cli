@@ -241,14 +241,14 @@ test("a null data body does not crash list, get or ping", async () => {
   }
 });
 
-test("E1 ping is not subscribable: create and update exit 6 naming events", async () => {
+test("events: ping is not subscribable: create and update exit 6 naming events", async () => {
   for (const a of [["subscription", "create", "--name", "n", "--url", "u", "--event", "ping"], ["subscription", "update", ID, "--event", "ping"]]) {
     const r = await sub(a);
     expect([r.code, r.err]).toEqual([6, expect.stringContaining("events")]);
   }
 });
 
-test("E1 ping rate limited: 429 exits 5 with retry-after", async () => {
+test("events: ping rate limited: 429 exits 5 with retry-after", async () => {
   const body = { error: { code: "rate_limited", message: "Too many pings" } };
   fake.state.next = { status: 429, body, headers: { "Retry-After": "10" } };
   const r = await sub(["subscription", "ping", ID]);
@@ -259,7 +259,7 @@ test("E1 ping rate limited: 429 exits 5 with retry-after", async () => {
   expect(JSON.parse(j.err)).toEqual(body);
 });
 
-test("E1 ping network failure: null status, exit 0", async () => {
+test("events: ping network failure: null status, exit 0", async () => {
   const data = { delivered: false, status: null, error: "timeout" };
   fake.state.next = { status: 200, body: { data } };
   expect(await sub(["subscription", "ping", ID])).toMatchObject({ code: 0, out: "delivered: false\nstatus: -\nerror: timeout\n" });
@@ -267,7 +267,7 @@ test("E1 ping network failure: null status, exit 0", async () => {
   expect(await sub(["subscription", "ping", ID], true)).toMatchObject({ code: 0, out: `Ping to ${ID}: not delivered (timeout)\n` });
 });
 
-test("E1 unknown id: teammate gets 403 (exit 4), operator 404 (exit 3)", async () => {
+test("events: unknown id: teammate gets 403 (exit 4), operator 404 (exit 3)", async () => {
   expect((await cli(["subscription", "get", "nope", "--org", "acme"], { env: { OLYMPUS_API_KEY: TOKENS.teammate } })).code).toBe(4);
   expect((await sub(["subscription", "get", "nope"])).code).toBe(3);
 });

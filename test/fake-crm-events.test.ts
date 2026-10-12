@@ -202,7 +202,7 @@ test("AC5 subscriptions: operator only, validation, secret once, ping, delete", 
   expect((await sub("GET", "")).json.data).toHaveLength(1);
 });
 
-test("D1 server shapes: search caps at 5 per entity, stage needs pipeline, narrow rows", async () => {
+test("server shapes: search caps at 5 per entity, stage needs pipeline, narrow rows", async () => {
   const S = fake.state.crm.acme!;
   for (let i = 0; i < 8; i++) S.people.push({ ...S.people[0], id: `pe_${i}`, full_name: `Dana ${i}` });
   const hits = (await crm("GET", "/search?q=dana")).json.data;

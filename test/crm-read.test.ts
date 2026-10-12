@@ -263,7 +263,7 @@ test("TTY: a future task due date prints the date, not 'just now'", async () => 
   expect(r.out).not.toContain("just now (2026-10-20");
 });
 
-test("D1 deal ref rows print the stage name; null list pipeline id prints - and never leaks the name into the id column", async () => {
+test("deal ref rows print the stage name; null list pipeline id prints - and never leaks the name into the id column", async () => {
   for (const a of [["person", "get", "pe_dana"], ["company", "get", "c_initech"]]) {
     const o = (await run1(a)).out;
     expect(o).toContain("deal: d_renewal\topen\tLead\tInitech renewal\n");

@@ -324,7 +324,7 @@ test("AC14 --help carries the CRM usage lines exactly", async () => {
   for (const l of lines) expect(r.out).toContain(l + "\n");
 });
 
-test("D1 503 machine_not_ready with details.saved: no retry hint, still exit 5", async () => {
+test("write errors: 503 machine_not_ready with details.saved: no retry hint, still exit 5", async () => {
   const body = { saved: true, id: "d_x" };
   const hdr = { "Retry-After": "30" };
   fake.state.next = err(503, "machine_not_ready", "The machine is starting; the deal may have been saved.", { details: body }, hdr);
@@ -340,7 +340,7 @@ test("D1 503 machine_not_ready with details.saved: no retry hint, still exit 5",
   expect((await run1(["deal", "add", "N"])).err).toBe("error: Starting. (retry after 30s)\n");
 });
 
-test("D1 422 with details.existing exits 6 and --json carries it", async () => {
+test("write errors: 422 with details.existing exits 6 and --json carries it", async () => {
   const existing = { id: "c_initech", name: "Initech" };
   fake.state.next = err(422, "duplicate", "Already exists.", { details: { existing } });
   let r = await run1(["company", "add", "Initech", "--json"]);
