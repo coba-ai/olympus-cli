@@ -142,7 +142,7 @@ week; `me` is your person id. `tasks` is in board order: the starred (`one_thing
   "id": "t8f3k2a", "text": "Ship the pricing page", "description": "",
   "section": "the_rest",          // "the_rest" | "backlog"; older tasks may read "one_thing"
   "order": 0, "done": false, "done_at": null,       // done_at: ISO 8601 or null
-  "assignee": {"id": "u_12", "name": "Abraham Kuri", "kind": "user"} | null,
+  "assignee": {"id": "u_12", "name": "Ada Lovelace", "kind": "user"} | null,
                                   // an id that no longer exists reads {"id":"u_9","name":null,"kind":null}
   "tags": ["pricing"],
   "today": false,                 // flagged for today
