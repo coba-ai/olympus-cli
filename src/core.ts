@@ -133,7 +133,8 @@ export type Me = {
 };
 export type Api = (method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown, timeoutMs?: number) => Promise<any>;
 
-export function exitForStatus(status: number): Exit {
+export function exitForStatus(status: number, code?: string): Exit {
+  if (status === 409 && (code === "conflict" || code === "crm_not_set_up")) return 6;
   if (status === 401) return 2;
   if (status === 404) return 3;
   if (status === 403) return 4;
@@ -191,7 +192,7 @@ export function api(host: string, token?: string, timeoutMs = 30_000, signal?: A
       e && typeof e === "object" && !Array.isArray(e)
         ? parsed
         : { error: { code: `http_${status}`, message: `HTTP ${status}` } };
-    throw new CliError(exitForStatus(status), errBody, res.headers.get("retry-after") ?? undefined, undefined, status);
+    throw new CliError(exitForStatus(status, errBody.error.code), errBody, res.headers.get("retry-after") ?? undefined, undefined, status);
   };
 }
 
@@ -343,6 +344,7 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   const err: any = e.body?.error;
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
   let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
+  if (e.status === 409 && err?.code === "conflict") line += " (it changed since you read it; read it again and retry)";
   if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;

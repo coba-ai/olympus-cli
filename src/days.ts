@@ -5,7 +5,7 @@ import { dash, GLOBAL, type Plan } from "./tasks";
 type Opts = Record<string, unknown>;
 type Ctx = { date: string; v: Opts; io: Io; json: boolean; now: () => number };
 
-export const DAY_FLAGS = ["shipped", "blocker", "learning", "reflection", "draft"];
+const DAY_FLAGS = ["shipped", "blocker", "learning", "reflection", "draft"];
 const CONTENT = ["shipped", "blocker", "learning", "reflection"];
 
 const dayPath = async (c: Ctx, org: () => Promise<string>) => `/orgs/${seg(await org())}/days/${seg(c.date)}`;
