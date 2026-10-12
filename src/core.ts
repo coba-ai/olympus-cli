@@ -363,14 +363,14 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
   let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
   if (e.status === 409 && err?.code === "conflict") line += " (it changed since you read it; read it again and retry)";
-  // saved: the write may have landed, so the server message stands alone: no retry hint, even if a Retry-After came back.
+  // saved: the write may have landed, so the server message stands alone: no Retry-After text and no retry hint (below).
   if (e.retryAfter && err?.details?.saved !== true) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;
   const fields = err?.details?.fields;
   if (fields && typeof fields === "object")
     for (const [k, v] of Object.entries(fields)) line += `\n  ${clean(k)}: ${clean(Array.isArray(v) ? v.join(", ") : String(v))}`;
-  if (e.exit === 5 && e.retryHint && io.tty) line += `\n${e.retryHint}`;
+  if (e.exit === 5 && e.retryHint && io.tty && err?.details?.saved !== true) line += `\n${e.retryHint}`;
   io.err(line + "\n");
   return e.exit;
 }

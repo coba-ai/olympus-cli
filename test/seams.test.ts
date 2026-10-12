@@ -76,7 +76,7 @@ async function failing(status: number | "network", tty: boolean, json: boolean) 
   let call;
   if (status === "network") call = api("http://127.0.0.1:1", "t");
   else {
-    fake.state.next = { status, body: { error: { code: "c", message: "boom", details: { saved: true, fields: { a: ["b"] } } } } };
+    fake.state.next = { status, body: { error: { code: "c", message: "boom", details: { saved: false, fields: { a: ["b"] } } } } };
     call = api(fake.url, TOKENS.owner);
   }
   let err = "";
@@ -101,6 +101,19 @@ test("create sends the key; hint only on exit 5, terminal, not --json", async ()
   expect(j.err).toBe(JSON.stringify(j.e.body) + "\n");
   const n = await failing("network", true, false);
   expect(n.err.trimEnd().split("\n").at(-1)).toBe(HINT);
+});
+
+test("no hint when the server says the create may be saved", async () => {
+  fake.state.next = { status: 503, body: { error: { code: "machine_not_ready", message: "boom", details: { saved: true, id: "d_9" } } } };
+  let err = "";
+  try {
+    await create(api(fake.url, TOKENS.owner), "/orgs/acme/crm/deals", { name: "n" }, "K9");
+    throw new Error("expected failure");
+  } catch (e) {
+    const code = fail({ env: {}, home: "", stdin: async () => "", out() {}, err: (s) => { err += s; }, tty: true }, false, e as CliError);
+    expect(code).toBe(5);
+  }
+  expect(err).toBe("error: boom\n");
 });
 
 test("other exits never get the hint", async () => {

@@ -346,7 +346,7 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
 "deals": [{"id": "…", "name": "…", "pipeline": {"id": "…", "name": "…"} | null, "stage": {"name": "…", "kind": "…"} | null, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
-// pipeline (live pipelines and stages only)
+// pipeline (live pipelines and stages only by default; with ?archived=include each list item also has "archived": true|false)
 { "id": "…", "name": "…", "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}], "currencies": ["USD"] }
 
 // pipeline-detail (GET/POST/PATCH/archive of one pipeline): the pipeline, plus
@@ -411,7 +411,7 @@ tasks answer 409 `machine_needs_update` while the organization's agent machine h
 to support them; try again later. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
 `details.saved` (true: the change may already be saved) and `details.id` (on create). When `saved` is true no
 `Retry-After` is sent and you must not retry blindly: read the record first. A create sent with an
-`Idempotency-Key` is the exception: its message says to retry with the same key, which is safe (below).
+`Idempotency-Key` does not change that: with `saved` true, read the record (`details.id`) and retry with the same key only if it is not there. Without `saved`, retry with the same key (below).
 
 ## Idempotent creates
 
@@ -438,7 +438,7 @@ POST /orgs/:org/crm/pipelines        POST /orgs/:org/crm/companies/:id/tasks
   machine has not been updated and did not store the key, so a retry could create a duplicate. Look for
   the record before retrying.
 - **Unsure outcome.** A 503 `machine_not_ready` with `details.saved` and a key sent means the create may or
-  may not have happened. Retry with the same `Idempotency-Key`: it creates the record once.
+  may not have happened. When `saved` is true, read the record first (`details.id`), and retry with the same `Idempotency-Key` only if it is not there; a machine that has not been updated does not store the key.
 
 ## Subscriptions
 

@@ -110,8 +110,9 @@ Any tag flag together with other fields is two server writes; if the second fail
 shows only archived records, `--sort` and `--page` are passed to the server (one page at a time), and
 `--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one
 (`retry after Ns`) is exit 5. Exit 5 with `details.saved: true` (in `--json` stderr) means the change may already be
-saved. For a create, retry with the same `--idempotency-key` (below); for any other write, read the record and do
-not retry. `--stage` needs `--pipeline`.
+saved. Read the record first (a create returns `details.id`); for a create, retry with the same `--idempotency-key`
+(below) only if it is not there; for any other write, do not retry. Exit 5 without `saved` (network error, timeout):
+retry a create with the same key, or, piped without your own key, look for the record first. `--stage` needs `--pipeline`.
 
 `delete` removes a record for good and **cannot be undone** (unlike `archive`, which `--undo` reverses). It needs
 `--yes`, never prompts, and without `--yes` is exit 1 with no request. On a terminal it first fetches

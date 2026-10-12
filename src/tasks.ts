@@ -7,7 +7,7 @@ type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
 export type Plan = (call: Api, org: () => Promise<string>) => Promise<void>;
 
 // Flags every command accepts; the rest are per subcommand.
-export const GLOBAL = ["json", "host", "org", "help"];
+const GLOBAL = ["json", "host", "org", "help"];
 // Rejects any flag outside `allowed` (+ GLOBAL), in the order typed; a negated boolean (value false) is named as typed, `--no-x`.
 export function checkFlags(v: Opts, allowed: string[], where?: string): void {
   for (const [k, x] of Object.entries(v)) {

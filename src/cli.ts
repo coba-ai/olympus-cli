@@ -42,7 +42,7 @@ const USAGE = `usage: olympus <command> [flags]
   crm pipelines [--archived]   crm pipeline get <id> | archive <id> [--undo]
   crm pipeline add NAME --stage NAME:KIND... [--currency C]...
   crm pipeline update <id> [--name T] [--stage [ID=]NAME:KIND]... [--remove STAGE_ID:MOVE_TO_ID]... [--restore ID]... [--currency C]... [--version V]
-  crm creates (add, note, task add, pipeline add) take [--idempotency-key K]; the same K on a retry never creates twice
+  crm creates (add, note, task add, pipeline add) take [--idempotency-key K]; a retry with the same K replays the first result (once the agent machine is updated)
   subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>
   subscription create --name N --url URL --event T... ('*' = all) | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]
   event-types   (event names for --event)
