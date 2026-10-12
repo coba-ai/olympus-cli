@@ -438,7 +438,7 @@ POST /orgs/:org/crm/pipelines        POST /orgs/:org/crm/companies/:id/tasks
   machine has not been updated and did not store the key, so a retry could create a duplicate. Look for
   the record before retrying.
 - **Unsure outcome.** A 503 `machine_not_ready` with `details.saved` and a key sent means the create may or
-  may not have happened. When `saved` is true, follow the message: it says whether a retry with the same `Idempotency-Key` is safe or to read the record (`details.id`) and not repeat the request; a machine that has not been updated does not store the key.
+  may not have happened. When `saved` is true, follow the message: it says whether a retry with the same `Idempotency-Key` is safe or to read the record (`details.id`) and not repeat the request; a machine that has not been updated does not store the key. Scripts should always send their own key, since a generated one cannot be recovered afterwards. Without `saved` (network error, timeout), look for the record first and retry with the same key only if it is missing.
 
 ## Subscriptions
 

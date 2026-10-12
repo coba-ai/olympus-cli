@@ -71,7 +71,7 @@ test("idempotencyKey", () => {
     expect(() => idempotencyKey(bad)).toThrow("--idempotency-key must be 1-128 characters from A-Z a-z 0-9 _ . : -");
 });
 
-const HINT = "The idempotency key sent was K9; to retry with it, add --idempotency-key K9";
+const HINT = "The idempotency key sent was K9 (--idempotency-key K9 reuses it)";
 async function failing(status: number | "network", tty: boolean, json: boolean) {
   let call;
   if (status === "network") call = api("http://127.0.0.1:1", "t");
@@ -104,16 +104,23 @@ test("create sends the key; hint only on exit 5, terminal, not --json", async ()
 });
 
 test("saved create: server message as-is, then only the key sent", async () => {
-  fake.state.next = { status: 503, body: { error: { code: "machine_not_ready", message: "boom", details: { saved: true, id: "d_9" } } } };
-  let err = "";
-  try {
-    await create(api(fake.url, TOKENS.owner), "/orgs/acme/crm/deals", { name: "n" }, "K9");
-    throw new Error("expected failure");
-  } catch (e) {
-    const code = fail({ env: {}, home: "", stdin: async () => "", out() {}, err: (s) => { err += s; }, tty: true }, false, e as CliError);
-    expect(code).toBe(5);
+  const cases = [
+    "The change was saved, at least in part, but we couldn't confirm it with your agent's machine. Read the record before retrying; do not repeat the request.",
+    "The change was saved, but we couldn't confirm it with your agent's machine. Retry with the same Idempotency-Key within 24 hours; it will not be saved twice.",
+  ];
+  for (const message of cases) {
+    fake.state.next = { status: 503, body: { error: { code: "machine_not_ready", message, details: { saved: true, id: "d_9" } } } };
+    let err = "";
+    try {
+      await create(api(fake.url, TOKENS.owner), "/orgs/acme/crm/deals", { name: "n" }, "K9");
+      throw new Error("expected failure");
+    } catch (e) {
+      const code = fail({ env: {}, home: "", stdin: async () => "", out() {}, err: (s) => { err += s; }, tty: true }, false, e as CliError);
+      expect(code).toBe(5);
+    }
+    expect(err).toBe(`error: ${message}\n${HINT}\n`);
+    expect(err.trimEnd().split("\n").at(-1)).not.toMatch(/retry/i);
   }
-  expect(err).toBe(`error: boom\n${HINT}\n`);
 });
 
 test("other exits never get the hint", async () => {

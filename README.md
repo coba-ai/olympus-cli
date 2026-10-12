@@ -135,10 +135,13 @@ otherwise (exit 6). `--restore ID` brings back an archived stage. `--currency` i
 Idempotent creates: `deal|person|company add`, `deal note`, `deal|person|company task add` and `pipeline add`
 each send a fresh random `Idempotency-Key`. `--idempotency-key K` (1-128 characters from `A-Z a-z 0-9 _ . : -`)
 sends your own instead: the same K on a retry returns the original record rather than creating a second one, for
-24 hours. On a terminal, an exit-5 failure of a create ends with a line giving the key it sent
-(`The idempotency key sent was <key>; to retry with it, add --idempotency-key <key>`), whatever the server said. Piped or with `--json` that line is not printed, so scripts and agents should **pass their own key**. If a
-create exits 5 and you did not pass `--idempotency-key`, the generated key cannot be recovered when output is
-piped. Look for the record (`crm search` / `get`) before retrying. An agent machine that has not been updated yet may not honour the key; the API says so in a response
+24 hours. On a terminal, an exit-5 failure of a create ends with the key it sent
+(`The idempotency key sent was <key> (--idempotency-key <key> reuses it)`); the server message above it decides
+whether to retry. Piped or with `--json` that line is not printed, so scripts and agents should **always pass their
+own key** (a fresh UUID) on every create. After exit 5, retry with that same key only when the server message says to
+retry with the same Idempotency-Key; when it says "do not repeat the request", read the record instead. After a
+network error or timeout, look for the record (`crm search` / `get`) first and retry with the same key only if it is
+missing. An agent machine that has not been updated yet may not honour the key; the API says so in a response
 header (`Idempotency-Key-Honored: false`), which the CLI does not show.
 
 Subscriptions (`olympus subscription …`) send signed HTTP events to your URL when things happen

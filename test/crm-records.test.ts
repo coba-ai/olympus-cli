@@ -276,7 +276,7 @@ test("exit 5 on a create: hint on a terminal only, naming the key sent", async (
     let r = await run1(c.args, { tty: true });
     const key = last().idem!;
     expect([c.name, r.code]).toEqual([c.name, 5]);
-    expect(r.err).toBe(`error: Starting.\nThe idempotency key sent was ${key}; to retry with it, add --idempotency-key ${key}\n`);
+    expect(r.err).toBe(`error: Starting.\nThe idempotency key sent was ${key} (--idempotency-key ${key} reuses it)\n`);
     expect(r.out).toBe("");
     fake.state.next = { status: 503, body };
     r = await run1(c.args);
@@ -286,7 +286,7 @@ test("exit 5 on a create: hint on a terminal only, naming the key sent", async (
     expect([r.code, r.err]).toEqual([5, JSON.stringify(body) + "\n"]);
     fake.state.next = { status: 503, body };
     r = await run1([...c.args, "--idempotency-key", "mine"], { tty: true });
-    expect(r.err.endsWith("--idempotency-key mine\n")).toBe(true);
+    expect(r.err.endsWith("The idempotency key sent was mine (--idempotency-key mine reuses it)\n")).toBe(true);
   }
 });
 
@@ -294,7 +294,7 @@ test("a network error on a create is exit 5 with the hint on a terminal", async 
   const o = { env: { ...owner, OLYMPUS_HOST: "http://127.0.0.1:1" } };
   let r = await run1(["person", "add", "P"], { ...o, tty: true });
   expect(r.code).toBe(5);
-  expect(r.err).toMatch(/\nThe idempotency key sent was [0-9a-f-]{36}; to retry with it, add --idempotency-key [0-9a-f-]{36}\n$/);
+  expect(r.err).toMatch(/\nThe idempotency key sent was [0-9a-f-]{36} \(--idempotency-key [0-9a-f-]{36} reuses it\)\n$/);
   r = await run1(["person", "add", "P"], o);
   expect([r.code, r.err.includes("--idempotency-key")]).toEqual([5, false]);
   r = await run1(["person", "add", "P", "--json"], { ...o, tty: true });

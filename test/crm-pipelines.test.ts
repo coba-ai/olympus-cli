@@ -115,9 +115,9 @@ test("messages for the pipeline usage cases", async () => {
 
 test("negated array flags: one pinned behaviour", async () => {
   const r = await run1(["pipeline", "add", "P", "--stage", "a:open", "--no-currency"]);
-  // whatever parseArgs does with a negated string option, it must not crash or send a malformed body
-  expect([0, 1]).toContain(r.code);
-  if (r.code === 0) expect(Array.isArray((last().body as any).currencies) || (last().body as any).currencies === undefined).toBe(true);
+  expect(r.code).toBe(1);
+  expect(r.err).toBe("error: Unknown option '--no-currency'\n");
+  expect(reqs().length).toBe(0);
 });
 
 const seedArchived = () => {
