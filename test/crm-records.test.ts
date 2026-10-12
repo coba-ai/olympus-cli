@@ -154,11 +154,18 @@ test("person and company task add", async () => {
     expect(last().body).toEqual({ title: "T2", due_at: "2026-10-20", assignee: "me" });
     const newId = S()[path].find((x) => x.id === id)!.tasks.at(-1).id;
     r = await run1([kind, "task", "add", id, "T3"], { tty: true });
-    expect(r.out).toMatch(new RegExp(`^Added task ct_\\w+ to ${kind} ${id}\\.\\n\\n`));
+    expect(r.out).toMatch(new RegExp(`^Added a task to ${kind} ${id}\\.\\n\\n`));
     expect(newId).toMatch(/^ct_/);
   }
   for (const a of [["person", "task", "add", "..", "T"], ["person", "task", "add", "p"], ["person", "task", "done", "p", "x"], ["person", "task", "add", "p", "T", "--bogus"]])
     expect((await run1(a)).code).toBe(1);
+});
+
+test("person task add names no task id when the detail lacks the new task", async () => {
+  fake.state.next = { status: 201, body: { data: { id: "pe_dana", full_name: "Dana Lee", tasks: [{ id: "ct_old", title: "Old", status: "open" }] } } };
+  const r = await run1(["person", "task", "add", "pe_dana", "New"], { tty: true });
+  expect(r.out).toMatch(/^Added a task to person pe_dana\.\n/);
+  expect(r.out.split("\n\n")[0]).not.toContain("ct_old");
 });
 
 test("detail: interaction, task and legacy_notes lines", async () => {

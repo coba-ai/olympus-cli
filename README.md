@@ -100,15 +100,14 @@ and requires every tag given; `--backlog` keeps the backlog section. `--mine` wi
 `--open` with `--done`, are usage errors. An unknown `--who` is exit 6. Text that starts with `-` needs
 `--` (`olympus task add -- "-x"`).
 
-CRM (`olympus crm …`): any member can read; writing needs the `operator` role (a teammate gets exit 4).
-Records are deals, people and companies. `--version V` on an `update` is optional. Sent, the update is
-refused when the record changed since you read it (exit 6, "it changed since you read it"); omitted, the
-last writer wins for the fields you send. `--add-tag` / `--remove-tag` read the record and then write it
-with the version they read, so they are **not atomic**: on exit 6, run the command again.
-Any tag flag together with other fields is two server writes; if the second fails, the first stays.
-`archive` hides a record and is reversible with `--undo`; it needs no `--yes`. `--archived` on a list
-shows only archived records, `--sort` and `--page` are passed to the server (one page at a time), and
-`--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one
+CRM (`olympus crm …`): any member can read; writing needs the `operator` role (a teammate gets exit 4). Records are
+deals, people and companies. `--version V` on an `update` is optional. Sent, the update is refused when the record
+changed since you read it (exit 6, "it changed since you read it"); omitted, the last writer wins for the fields you
+send. `--add-tag` / `--remove-tag` read the record and then write it with the version they read, so they are **not
+atomic**: on exit 6, run the command again. Any tag flag together with other fields is two server writes; if the
+second fails, the first stays. `archive` hides a record and is reversible with `--undo`; it needs no `--yes`.
+`--archived` on a list shows only archived records, `--sort` and `--page` are passed to the server (one page at a
+time), and `--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one
 (`retry after Ns`) is exit 5. Exit 5 with `details.saved: true` (in `--json` stderr) means the change may already be
 saved. For a create, follow the server message: it says whether a retry with the same `--idempotency-key` (below) is
 safe (the agent machine confirmed it stored the key) or to read the record (`details.id`) and not repeat the request;
@@ -121,6 +120,8 @@ record first (`crm search` / `get`); if it is missing, retry with the same key. 
 preview fails, nothing is deleted. Piped or with `--json` it sends the one delete. `deletion-preview` alone changes
 nothing. `deal unlink-company` / `unlink-person` detach the deal's company or person; `crm task done` marks any
 record's task done by its task id (`--undo` reopens it). `person|company task add` works like `deal task add`.
+Person and company detail list at most 10 open tasks, so after `task add` the new task may not be shown (the
+confirmation names no task id).
 
 Pipelines: reads are open to any member, but every pipeline write (`add`, `update`, `archive`) is operator only
 (a teammate gets exit 4). `pipelines --archived` includes archived pipelines. `--stage NAME:KIND` (`open`,
@@ -141,8 +142,11 @@ whether to retry. Piped or with `--json` that line is not printed, so scripts an
 own key** (a fresh UUID) on every create. After exit 5, retry with that same key only when the server message says to
 retry with the same Idempotency-Key; when it says "do not repeat the request", read the record instead. After a
 network error or timeout, look for the record (`crm search` / `get`) first and retry with the same key only if it is
-missing. An agent machine that has not been updated yet may not honour the key; the API says so in a response
-header (`Idempotency-Key-Honored: false`), which the CLI does not show.
+missing. An agent machine that has not been updated yet may not honour the key; the API says so in a response header
+(`Idempotency-Key-Honored: false`). The CLI does not show that header, so unless you know the organization's agent
+machine is up to date, look for the record before retrying even when the message says to retry with the same key.
+`crm person add --new-company` that exits 6 on `idempotency_key`: the company may already be saved (`details.id`
+in `--json`); do not retry with that key. Keys are per organization and last 24 hours.
 
 Subscriptions (`olympus subscription …`) send signed HTTP events to your URL when things happen
 (`olympus event-types` lists the names). They are **operator only, reads included** (a teammate gets

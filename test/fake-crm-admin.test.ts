@@ -45,7 +45,7 @@ test("pipelines: create, detail, patch with version, archive, list", async () =>
   expect((await crm("GET", "/pipelines")).json.data.map((x: any) => x.id)).toEqual(["p_sales"]);
   const all = (await crm("GET", "/pipelines?archived=include")).json.data;
   expect(all.map((x: any) => [x.id, x.archived])).toEqual([["p_sales", false], [p.id, true]]);
-  expect((await crm("GET", "/pipelines")).json.data[0]).not.toHaveProperty("archived");
+  expect((await crm("GET", "/pipelines")).json.data[0]).toHaveProperty("archived", false);
   expect((await crm("GET", "/pipelines/p_sales")).json.data).toMatchObject({ id: "p_sales", archived: false, archived_stages: [] });
   expect((await crm("GET", "/pipelines/nope")).status).toBe(404);
 });

@@ -239,7 +239,7 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
   if (c === "pipelines") {
     const inc = q.get("archived") === "include";
     const pd = (p: Item) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies, version: (p.version ??= ver()), archived: !!p.archived_at, archived_stages: p.archived_stages ?? [] });
-    if (!id && M === "GET") return [200, { data: S.pipelines.filter((p) => inc || !p.archived_at).map((p) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies, ...(inc ? { archived: !!p.archived_at } : {}) })) }];
+    if (!id && M === "GET") return [200, { data: S.pipelines.filter((p) => inc || !p.archived_at).map((p) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies, archived: !!p.archived_at })) }];
     const kinds = (v: unknown) => Array.isArray(v) && v.length > 0 && v.every((s) => !blank(s?.name) && ["open", "won", "lost"].includes(s?.kind));
     if (!id && M === "POST") {
       if (blank(b.name)) return inv({ name: ["can't be blank"] });

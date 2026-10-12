@@ -199,7 +199,9 @@ const TASK_ADD_FLAGS = [["due", "due_at"], ["assign", "assignee"]];
 const taskAdd = (kind: Kind): Spec => ({
   flags: ["due", "assign", "idempotency-key"], n: 6,
   build: (c) => mutate(c, kind, "POST", `/${KIND[kind].path}/${seg(c.pos[4]!)}/tasks`, copyFlags({ title: c.pos[5] }, c.v, TASK_ADD_FLAGS),
-    (d) => `Added task ${dash(arr(d.tasks).at(-1)?.id)} to ${kind} ${clean(c.pos[4])}.`, keyOf(c)),
+    // Record detail lists a capped set of tasks, so the new one may be absent or not last: claim no id for person/company.
+    // The deal sentence still names tasks.at(-1) and can be wrong (issue #20).
+    (d) => kind === "deal" ? `Added task ${dash(arr(d.tasks).at(-1)?.id)} to deal ${clean(c.pos[4])}.` : `Added a task to ${kind} ${clean(c.pos[4])}.`, keyOf(c)),
 });
 const unlink = (what: "company" | "person"): Spec => ({
   flags: [], n: 4,

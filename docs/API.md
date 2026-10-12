@@ -346,7 +346,7 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
 "deals": [{"id": "…", "name": "…", "pipeline": {"id": "…", "name": "…"} | null, "stage": {"name": "…", "kind": "…"} | null, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
-// pipeline (live pipelines and stages only by default; with ?archived=include each list item also has "archived": true|false)
+// pipeline (live pipelines and stages only by default; in a list every item has "archived": false, and ?archived=include also returns archived ones with true)
 { "id": "…", "name": "…", "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}], "currencies": ["USD"] }
 
 // pipeline-detail (GET/POST/PATCH/archive of one pipeline): the pipeline, plus
@@ -391,27 +391,32 @@ person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have 
 - **Unlink.** `DELETE …/deals/:id/company` and `…/person` detach the linked record and return the deal.
   The linked record itself is kept. A deal that is already unlinked answers 200 and changes nothing.
   `expected` (optional) is the id you last saw linked; if something else is linked now, the answer is
-  409 `conflict`. Omitted, no check.
+  409 `conflict`. Omitted, no check; a blank `?expected=` is 422 `fields.expected`.
 - **Pipelines.** Reading one is open to any member; create, update and archive need `operator`. `stages`
   on `PATCH` is the full, ordered list of live stages: existing stages by `id`, new ones without. A
   live stage that is missing from the list must appear in `removals` as `{stage, move_to}` where
   `move_to` is a stage that stays live (its deals move there); otherwise 422. `kind` is `open`, `won` or
   `lost`, and a pipeline keeps at least one stage. Removed stages show up in `archived_stages`;
   `restores` takes their ids. `version` works as above. `GET /crm/pipelines` lists live pipelines;
-  `?archived=include` adds archived ones.
+  `?archived=include` adds archived ones. Every list item carries `archived` (`false` unless it is an archived one). A `PATCH`
+  with no editable key is 422 `fields.base`; an unknown key inside a `stages[]` or `removals[]` row is 422.
 - **Tasks.** A task can hang off a deal, a person or a company. `POST` on `/people/:id/tasks` or
   `/companies/:id/tasks` takes `{title, due_at?, assignee?}` (assignee as for deals) and returns the
   record's detail with 201. `PATCH /crm/tasks/:task_id {done}` marks any task done or open by its id and
-  returns that task; the deal-scoped route above keeps working.
+  returns that task; the deal-scoped route above keeps working. Person and company detail list at most 10 open
+  tasks, so the new task may not appear in the 201.
 
 Extra CRM errors: 409 `crm_not_set_up` (the organization has no CRM yet), 503 `crm_unavailable` (try again
 after `Retry-After` seconds), 409 `conflict` (above), plus the existing 409 `machine_needs_update` and 503
-`machine_not_ready`. The routes for deletion, unlinking, pipeline reads and writes, interactions, and record
-tasks answer 409 `machine_needs_update` while the organization's agent machine has not been updated
-to support them; try again later. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
-`details.saved` (true: the change may already be saved) and `details.id` (on create). When `saved` is true no
-`Retry-After` is sent and you must not retry blindly: read the record first. A create sent with an
-`Idempotency-Key` does not change that: with `saved` true, follow the message, which says whether a retry with the same key is safe (the agent machine confirmed it stored the key) or to read the record (`details.id`) and not repeat the request. Without `saved` (network error, timeout), look for the record first and retry with the same key if it is missing (below).
+`machine_not_ready`. While the organization's agent machine has not been updated, only person/company task
+create and the org-wide `PATCH /crm/tasks/:task_id` answer 409 `machine_needs_update`; every other CRM route
+works. Try again later. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a
+write may carry `details.saved` (true: the change may already be saved) and `details.id` (on create). When
+`saved` is true no `Retry-After` is sent and you must not retry blindly: read the record first. A create sent
+with an `Idempotency-Key` does not change that: with `saved` true, follow the message, which says whether a
+retry with the same key is safe (the agent machine confirmed it stored the key) or to read the record
+(`details.id`) and not repeat the request. Without `saved` (network error, timeout), look for the record first
+and retry with the same key if it is missing (below).
 
 ## Idempotent creates
 
@@ -434,11 +439,19 @@ POST /orgs/:org/crm/pipelines        POST /orgs/:org/crm/companies/:id/tasks
 - **Expiry.** A key is remembered for 24 hours; after that it is treated as new.
 - **No header, no change.** Without the header a create behaves as before, and repeating it creates
   another record.
-- **Not updated yet.** If the response carries `Idempotency-Key-Honored: false`, the organization's agent
-  machine has not been updated and did not store the key, so a retry could create a duplicate. Look for
-  the record before retrying.
+- **Not updated yet.** A machine on an older version (or whose CRM upgrade did not apply) ignores the key, and
+  the create answers with `Idempotency-Key-Honored: false`. The 503 message "retry with the same Idempotency-Key"
+  is only safe where keys are honoured: if a previous successful create in that organization came back with
+  `Idempotency-Key-Honored: false`, read the record before retrying. Keys are scoped to the organization, not the user.
+- **Person with a new company.** A person create with an inline new company runs two keyed steps (the company's
+  key is derived from yours). If your key was already used for a different request, the company may already be
+  saved before the 422; that 422 then carries `details.saved` and `details.id`.
 - **Unsure outcome.** A 503 `machine_not_ready` with `details.saved` and a key sent means the create may or
-  may not have happened. When `saved` is true, follow the message: it says whether a retry with the same `Idempotency-Key` is safe or to read the record (`details.id`) and not repeat the request; a machine that has not been updated does not store the key. Scripts should always send their own key, since a generated one cannot be recovered afterwards. Without `saved` (network error, timeout), look for the record first and retry with the same key only if it is missing.
+  may not have happened. When `saved` is true, follow the message: it says whether a retry with the same
+  `Idempotency-Key` is safe or to read the record (`details.id`) and not repeat the request; a machine that
+  has not been updated does not store the key. Scripts should always send their own key, since a generated one
+  cannot be recovered afterwards. Without `saved` (network error, timeout), look for the record first and
+  retry with the same key only if it is missing.
 
 ## Subscriptions
 
