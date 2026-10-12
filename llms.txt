@@ -148,7 +148,7 @@ olympus crm person add "Ann Lee" --email ann@acme.test --company <company_id>
 olympus crm person task add <id> "Send intro" --due 2026-11-01     # companies the same; crm task done <task_id> [--undo]
 olympus crm deal unlink-company <id>      # or unlink-person; the records stay
 olympus crm pipelines --archived --json   # pipeline get <id> --json shows stages
-olympus crm pipeline add Sales --stage NAME:KIND --stage NAME:KIND   # KIND: copy one from pipelines --json
+olympus crm pipeline add Sales --stage Lead:open --stage Won:won --stage Lost:lost   # KIND is open, won or lost
 olympus crm pipeline update <id> --name "Sales 2027" --version <v>   # also pipeline archive <id> [--undo]
 olympus crm deal deletion-preview <id> --json   # then delete: person|company the same
 olympus crm deal delete <id> --yes

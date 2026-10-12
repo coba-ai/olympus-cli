@@ -38,7 +38,7 @@ const err = (status: number, code: string, message = "m", extra: Record<string, 
   ({ status, headers, body: { error: { code, message, ...extra } } });
 const UUID4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-test("AC15 requests: method, path, body, query", async () => {
+test("requests: method, path, body, query", async () => {
   const hit = async (a: string[], method: string, path: string, body: unknown, search = "") => {
     const r = await run1(a);
     expect([a.join(" "), r.code]).toEqual([a.join(" "), 0]);
@@ -67,7 +67,7 @@ test("AC15 requests: method, path, body, query", async () => {
   expect(last().path).toBe(`${P}/pipelines/a%2Fb`);
 });
 
-test("AC15 pipeline add sends a v4 Idempotency-Key, different per run; get/update/archive/list send none", async () => {
+test("pipeline add sends a v4 Idempotency-Key, different per run; get/update/archive/list send none", async () => {
   await run1(["pipeline", "add", "P", "--stage", "a:open"]);
   const first = last().idem;
   await run1(["pipeline", "add", "P", "--stage", "a:open"]);
@@ -81,7 +81,7 @@ test("AC15 pipeline add sends a v4 Idempotency-Key, different per run; get/updat
   }
 });
 
-test("AC15 usage errors exit 1 with zero requests", async () => {
+test("usage errors exit 1 with zero requests", async () => {
   const bad: string[][] = [
     ["pipeline", "add", "P"], ["pipeline", "add", "P", "--stage", "nokind"], ["pipeline", "add", "P", "--stage", ":open"], ["pipeline", "add", "P", "--stage", "a:"],
     ["pipeline", "add", "P", "--stage", "a:open", "--idempotency-key", "bad key"], ["pipeline", "add", "P", "--stage", "a:open", "--idempotency-key", ""],
@@ -107,13 +107,13 @@ test("AC15 usage errors exit 1 with zero requests", async () => {
   expect((await cli(["crm", "pipeline", "add", "P", "--stage", "a:open", "--idempotency-key", "bad key"], { env: {} })).code).toBe(1);
 });
 
-test("AC15 messages for the pipeline usage cases", async () => {
+test("messages for the pipeline usage cases", async () => {
   expect((await run1(["pipeline", "add", "P"])).err).toBe("error: crm pipeline add needs at least one --stage\n");
   expect((await run1(["pipeline", "add", "P", "--stage", "x"])).err).toBe("error: --stage must be NAME:KIND\n");
   expect((await run1(["pipeline", "update", "p_sales", "--version", "v"])).err).toBe("error: crm pipeline update needs at least one field to change\n");
 });
 
-test("AC15 negated array flags: one pinned behaviour", async () => {
+test("negated array flags: one pinned behaviour", async () => {
   const r = await run1(["pipeline", "add", "P", "--stage", "a:open", "--no-currency"]);
   // whatever parseArgs does with a negated string option, it must not crash or send a malformed body
   expect([0, 1]).toContain(r.code);
@@ -125,7 +125,7 @@ const seedArchived = () => {
   S().pipelines.push({ id: "p_old", name: "Legacy", currencies: [], archived_at: "2026-10-01T00:00:00Z", stages: [{ id: "st_o1", name: "Only", kind: "open", position: 0 }] });
 };
 
-test("AC16 piped goldens: detail and the archived list", async () => {
+test("piped goldens: detail and the archived list", async () => {
   seedArchived();
   S().pipelines[0]!.version = "v7";
   const g = await run1(["pipeline", "get", "p_sales"]);
@@ -141,7 +141,7 @@ test("AC16 piped goldens: detail and the archived list", async () => {
   expect(all).toBe(live + "p_old\tpipeline:archived\t-\tLegacy\nst_o1\tstage:p_old\topen\tOnly\n");
 });
 
-test("AC16 TTY forms and --json", async () => {
+test("TTY forms and --json", async () => {
   seedArchived();
   const list = (await run1(["pipelines", "--archived"], { tty: true })).out;
   expect(list).toContain("Legacy (archived)");
@@ -159,7 +159,7 @@ test("AC16 TTY forms and --json", async () => {
   expect(JSON.parse(a.out).data.name).toBe("Fresh");
 });
 
-test("AC16 sentences and effects", async () => {
+test("sentences and effects", async () => {
   let r = await run1(["pipeline", "add", "Fresh", "--stage", "a:open", "--stage", "b:won"]);
   const id = S().pipelines.find((p) => p.name === "Fresh")!.id;
   expect(r.out.startsWith(`id: ${id}\nname: Fresh\n`)).toBe(true);
@@ -179,7 +179,7 @@ test("AC16 sentences and effects", async () => {
   expect(r.out).toContain("archived_stage: st_lost\tlost\tLost");
 });
 
-test("AC16 idempotency on add: reused key replays, invalid key refused, hint rules", async () => {
+test("idempotency on add: reused key replays, invalid key refused, hint rules", async () => {
   const add = (extra: string[] = [], o: { tty?: boolean } = {}) => run1(["pipeline", "add", "Once", "--stage", "a:open", "--idempotency-key", "K1", ...extra], o);
   const a = await add();
   const b = await add();
@@ -203,7 +203,7 @@ test("AC16 idempotency on add: reused key replays, invalid key refused, hint rul
   expect([r.code, r.err]).toEqual([5, JSON.stringify(body) + "\n"]);
 });
 
-test("AC16 EVIL control strings never reach stdout", async () => {
+test("EVIL control strings never reach stdout", async () => {
   S().pipelines[0] = {
     ...S().pipelines[0]!, id: EVIL, name: EVIL, currencies: [EVIL], version: EVIL, archived_at: "2026-10-01T00:00:00Z",
     stages: [{ id: EVIL, name: EVIL, kind: EVIL }], archived_stages: [{ id: EVIL, name: EVIL, kind: EVIL }],
@@ -222,7 +222,7 @@ test("AC16 EVIL control strings never reach stdout", async () => {
   noCtl((await run1(["pipeline", "add", "P", "--stage", "a:open"])).out);
 });
 
-test("AC16 token sweep: pipeline commands x error statuses x tty x json never print the token", async () => {
+test("token sweep: pipeline commands x error statuses x tty x json never print the token", async () => {
   const T = TOKENS.owner;
   const cmds: string[][] = [
     ["pipelines"], ["pipelines", "--archived"], ["pipeline", "get", "p_sales"], ["pipeline", "add", "P", "--stage", "a:open"],

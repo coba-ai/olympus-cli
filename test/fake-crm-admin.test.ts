@@ -19,7 +19,7 @@ async function crm(method: string, path: string, body?: unknown, token = TOKENS.
   return { status: res.status, json: text ? JSON.parse(text) : undefined, res };
 }
 
-test("AC6 pipelines: create, detail, patch with version, archive, list", async () => {
+test("pipelines: create, detail, patch with version, archive, list", async () => {
   const c = await crm("POST", "/pipelines", { name: "Ops", stages: [{ name: "A", kind: "open" }, { name: "B", kind: "won" }], currencies: ["EUR"] });
   expect(c.status).toBe(201);
   const p = c.json.data;
@@ -50,7 +50,7 @@ test("AC6 pipelines: create, detail, patch with version, archive, list", async (
   expect((await crm("GET", "/pipelines/nope")).status).toBe(404);
 });
 
-test("AC6 deletion preview, delete, unlink", async () => {
+test("deletion preview, delete, unlink", async () => {
   expect((await crm("GET", "/deals/d_renewal/deletion_preview")).json.data).toEqual({ entity: "deal", id: "d_renewal", name: "Initech renewal", impact: { notes: 1, tasks: 1 } });
   expect((await crm("GET", "/people/pe_dana/deletion_preview")).json.data.impact).toEqual({ deals_unlinked: 1 });
   expect((await crm("GET", "/companies/c_initech/deletion_preview")).json.data.impact).toEqual({ people_unlinked: 1, deals_unlinked: 1 });
@@ -65,7 +65,7 @@ test("AC6 deletion preview, delete, unlink", async () => {
   expect((await crm("DELETE", "/people/pe_dana", undefined, TOKENS.teammate)).status).toBe(403);
 });
 
-test("AC6 record tasks and the org-wide toggle; detail extras only when stored", async () => {
+test("record tasks and the org-wide toggle; detail extras only when stored", async () => {
   const person = (await crm("GET", "/people/pe_dana")).json.data;
   expect(person).not.toHaveProperty("tasks");
   expect(person).not.toHaveProperty("interactions");
@@ -86,7 +86,7 @@ test("AC6 record tasks and the org-wide toggle; detail extras only when stored",
   expect(d).toMatchObject({ interactions: [{ kind: "call" }], legacy_notes: "old" });
 });
 
-test("AC6 idempotency: log field, replay, reuse, malformed, teammate", async () => {
+test("idempotency: log field, replay, reuse, malformed, teammate", async () => {
   const k = { "Idempotency-Key": "key-1" };
   const first = await crm("POST", "/deals", { name: "X" }, TOKENS.owner, k);
   expect(first.status).toBe(201);

@@ -166,7 +166,7 @@ export function api(host: string, token?: string, timeoutMs = 30_000, signal?: A
   return async (method, path, body, callTimeoutMs, extra) => {
     const ms = callTimeoutMs ?? timeoutMs;
     const url = `${host}/api/v1${path}`;
-    const headers: Record<string, string> = { ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json", ...extra };
+    const headers: Record<string, string> = { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let res: Response;
     let text: string;
