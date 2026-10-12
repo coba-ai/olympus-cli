@@ -153,7 +153,8 @@ makes no promise that the old secret keeps working. `delete` never prompts and r
 `consecutive_failures` and exits 0 whether or not your URL answered, so read `delivered`; `status` is `-` on a
 network failure and `error` says why. It can be rate limited (exit 5: retry after the stated seconds). A
 subscription pauses after 20 failed events in a row; re-enable it with `update <id> --active`. Verifying
-signatures: [`docs/API.md`](docs/API.md#receiving-events).
+signatures: [`docs/API.md`](docs/API.md#receiving-events). Delivery is at-least-once, so receivers dedupe on
+`X-Request-ID` (keep seen ids at least 25 hours); events can arrive late or out of order.
 
 Agents and days:
 

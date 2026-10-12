@@ -535,8 +535,12 @@ UTF-8 JSON of at most 256 KB; if it would be larger, `description` fields are tr
   followed; a 3xx counts as a failure. Any 2xx is success.
 - Network errors, timeouts, 408, 429 and 5xx are retried, up to 6 attempts in all, with a growing delay
   (roughly n⁴ × 3 s, about 49 minutes across the 6 attempts). Any other 4xx is not retried.
-- Delivery is best-effort at-least-once: duplicates are possible, so dedupe on `X-Request-ID`. An event can
-  be lost if the server stops between saving the task and queueing the event. Order is not guaranteed.
+- Delivery is at-least-once: every saved task change produces its events. They are stored together with the
+  change and re-sent if queueing fails; an event that still cannot be queued is dropped only after 24 hours.
+- Duplicates are possible: dedupe on `X-Request-ID` and keep the ids you have seen for at least 25 hours
+  (longer if you can).
+- Events can arrive late (around 10 minutes) after a server problem, and out of order; order is not
+  guaranteed.
 - After 20 failed events in a row the subscription is switched off (`active: false`). Re-enable it with
   `PATCH` `active: true`, which resets the counter. A success resets it too.
 - URLs must be `https`. Private, loopback, link-local and cloud-metadata addresses are refused when sending.
