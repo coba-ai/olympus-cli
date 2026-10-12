@@ -176,5 +176,7 @@ olympus subscription delete <id> --yes
 - Before changing a task, read it (`task get`) so you act on the right id and week.
 - Exit 4: report the server's message. Exit 6: read `error.code` from `--json` stderr. `conflict`: `get` again, then retry once. `crm_not_set_up`: stop and tell the person. `invalid`: fix the input; never resend it unchanged.
 - `crm deal add|note|task add`, `crm person|company add` and `subscription create` are not idempotent: after exit 5, list or get before retrying.
+- Exit 5 with `details.saved: true` in --json stderr: the write may have happened. `get`/list the record (create returns `details.id`); do not retry.
+- `--stage` needs `--pipeline` on `crm deals` and `deal add`.
 - Prefer `--json` and read ids from it. Never guess an id.
 - Do not `delegate` or `breakdown` on your own initiative; they start work for other agents.

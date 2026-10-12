@@ -100,7 +100,8 @@ Any tag flag together with other fields is two server writes; if the second fail
 `archive` hides a record and is reversible with `--undo`; it needs no `--yes`. `--archived` on a list
 shows only archived records, `--sort` and `--page` are passed to the server (one page at a time), and
 `--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one
-(`retry after Ns`) is exit 5.
+(`retry after Ns`) is exit 5. Exit 5 with `details.saved: true` (in `--json` stderr) means the change may already be
+saved: read the record, do not retry. `--stage` needs `--pipeline`.
 
 Subscriptions (`olympus subscription …`) send signed HTTP events to your URL when things happen
 (`olympus event-types` lists the names). They are **operator only, reads included** (a teammate gets
@@ -191,7 +192,7 @@ newline in task text never splits a row; nothing is printed for an empty list):
   prints the same lines with `-` for the empty ones. The `summary` is in `--json` only.
 - `crm pipelines`: `id  pipeline  currencies|-  name`, then one `stage-id  stage:<pipeline id>  kind  name` row per stage.
 - `crm tags`: one tag per line. `crm search`: `entity  id  sub|-  label`.
-- `crm deals`: `id  status  pipeline-id  stage-id  amount  currency  owner-email|-  company-name|-  tag,tag|-  name`.
+- `crm deals`: `id  status  pipeline-id|-  stage-id  amount  currency  owner-email|-  company-name|-  tag,tag|-  name`.
   `crm people`: `id  email|-  company-id|-  job-title|-  open-deals  tag,tag|-  name`.
   `crm companies`: `id  domain|-  city|-  open-deals  tag,tag|-  name`. Piped lists are **one page**, with no
   paging footer; use `--json` for `total`, `page` and `per`, and `--page N` for the next one.
@@ -203,8 +204,8 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `linkedin_url`, `company`, `tags`, `archived`, `version`, `notes`; a company `id`, `name`, `domain`,
   `website`, `industry`, `linkedin_url`, `phone`, `city`, `tags`, `archived`, `version`, `notes`.
   Related rows follow, tab-separated: deals `note: id  created_at  author  body` and
-  `task: id  status  due_at|-  assignee  title`; people `deal: id  status  stage  name`; companies
-  `person: id  email  full_name` and `deal: id  status  stage  name`. Pass the `version` back as `--version`.
+  `task: id  status  due_at|-  assignee  title`; people `deal: id  status  stage-name  name`; companies
+  `person: id  email  full_name` and `deal: id  status  stage-name  name` (deal refs carry the stage name, not an id). Pass the `version` back as `--version`.
 - `subscription list`: `id  active|inactive  event,event  last-status|-  consecutive-failures  url  name`.
 - `subscription get`, `create`, `update` and `rotate-secret`: `id:`, `name:`, `url:`, `events:`
   (comma-joined), `active:` (`true|false`), `created_by:` (user id), `last_delivery_at:`,

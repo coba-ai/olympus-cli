@@ -250,8 +250,8 @@ Responses carry `Cache-Control: no-store`. An unknown record id, or an organizat
 is the usual 404 `not_found`.
 
 **Shapes grow.** The server may add fields to any object below over time. Clients must ignore fields
-they do not know. Ids are opaque strings: store and send them back unchanged. Amounts are decimal
-strings (`"1200.00"`), never numbers. Times are ISO 8601.
+they do not know. Ids are opaque strings: store and send them back unchanged. Amounts are
+whole-number strings (`"1200"`); send a number or a decimal string. Times are ISO 8601.
 
 ```
 GET    /orgs/:org/crm/pipelines                              → {data:[pipeline]}
@@ -287,16 +287,16 @@ POST   /orgs/:org/crm/companies/:id/archive {archived}                        �
 **Lists.** `page` starts at 1; `total`, `page` and `per` describe the page you got. Filters are strict: an
 unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take `status`
 (`open`, `won`, `lost`), `stage` (a stage id, or `none`), `owner` (a member email, `me` or `none`) and
-`archived` (`only` or `include`; archived records are left out by default). People and companies take `q`, `sort`,
-`page` and `archived`. `search` needs a non-empty `q` and returns at most 20 results.
+`archived` (`only` or `include`; archived records are left out by default). `stage` without `pipeline` is 422 (also on create). People and companies take `q`, `sort`,
+`page` and `archived`. `search` needs a non-empty `q` and returns at most 5 results per entity (15 in all).
 
 **Shapes.** A deal in a list is a row; fetching one returns the full deal.
 
 ```jsonc
 // deal row
-{ "id": "…", "name": "Acme renewal", "amount": "1200.00" | null, "currency": "USD" | null,
+{ "id": "…", "name": "Acme renewal", "amount": "1200" | null, "currency": "USD" | null,
   "status": "open" | "won" | "lost" | null,
-  "pipeline": {"id": "…", "name": "…"} | null,
+  "pipeline": {"id": "…" | null, "name": "…"} | null,
   "stage": {"id": "…", "name": "…", "kind": "…"} | null, "in_stage_since": "…" | null,
   "company_name": "…" | null, "person_name": "…" | null, "person_email": "…" | null,
   "owner_email": "…" | null, "next_action": "…" | null,
@@ -323,7 +323,7 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
   "tags": ["…"], "archived": false, "version": "<opaque>", "open_deals": 0 }
 
 // person and company, single-record responses also carry
-"deals": [{"id": "…", "name": "…", "pipeline": "…", "stage": "…", "status": "…", "amount": "…", "currency": "…"}]
+"deals": [{"id": "…", "name": "…", "pipeline": "<pipeline id>", "stage": {"name": "…", "kind": "…"}, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
 // pipeline (live pipelines and stages only)
@@ -333,7 +333,9 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
 { "entity": "deal" | "person" | "company", "id": "…", "label": "…", "sub": "…" }
 ```
 
-List rows for people and companies carry the same fields without the nested lists, plus a few counts
+The company and person nested in a deal are the core record: no `deals` or `people` list, but with `version` and `deal_count`.
+List rows are narrower than the detail: company rows omit `website`, `linkedin_url`, `phone`, `notes` and `version`;
+person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have `open_deals`). No nested lists; a few counts
 (`open_deals`, `open_value`, `currencies` on companies). `archived` is also given as `archived_at`.
 
 **Writes.**
@@ -346,7 +348,7 @@ List rows for people and companies carry the same fields without the nested list
   version: last writer wins for the fields you sent. `move` takes `from_stage` and the owner, company and
   person routes take `expected` (the value you last saw) the same way: sent, a mismatch is 409 `conflict`;
   omitted, no check.
-- **`tags`** replaces the whole list: at most 20, each trimmed to 24 characters. There is no add/remove;
+- **`tags`** replaces the whole list: at most 20, each at most 200 characters. There is no add/remove;
   read, change, write back. Sending `tags` together with other fields is two writes. If the second fails,
   the first stays.
 - **Create.** `owner` defaults to the caller. `owner` and `assignee` accept a member's email
@@ -355,9 +357,11 @@ List rows for people and companies carry the same fields without the nested list
 - **Move.** Moving a deal to the stage it is already in is a no-op 200.
 - **Archive.** `archived: true` archives, `false` restores. Nothing is deleted through the API.
 
-Extra CRM errors: 409 `crm_not_set_up` (the organization has no CRM yet), 503 `crm_unavailable` (try again
+Task `done` is set by task id. Extra CRM errors: 409 `crm_not_set_up` (the organization has no CRM yet), 503 `crm_unavailable` (try again
 after `Retry-After` seconds), 409 `conflict` (above), plus the existing 409 `machine_needs_update` and 503
-`machine_not_ready`.
+`machine_not_ready`. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
+`details.saved` (true: the change may already be saved) and `details.id` (on create). When `saved` is true no
+`Retry-After` is sent and you must not retry blindly: read the record first.
 
 ## Subscriptions
 

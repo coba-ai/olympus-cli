@@ -103,7 +103,7 @@ test("AC8 piped list goldens", async () => {
     "p_sales\tpipeline\tUSD\tSales\nst_lead\tstage:p_sales\topen\tLead\nst_won\tstage:p_sales\twon\tWon\nst_lost\tstage:p_sales\tlost\tLost\n");
   expect(await g(["tags"])).toBe("renewal\n");
   expect(await g(["search", "in"])).toBe("deal\td_renewal\tInitech\tInitech renewal\ncompany\tc_initech\tinitech.test\tInitech\n");
-  expect(await g(["deals"])).toBe("d_renewal\topen\tp_sales\tst_lead\t1200.00\tUSD\towner@acme.test\tInitech\trenewal\tInitech renewal\n");
+  expect(await g(["deals"])).toBe("d_renewal\topen\tp_sales\tst_lead\t1200\tUSD\towner@acme.test\tInitech\trenewal\tInitech renewal\n");
   expect(await g(["deals", "--archived"])).toBe("d_old\tlost\tp_sales\tst_lost\t-\t-\t-\t-\t-\tOld deal\n");
   expect(await g(["people"])).toBe("pe_dana\tdana@initech.test\tc_initech\t-\t1\t-\tDana Lee\n");
   expect(await g(["companies"])).toBe("c_initech\tinitech.test\t-\t1\t-\tInitech\n");
@@ -155,7 +155,7 @@ test("AC8 --json is the body as-is; TTY is a table with a paging footer", async 
   expect((await run1(["deals"], true)).out).toEndWith("\n\nPage 2 · showing 1 of 51.\n");
   fake.state.next = { status: 200, body: { data: { deals: [{ id: "d1" }], total: 1, page: 1, per: 50 } } };
   expect((await run1(["deals"], true)).out).not.toContain("Page");
-  expect((await run1(["deals"], true)).out).toContain("d_renewal  Initech renewal  open    Lead   1200.00  USD       owner@acme.test  Initech       renewal");
+  expect((await run1(["deals"], true)).out).toContain("d_renewal  Initech renewal  open    Lead   1200    USD       owner@acme.test  Initech       renewal");
   nextOk({ deals: [], total: 0, page: 1, per: 50 });
   expect((await run1(["deals"], true)).out).toBe("No deals.\n");
   nextOk({ people: [] });
@@ -176,7 +176,7 @@ test("AC8 --json is the body as-is; TTY is a table with a paging footer", async 
 test("AC9 piped detail goldens", async () => {
   const d = (await run1(["deal", "get", "d_renewal"])).out;
   expect(d).toBe([
-    "id: d_renewal", "name: Initech renewal", "status: open", "pipeline: p_sales", "stage: st_lead", "amount: 1200.00", "currency: USD",
+    "id: d_renewal", "name: Initech renewal", "status: open", "pipeline: p_sales", "stage: st_lead", "amount: 1200", "currency: USD",
     "owner_email: owner@acme.test", "next_action: -", "lost_reason: -", "company: c_initech", "person: pe_dana", "tags: renewal", "archived: false",
     "in_stage_since: 2026-10-01T09:00:00Z", "updated_at: 2026-10-01T09:00:00Z", `version: ${V}`,
     "note: n_1\t2026-10-01T09:00:00Z\towner@acme.test\tKickoff call booked", "task: ct_1\topen\t-\towner@acme.test\tSend quote", "",
@@ -217,7 +217,7 @@ test("AC9 TTY detail names records; --json is the body as-is", async () => {
   const t = (await run1(["deal", "get", "d_renewal"], true)).out;
   expect(t).toBe([
     "id              d_renewal", "name            Initech renewal", "status          open", "pipeline        Sales", "stage           Lead",
-    "amount          1200.00", "currency        USD", "owner email     owner@acme.test", "next action     -", "lost reason     -",
+    "amount          1200", "currency        USD", "owner email     owner@acme.test", "next action     -", "lost reason     -",
     "company         Initech", "person          Dana Lee", "tags            renewal", "archived        -",
     "in stage since  11d ago (2026-10-01 09:00 UTC)", "updated at      11d ago (2026-10-01 09:00 UTC)", `version         ${V}`,
     "", "notes:", "  n_1  11d ago (2026-10-01 09:00 UTC)  owner@acme.test  Kickoff call booked", "", "tasks:", "  ct_1  open  -  owner@acme.test  Send quote", "",
@@ -261,4 +261,21 @@ test("TTY: a future task due date prints the date, not 'just now'", async () => 
   expect(r.out).toContain("2026-10-20 00:00 UTC");
   expect(r.out).toMatch(/\+\d+d \(2026-10-20 00:00 UTC\)/);
   expect(r.out).not.toContain("just now (2026-10-20");
+});
+
+test("D1 deal ref rows print the stage name; null list pipeline id prints - and never leaks the name into the id column", async () => {
+  for (const a of [["person", "get", "pe_dana"], ["company", "get", "c_initech"]]) {
+    const o = (await run1(a)).out;
+    expect(o).toContain("deal: d_renewal\topen\tLead\tInitech renewal\n");
+    expect(o).not.toContain("st_lead");
+  }
+  const dl = fake.state.crm.acme!.deals.find((d: any) => d.id === "d_renewal")!;
+  dl.null_pipeline_id = true;
+  expect((await run1(["deals"])).out).toBe("d_renewal\topen\t-\tst_lead\t1200\tUSD\towner@acme.test\tInitech\trenewal\tInitech renewal\n");
+  expect((await run1(["deals"], true)).out).not.toContain("Sales");
+  nextOk({ id: "d1", pipeline: { id: null, name: "Sales" }, stage: { id: "s1", name: "Lead" } });
+  const t = (await run1(["deal", "get", "d1"], true)).out;
+  expect(t).toContain("pipeline        Sales");
+  nextOk({ id: "d1", pipeline: { id: null, name: "Sales" } });
+  expect((await run1(["deal", "get", "d1"])).out).toContain("pipeline: -\n");
 });

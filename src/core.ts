@@ -345,7 +345,8 @@ export function fail(io: Io, json: boolean, e: CliError, hint?: { orgFromCreds?:
   const msg = typeof err?.message === "string" && err.message ? err.message : null;
   let line = msg ? `error: ${clean(msg)}` : `error: HTTP ${e.status ?? "error"}`;
   if (e.status === 409 && err?.code === "conflict") line += " (it changed since you read it; read it again and retry)";
-  if (e.retryAfter) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
+  // saved: the write may have landed, so the server message stands alone: no retry hint, even if a Retry-After came back.
+  if (e.retryAfter && err?.details?.saved !== true) line += ` (retry after ${/^\d+$/.test(e.retryAfter) ? e.retryAfter + "s" : clean(e.retryAfter)})`;
   if (e.location) line += ` (redirected to ${e.location}; check --host)`;
   if (e.exit === 3 && hint?.orgFromCreds) line += ` (org "${hint.orgFromCreds}" from credentials.json; override with --org)`;
   const fields = err?.details?.fields;

@@ -36,7 +36,7 @@ test("AC4 reads: pipelines, tags, search, paging, archived filter", async () => 
   const l = await crm("GET", "/deals?status=bogus");
   expect(l.json.data).toMatchObject({ total: 1, page: 1, per: 50 });
   expect(l.json.data.deals[0]).toMatchObject({
-    id: "d_renewal", amount: "1200.00", currency: "USD", status: "open", company_name: "Initech", person_name: "Dana Lee",
+    id: "d_renewal", amount: "1200", currency: "USD", status: "open", company_name: "Initech", person_name: "Dana Lee",
     person_email: "dana@initech.test", owner_email: "owner@acme.test", archived: false,
   });
   expect(l.json.data.deals[0].notes).toBeUndefined();
@@ -194,4 +194,27 @@ test("AC5 subscriptions: operator only, validation, secret once, ping, delete", 
   expect(et.json.data).toEqual(["task.created", "task.updated", "task.completed", "task.reopened", "task.assigned", "task.deleted", "task.delegated", "ping"]);
   fake.state.subscriptions = seedSubscriptions();
   expect((await sub("GET", "")).json.data).toHaveLength(1);
+});
+
+test("D1 server shapes: search caps at 5 per entity, stage needs pipeline, narrow rows", async () => {
+  const S = fake.state.crm.acme!;
+  for (let i = 0; i < 8; i++) S.people.push({ ...S.people[0], id: `pe_${i}`, full_name: `Dana ${i}` });
+  const hits = (await crm("GET", "/search?q=dana")).json.data;
+  expect(hits.filter((h: any) => h.entity === "person")).toHaveLength(5);
+  expect((await crm("GET", "/deals?stage=st_lead")).json.error.details.fields).toHaveProperty("stage");
+  expect((await crm("GET", "/deals?stage=st_lead&pipeline=p_sales")).status).toBe(200);
+  expect((await crm("POST", "/deals", { name: "x", stage: "st_lead" })).json.error.details.fields).toHaveProperty("stage");
+  const co = (await crm("GET", "/companies")).json.data.companies[0];
+  for (const k of ["website", "linkedin_url", "phone", "notes", "version"]) expect(co).not.toHaveProperty(k);
+  const pe = (await crm("GET", "/people")).json.data.people[0];
+  for (const k of ["linkedin_url", "notes", "version", "deal_count"]) expect(pe).not.toHaveProperty(k);
+  expect(pe).toHaveProperty("open_deals");
+  const dd = (await crm("GET", "/deals/d_renewal")).json.data;
+  expect(dd.company).toMatchObject({ deal_count: 1 });
+  expect(dd.company).not.toHaveProperty("deals");
+  expect(dd.person).toMatchObject({ deal_count: 1 });
+  expect(dd.person).not.toHaveProperty("deals");
+  const ref = (await crm("GET", "/people/pe_dana")).json.data.deals[0];
+  expect(ref.stage).toEqual({ name: "Lead", kind: "open" });
+  expect(ref.pipeline.id).toBe("p_sales");
 });

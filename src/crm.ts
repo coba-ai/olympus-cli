@@ -35,7 +35,8 @@ const ref = (x: any) => (obj(x) ? x.id : x);
 const sc = (x: any) => (typeof x === "string" ? x : x?.email ?? x?.name ?? x?.id);
 const REF = ["pipeline", "stage", "company", "person"], SC = ["author", "assignee"];
 const cell = (f: string, x: any) => (f === "archived" ? String(x === true) : REF.includes(f) ? dash(ref(x)) : SC.includes(f) ? dash(sc(x)) : dash(x));
-const row = (cols: string[], r: any) => cols.map((f) => cell(f, r?.[f])).join("\t");
+// byName: columns printed as the name instead of the id (a deal ref's stage has no id).
+const row = (cols: string[], r: any, byName: string[] = []) => cols.map((f) => (byName.includes(f) ? dash(nm(r?.[f])) : cell(f, r?.[f]))).join("\t");
 // TTY: names in place of ids.
 const nm = (x: any): string | null => {
   const y = obj(x) ? x.name ?? x.full_name ?? x.id : Array.isArray(x) ? (x.length ? x.join(",") : null) : x;
@@ -46,7 +47,7 @@ const tt = (f: string, x: any, now: number): string | null =>
 
 const detail = (kind: Kind, d: any) => [
   ...KIND[kind].fields.map((f) => `${f}: ${cell(f, d[f])}`),
-  ...KIND[kind].rels.flatMap(([p, key, cols]) => arr(d[key]).map((r) => `${p}: ${row(cols, r)}`)),
+  ...KIND[kind].rels.flatMap(([p, key, cols]) => arr(d[key]).map((r) => `${p}: ${row(cols, r, p === "deal" ? ["stage"] : [])}`)),
 ].join("\n");
 
 function block(kind: Kind, d: any, now: number): string {

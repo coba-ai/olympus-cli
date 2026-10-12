@@ -135,7 +135,7 @@ export function seedCrm(): Record<string, CrmStore> {
       people: [{ ...nul(PE_KEYS), id: "pe_dana", full_name: "Dana Lee", email: "dana@initech.test", company_id: "c_initech", tags: [], archived_at: null, version: ver() }],
       deals: [
         deal({
-          id: "d_renewal", name: "Initech renewal", amount: "1200.00", currency: "USD", stage_id: "st_lead", owner_email: "owner@acme.test",
+          id: "d_renewal", name: "Initech renewal", amount: "1200", currency: "USD", stage_id: "st_lead", owner_email: "owner@acme.test",
           tags: ["renewal"], company_id: "c_initech", person_id: "pe_dana",
           notes: [{ id: "n_1", author: "owner@acme.test", body: "Kickoff call booked", created_at: TS }],
           tasks: [{ id: "ct_1", title: "Send quote", status: "open", due_at: null, assignee: "owner@acme.test" }],
@@ -160,7 +160,7 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
   const open = (d: Item) => !d.archived_at && stOf(d.stage_id)?.s.kind === "open";
   const dref = (d: Item) => {
     const l = stOf(d.stage_id);
-    return { id: d.id, name: d.name, pipeline: l ? { id: l.p.id, name: l.p.name } : null, stage: l?.s.name ?? null, status: l?.s.kind ?? null, amount: d.amount, currency: d.currency };
+    return { id: d.id, name: d.name, pipeline: l ? { id: l.p.id, name: l.p.name } : null, stage: l ? { name: l.s.name, kind: l.s.kind } : null, status: l?.s.kind ?? null, amount: d.amount, currency: d.currency };
   };
   const base = (d: Item) => {
     const l = stOf(d.stage_id);
@@ -170,27 +170,32 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
       in_stage_since: d.in_stage_since, owner_email: d.owner_email, next_action: d.next_action, tags: d.tags, ...arch(d), updated_at: d.updated_at,
     };
   };
-  const cOut = (c: Item, full: boolean) => {
-    const { version, ...rest } = c;
+  // core = the shape nested in a deal; detail adds the related arrays; the list row is narrower than either.
+  const cOut = (c: Item, mode: "core" | "detail" | "row") => {
+    const { version, website, linkedin_url, phone, notes, ...slim } = c;
     const ds = S.deals.filter((d) => d.company_id === c.id);
     const ps = S.people.filter((p) => p.company_id === c.id);
-    return full
-      ? { ...rest, ...arch(c), version, deals: ds.map(dref), people: ps.map((p) => ({ id: p.id, full_name: p.full_name, email: p.email, job_title: p.job_title })) }
-      : { ...rest, ...arch(c), people: ps.length, open_deals: ds.filter(open).length, open_value: ds.filter(open).reduce((a, d) => a + Number(d.amount ?? 0), 0).toFixed(2), currencies: [...new Set(ds.map((d) => d.currency).filter(Boolean))] };
+    if (mode === "row") return { ...slim, ...arch(c), people: ps.length, open_deals: ds.filter(open).length, open_value: String(ds.filter(open).reduce((a, d) => a + Number(d.amount ?? 0), 0)), currencies: [...new Set(ds.map((d) => d.currency).filter(Boolean))] };
+    const full = { ...slim, website, linkedin_url, phone, notes, ...arch(c), version, deal_count: ds.length };
+    return mode === "core" ? full : { ...full, deals: ds.map(dref), people: ps.map((p) => ({ id: p.id, full_name: p.full_name, email: p.email, job_title: p.job_title })) };
   };
-  const pOut = (p: Item, full: boolean) => {
-    const { version, company_id, ...rest } = p;
+  const pOut = (p: Item, mode: "core" | "detail" | "row") => {
+    const { version, company_id, linkedin_url, notes, ...slim } = p;
     const c = co(company_id);
     const ds = S.deals.filter((d) => d.person_id === p.id);
-    return { ...rest, ...arch(p), company: c ? { id: c.id, name: c.name } : null, ...(full ? { version, deals: ds.map(dref) } : { open_deals: ds.filter(open).length }) };
+    const head = { ...slim, ...arch(p), company: c ? { id: c.id, name: c.name } : null };
+    if (mode === "row") return { ...head, open_deals: ds.filter(open).length };
+    const full = { ...head, linkedin_url, notes, version, deal_count: ds.length };
+    return mode === "core" ? full : { ...full, deals: ds.map(dref) };
   };
-  const dRow = (d: Item) => ({ ...base(d), company_name: co(d.company_id)?.name ?? null, person_name: pe(d.person_id)?.full_name ?? null, person_email: pe(d.person_id)?.email ?? null });
+  // null_pipeline_id (test-injected) makes the list row's pipeline id null, as the server may send.
+  const dRow = (d: Item) => ({ ...base(d), ...(d.null_pipeline_id && base(d).pipeline ? { pipeline: { id: null, name: base(d).pipeline!.name } } : {}), company_name: co(d.company_id)?.name ?? null, person_name: pe(d.person_id)?.full_name ?? null, person_email: pe(d.person_id)?.email ?? null });
   const dOut = (d: Item) => {
     const l = stOf(d.stage_id);
     const c = co(d.company_id), p = pe(d.person_id);
     return {
       ...base(d), lost_reason: d.lost_reason, created_at: d.created_at, version: d.version, pipeline_currencies: l?.p.currencies ?? [],
-      company: c ? cOut(c, true) : null, person: p ? pOut(p, true) : null, stages: l?.p.stages ?? [], history: d.history,
+      company: c ? cOut(c, "core") : null, person: p ? pOut(p, "core") : null, stages: l?.p.stages ?? [], history: d.history,
       notes: d.notes, notes_count: d.notes.length, tasks: d.tasks,
     };
   };
@@ -243,13 +248,14 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
       ...S.people.map((x) => ({ entity: "person", id: x.id, label: x.full_name, sub: x.email })),
       ...S.companies.map((x) => ({ entity: "company", id: x.id, label: x.name, sub: x.domain })),
     ];
-    return [200, { data: hits.filter((h) => (!e || h.entity === e) && h.label.toLowerCase().includes(t)).slice(0, 20) }];
+    const per: Record<string, number> = {};
+    return [200, { data: hits.filter((h) => (!e || h.entity === e) && h.label.toLowerCase().includes(t) && (per[h.entity] = (per[h.entity] ?? 0) + 1) <= 5) }];
   }
   if (c === "people" || c === "companies") {
     const company = c === "companies", list = company ? S.companies : S.people, nk = company ? "name" : "full_name";
-    const out = (x: Item, full = true) => (company ? cOut(x, full) : pOut(x, full));
+    const out = (x: Item, mode: "detail" | "row" = "detail") => (company ? cOut(x, mode) : pOut(x, mode));
     if (!id) {
-      if (M === "GET") return page(list, c, (x) => out(x, false));
+      if (M === "GET") return page(list, c, (x) => out(x, "row"));
       if (M !== "POST") return NF;
       if (blank(b[nk])) return inv({ [nk]: ["can't be blank"] });
       let cid: string | Res | null = null;
@@ -273,9 +279,10 @@ function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams,
   }
   if (c !== "deals") return NF;
   if (!id) {
-    if (M === "GET") return page(S.deals, "deals", dRow);
+    if (M === "GET") return q.get("stage") && !q.get("pipeline") ? inv({ stage: ["needs pipeline"] }) : page(S.deals, "deals", dRow);
     if (M !== "POST") return NF;
     if (blank(b.name)) return inv({ name: ["can't be blank"] });
+    if (b.stage && !b.pipeline) return inv({ stage: ["needs pipeline"] });
     const p = S.pipelines.find((x) => x.id === (b.pipeline ?? S.pipelines[0]?.id));
     if (!p) return inv({ pipeline: ["not found"] });
     const st = p.stages.find((x: Item) => x.id === (b.stage ?? p.stages[0].id));

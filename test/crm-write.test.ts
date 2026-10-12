@@ -323,3 +323,29 @@ test("AC14 --help carries the CRM usage lines exactly", async () => {
   ];
   for (const l of lines) expect(r.out).toContain(l + "\n");
 });
+
+test("D1 503 machine_not_ready with details.saved: no retry hint, still exit 5", async () => {
+  const body = { saved: true, id: "d_x" };
+  const hdr = { "Retry-After": "30" };
+  fake.state.next = err(503, "machine_not_ready", "The machine is starting; the deal may have been saved.", { details: body }, hdr);
+  let r = await run1(["deal", "add", "N"]);
+  expect([r.code, r.err]).toEqual([5, "error: The machine is starting; the deal may have been saved.\n"]);
+  fake.state.next = err(503, "machine_not_ready", "The machine is starting; the deal may have been saved.", { details: body }, hdr);
+  r = await run1(["deal", "add", "N", "--json"]);
+  expect([r.code, JSON.parse(r.err).error.details]).toEqual([5, body]);
+  fake.state.next = err(503, "machine_not_ready", "Starting.", { details: { saved: false } }, hdr);
+  r = await run1(["deal", "add", "N"]);
+  expect([r.code, r.err]).toEqual([5, "error: Starting. (retry after 30s)\n"]);
+  fake.state.next = err(503, "machine_not_ready", "Starting.", {}, hdr);
+  expect((await run1(["deal", "add", "N"])).err).toBe("error: Starting. (retry after 30s)\n");
+});
+
+test("D1 422 with details.existing exits 6 and --json carries it", async () => {
+  const existing = { id: "c_initech", name: "Initech" };
+  fake.state.next = err(422, "duplicate", "Already exists.", { details: { existing } });
+  let r = await run1(["company", "add", "Initech", "--json"]);
+  expect([r.code, JSON.parse(r.err).error.details.existing]).toEqual([6, existing]);
+  fake.state.next = err(422, "duplicate", "Already exists.", { details: { existing } });
+  r = await run1(["company", "add", "Initech"]);
+  expect([r.code, r.err]).toEqual([6, "error: Already exists.\n"]);
+});
