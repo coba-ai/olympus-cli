@@ -137,7 +137,7 @@ olympus crm pipelines --json              # pipelines and their stage ids
 olympus crm deals --pipeline P --status open --json   # also --stage, --owner me|EMAIL|none, --q, --page
 olympus crm deal get <id> --json          # .data.version is what --version takes
 olympus crm deal add "Acme renewal" --pipeline P --stage S --amount 5000 --next "Call Tue"
-olympus crm deal update <id> --next "Send quote" --version 7
+olympus crm deal update <id> --next "Send quote" --version <version from get --json>
 olympus crm deal move <id> STAGE_ID       # stage id from pipelines; deal owner <id> me|EMAIL|--none
 olympus crm deal note <id> "Called, wants a quote"    # TEXT, or - to read stdin
 olympus crm deal task add <id> "Send quote" --due 2026-11-01 --assign me

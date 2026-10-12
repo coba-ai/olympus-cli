@@ -431,7 +431,7 @@ task and type, after it has been saved.
 { "id": "evt_…", "type": "task.completed", "created_at": "2026-10-12T15:04:05Z",
   "organization": {"slug": "acme"},
   "subscription": "sub_…",
-  "actor": {"id": "u_12", "name": "Abraham Kuri", "kind": "user"} | null,   // null when unknown
+  "actor": {"id": "u_12", "name": "Ann Lee", "kind": "user"} | null,   // null when unknown
   "week": "2026-10-12",
   "data": {
     "task": {…},      // the task item, as GET /orgs/:org/tasks/:id returns it; for task.deleted, its last state

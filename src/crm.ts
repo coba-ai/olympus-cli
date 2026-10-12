@@ -42,7 +42,7 @@ const nm = (x: any): string | null => {
   return y == null || y === "" ? null : String(y);
 };
 const tt = (f: string, x: any, now: number): string | null =>
-  f.endsWith("_at") || f === "in_stage_since" ? (x == null ? null : when(x, now)) : SC.includes(f) ? nm(sc(x)) : f === "archived" ? (x === true ? "yes" : null) : nm(x);
+  f.endsWith("_at") || f === "in_stage_since" ? (x == null ? null : Date.parse(x) > now ? new Date(Date.parse(x)).toISOString().slice(0, 16).replace("T", " ") + " UTC" : when(x, now)) : SC.includes(f) ? nm(sc(x)) : f === "archived" ? (x === true ? "yes" : null) : nm(x);
 
 const detail = (kind: Kind, d: any) => [
   ...KIND[kind].fields.map((f) => `${f}: ${cell(f, d[f])}`),
@@ -87,7 +87,7 @@ function lst(c: Ctx, url: string, key: string | null, cols: string[], tty: strin
       if (!rows.length) return empty;
       const p = Number(d.page) || 1, per = Number(d.per) || rows.length, total = Number(d.total), more = p * per < total;
       const foot = Number.isFinite(total) && (more || p > 1) ? `\n\nPage ${p} · showing ${rows.length} of ${total}.${more ? ` Next: --page ${p + 1}` : ""}` : "";
-      return table(tty.map((f) => f.toUpperCase().replace(/_/g, " ")), rows.map((r) => tty.map((f) => tt(f, r?.[f], 0)))) + foot;
+      return table(tty.map((f) => f.toUpperCase().replace(/_/g, " ")), rows.map((r) => tty.map((f) => tt(f, r?.[f], c.now())))) + foot;
     });
   };
 }

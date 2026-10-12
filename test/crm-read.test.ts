@@ -254,3 +254,10 @@ test("AC14 hostile server strings never reach stdout, piped or TTY", async () =>
       noCtl(r.out);
     }
 });
+
+test("TTY: a future task due date prints the date, not 'just now'", async () => {
+  nextOk({ id: "d_1", tasks: [{ id: "ct_1", status: "open", due_at: "2026-10-20T00:00:00Z", assignee: "a@b.c", title: "T" }] });
+  const r = await run1(["deal", "get", "d_1"], true);
+  expect(r.out).toContain("2026-10-20 00:00 UTC");
+  expect(r.out).not.toContain("just now (2026-10-20");
+});

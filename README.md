@@ -95,8 +95,8 @@ CRM (`olympus crm …`): any member can read; writing needs the `operator` role 
 Records are deals, people and companies. `--version V` on an `update` is optional. Sent, the update is
 refused when the record changed since you read it (exit 6, "it changed since you read it"); omitted, the
 last writer wins for the fields you send. `--add-tag` / `--remove-tag` read the record and then write it
-with the version they read, so they are **not atomic**: on exit 6, run the command again. `--tag` or
-`--no-tags` together with other fields is two server writes; if the second fails, the first stays.
+with the version they read, so they are **not atomic**: on exit 6, run the command again.
+Any tag flag together with other fields is two server writes; if the second fails, the first stays.
 `archive` hides a record and is reversible with `--undo`; it needs no `--yes`. `--archived` on a list
 shows only archived records, `--sort` and `--page` are passed to the server (one page at a time), and
 `--owner` and `--stage` take `none`. A CRM that is not set up yet is exit 6; a temporarily unavailable one

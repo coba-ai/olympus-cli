@@ -167,7 +167,7 @@ test("AC17 hostile server strings never reach stdout", async () => {
     for (const [args, body] of [
       [["subscription", "list"], { data: [bad] }], [["subscription", "get", "s"], { data: bad }], [["subscription", "update", "s", "--active"], { data: bad }],
       [["subscription", "create", "--name", "n", "--url", "u", "--event", "ping"], { data: bad, secret: EVIL }], [["subscription", "rotate-secret", "s"], { data: bad, secret: EVIL }],
-      [["subscription", "ping", "s"], { data: { delivered: false, status: EVIL, error: EVIL } }], [["event-types"], { data: [EVIL] }],
+      [["subscription", "ping", "s"], { data: { delivered: false, status: EVIL, error: EVIL } }], [["subscription", "ping", "s"], { data: { delivered: true, status: EVIL } }], [["event-types"], { data: [EVIL] }],
     ] as [string[], unknown][]) {
       fake.state.next = { status: 200, body };
       const r = await sub(args, tty);
@@ -220,4 +220,14 @@ test("AC19 --help lists the subscription usage lines", async () => {
   expect(r.out).toContain("  subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>\n");
   expect(r.out).toContain("  subscription create --name N --url URL --event T... ('*' = all) | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]\n");
   expect(r.out).toContain("  event-types");
+});
+
+test("a null data body does not crash list, get or ping", async () => {
+  for (const tty of [false, true]) {
+    for (const args of [["subscription", "list"], ["subscription", "get", "s"], ["subscription", "ping", "s"], ["event-types"]]) {
+      fake.state.next = { status: 200, body: { data: null } };
+      const r = await sub(args, tty);
+      expect([args.join(" "), r.code, r.err.includes("internal")]).toEqual([args.join(" "), 0, false]);
+    }
+  }
 });

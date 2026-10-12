@@ -31,7 +31,7 @@ function block(s: any, now: number): string {
 // With a secret (create, rotate): piped appends one line; the TTY block warns and points at the docs.
 function shown(c: Ctx, b: any, sentence: string, withSecret: boolean): void {
   const secret = () => (withSecret ? `\nsecret (shown once): ${dash(b.secret)}` : "");
-  print(c.io, c.json, b, () => detail(b.data) + secret(), () => `${sentence}\n\n${block(b.data, c.now())}` +
+  print(c.io, c.json, b, () => detail(b.data ?? {}) + secret(), () => `${sentence}\n\n${block(b.data ?? {}, c.now())}` +
     (withSecret ? `\n\nSigning secret (shown once — store it now; it cannot be read again):\n  ${clean(b.secret)}\n${SIGNING}` : ""));
 }
 
@@ -56,12 +56,12 @@ const rows = (s: any) => [dash(s.id), s.active === true ? "active" : "inactive",
 type Spec = { flags: string[]; n: number; build: (c: Ctx) => Plan };
 const SPECS: Record<string, Spec> = {
   list: { flags: [], n: 2, build: (c) => async (call, org) => {
-    const slug = await org(), b = await call("GET", await base(async () => slug)), l: any[] = b.data;
+    const slug = await org(), b = await call("GET", await base(async () => slug)), l: any[] = Array.isArray(b.data) ? b.data : [];
     print(c.io, c.json, b, () => l.map(rows).join("\n"), () => l.length
       ? table(["ID", "NAME", "ACTIVE", "EVENTS", "LAST DELIVERY", "URL"], l.map((s) => [s.id, s.name, s.active === true ? "yes" : "no", dash(s.events), delivery(s.last_delivery_status, s.last_delivery_at, c.now()), s.url]))
       : `No subscriptions in ${clean(slug)} yet. Create one:\n  olympus subscription create --name N --url URL --event task.completed`);
   } },
-  get: { flags: [], n: 3, build: (c) => async (call, org) => { const b = await call("GET", await base(org, c.pos[2])); print(c.io, c.json, b, () => detail(b.data), () => block(b.data, c.now())); } },
+  get: { flags: [], n: 3, build: (c) => async (call, org) => { const b = await call("GET", await base(org, c.pos[2])); print(c.io, c.json, b, () => detail(b.data ?? {}), () => block(b.data ?? {}, c.now())); } },
   create: { flags: ["name", "url", "event"], n: 2, build: (c) => {
     const b = body(c, true);
     return async (call, org) => { const r = await call("POST", await base(org), b); shown(c, r, `Created subscription ${clean(r.data?.id)}.`, true); };
@@ -85,10 +85,10 @@ const SPECS: Record<string, Spec> = {
   ping: { flags: [], n: 3, build: (c) => async (call, org) => {
     const b = await call("POST", (await base(org, c.pos[2])) + "/ping"), p = b.data ?? {};
     print(c.io, c.json, b, () => [`delivered: ${p.delivered === true}`, `status: ${dash(p.status)}`, `error: ${dash(p.error)}`].join("\n"),
-      () => `Ping to ${clean(c.pos[2])}: ` + (p.delivered === true ? `delivered (${delivery(p.status, null, c.now())})` : `not delivered (${dash(p.error ?? p.status)})`));
+      () => `Ping to ${clean(c.pos[2])}: ` + (p.delivered === true ? `delivered (${clean(delivery(p.status, null, c.now()))})` : `not delivered (${dash(p.error ?? p.status)})`));
   } },
   "event-types": { flags: [], n: 1, build: (c) => async (call, org) => {
-    const b = await call("GET", `/orgs/${seg(await org())}/event_types`), l: unknown[] = b.data;
+    const b = await call("GET", `/orgs/${seg(await org())}/event_types`), l: unknown[] = Array.isArray(b.data) ? b.data : [];
     print(c.io, c.json, b, () => l.map((x) => clean(x)).join("\n"), () => (l.length ? l.map((x) => clean(x)).join("\n") : "No event types."));
   } },
 };
