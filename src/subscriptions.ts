@@ -1,6 +1,6 @@
 import { print, seg, usage, type Io } from "./core";
 import { clean, delivery, keyValue, table, when } from "./format";
-import { dash, GLOBAL, type Plan } from "./tasks";
+import { checkFlags, dash, type Plan } from "./tasks";
 
 type Opts = Record<string, unknown>;
 type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
@@ -99,10 +99,7 @@ export function subscriptionPlan(pos: string[], v: Opts, io: Io, json: boolean, 
   // hasOwn: a plain lookup would find Object.prototype keys (constructor, __proto__, ...); event-types is not a subscription subcommand.
   const spec = Object.hasOwn(SPECS, key) && (pos[0] === "event-types") === (key === "event-types") ? SPECS[key] : undefined;
   if (!spec) throw usage(`unknown subscription command: ${pos.slice(1).join(" ")}`);
-  for (const [k, x] of Object.entries(v)) {
-    if (x === undefined || GLOBAL.includes(k)) continue;
-    if (!spec.flags.includes(k)) throw usage(`unknown option '--${x === false ? "no-" : ""}${k}' for subscription ${key}`);
-  }
+  checkFlags(v, spec.flags, "subscription " + key);
   if (pos.length !== spec.n) throw usage(`expected ${spec.n} argument(s) in: ${pos.join(" ")}`);
   if (spec.n === 3) seg(pos[2]!);
   return spec.build({ pos, v, io, json, now });

@@ -59,3 +59,10 @@ export function delivery(status: number | null | undefined, at: string | null | 
   const label = STATUS_CODES[status]?.toLowerCase();
   return `${status}${label ? " " + label : ""}${at ? ", " + ago(at, now) : ""}`;
 }
+
+// TTY: names in place of ids.
+export const display = (x: unknown): string | null => {
+  const o = x as any;
+  const y = o && typeof o === "object" && !Array.isArray(o) ? o.name ?? o.full_name ?? o.id : Array.isArray(x) ? (x.length ? x.join(",") : null) : x;
+  return y == null || y === "" ? null : String(y);
+};

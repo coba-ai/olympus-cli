@@ -8,7 +8,7 @@ import {
 import { crmPlan } from "./crm";
 import { dayPlan } from "./days";
 import { subscriptionPlan } from "./subscriptions";
-import { GLOBAL, taskPlan } from "./tasks";
+import { checkFlags, taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
 
 const USAGE = `usage: olympus <command> [flags]
@@ -36,6 +36,13 @@ const USAGE = `usage: olympus <command> [flags]
   crm person add NAME [--email E] [--phone P] [--job-title T] [--linkedin-url U] [--company ID | --new-company NAME]
   crm company add NAME [--domain D] [--website U] [--industry T] [--linkedin-url U] [--phone P] [--city C]
   crm person|company update <id> [--name T] [field flags as add] [--notes T] [tag flags] [--version V]   (--add/--remove-tag: read then write, not atomic)
+  crm deal|person|company delete <id> --yes | deletion-preview <id>   (delete prints the preview first on a terminal)
+  crm deal unlink-company <id> | unlink-person <id>   crm task done <task_id> [--undo]
+  crm person|company task add <id> TITLE [--due ISO] [--assign W]
+  crm pipelines [--archived]   crm pipeline get <id> | archive <id> [--undo]
+  crm pipeline add NAME --stage NAME:KIND... [--currency C]...
+  crm pipeline update <id> [--name T] [--stage [ID=]NAME:KIND]... [--remove STAGE_ID:MOVE_TO_ID]... [--restore ID]... [--currency C]... [--version V]
+  crm creates (add, note, task add, pipeline add) take [--idempotency-key K]; the same K on a retry never creates twice
   subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>
   subscription create --name N --url URL --event T... ('*' = all) | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]
   event-types   (event names for --event)
@@ -57,7 +64,9 @@ const OPTIONS = {
   "add-tag": { type: "string", multiple: true }, "remove-tag": { type: "string", multiple: true },
   to: { type: "string" }, shipped: { type: "string" }, reflection: { type: "string" },
   blocker: { type: "string", multiple: true }, learning: { type: "string", multiple: true }, draft: { type: "boolean" },
-  ...Object.fromEntries(("entity pipeline stage status owner q sort page amount currency next company new-company person new-person " +
+  stage: { type: "string", multiple: true }, currency: { type: "string", multiple: true },
+  remove: { type: "string", multiple: true }, restore: { type: "string", multiple: true }, "idempotency-key": { type: "string" },
+  ...Object.fromEntries(("entity pipeline status owner q sort page amount next company new-company person new-person " +
     "person-email lost-reason version new email due phone job-title linkedin-url notes domain website industry city url").split(" ")
     .map((k) => [k, { type: "string" }])),
   event: { type: "string", multiple: true },
@@ -100,11 +109,12 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     }
     const { values: v, positionals: pos } = parsed;
     json = !!v.json;
-    const given = (k: string) => (v as Record<string, unknown>)[k] !== undefined;
+    // stage/currency repeat only for `crm pipeline`; everywhere else the last one wins and stays a string.
+    if (!(pos[0] === "crm" && pos[1] === "pipeline"))
+      for (const k of ["stage", "currency"] as const) if (v[k]) (v as Record<string, unknown>)[k] = v[k]!.at(-1);
     // These commands validate no flags of their own: only global + legacy flags are theirs; the modules check the rest.
     if (["login", "logout", "whoami", "org", "agents", "webhook"].includes(pos[0] ?? "")) {
-      const f = Object.keys(OPTIONS).find((k) => given(k) && !GLOBAL.includes(k) && !LEGACY.includes(k));
-      if (f) throw usage(`unknown option '--${f}'`);
+      checkFlags(v, LEGACY);
     }
     if (v.help) { io.out(USAGE); return 0; }
     if (!pos.length) { io.err(USAGE); return 1; }
