@@ -28,11 +28,14 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 401 | `unauthorized` | missing, malformed or unknown token |
 | 403 | `forbidden` | your role cannot do this |
 | 404 | `not_found` | not found, or an organization you cannot see (also: a token limited to another organization) |
+| 409 | `conflict` | the record changed since you read it; `details.current` may carry the current record |
+| 409 | `crm_not_set_up` | this organization's CRM is not set up yet |
 | 409 | `machine_needs_update` / `route_missing` | the organization's agent machine needs an update, or no longer has this webhook |
 | 422 | `invalid` | `details.fields` is `{field: ["message", …]}` |
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
-| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved |
+| 503 | `crm_unavailable` | the CRM cannot be reached right now; see `Retry-After` (seconds) |
+| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)) |
 | 503 | `machine_uncertain` | an update may have been half-applied on the machine; read the webhook again |
 
 Limit: 60 requests per minute per token.
@@ -66,6 +69,10 @@ POST   /orgs/:org/tasks/:id/breakdown[?week]             {agent?} → {data:{tas
 GET    /orgs/:org/days[?week]                            → {data:{week, days:[{day, closed, closed_at, score, entry}]}}
 GET    /orgs/:org/days/:day                              → {data:{day, closed, closed_at, score, entry|null}}
 PUT    /orgs/:org/days/:day                              {shipped?, blockers?, learnings?, reflection?, close?} → {data:{…as GET…}}
+
+GET    /orgs/:org/crm/…                                  → CRM: pipelines, tags, search, deals, people, companies (see CRM)
+GET    /orgs/:org/subscriptions[/:id]                    → {data:[sub…]} | {data:sub}; also POST, PATCH, DELETE, rotate_secret, ping (see Subscriptions)
+GET    /orgs/:org/event_types                            → {data:["task.created", …]}
 ```
 
 - `token.organization` is `{slug, name}` for a token limited to one organization, otherwise `null`.
@@ -135,7 +142,7 @@ week; `me` is your person id. `tasks` is in board order: the starred (`one_thing
   "id": "t8f3k2a", "text": "Ship the pricing page", "description": "",
   "section": "the_rest",          // "the_rest" | "backlog"; older tasks may read "one_thing"
   "order": 0, "done": false, "done_at": null,       // done_at: ISO 8601 or null
-  "assignee": {"id": "u_12", "name": "Abraham Kuri", "kind": "user"} | null,
+  "assignee": {"id": "u_12", "name": "Ada Lovelace", "kind": "user"} | null,
                                   // an id that no longer exists reads {"id":"u_9","name":null,"kind":null}
   "tags": ["pricing"],
   "today": false,                 // flagged for today
@@ -235,3 +242,243 @@ has `entry:null`, `closed:false`, `closed_at:null`, `score:null`.
 - **Read-only.** `summary`, `score` and `agent_note` are computed by the server; they cannot be set
   through this endpoint. Closing a week is not available through the API.
 - Types are strict; a wrong type is 422 on that field.
+
+## CRM
+
+Everything is under `/orgs/:org/crm`. Reading is open to any member; every write needs `operator`.
+Responses carry `Cache-Control: no-store`. An unknown record id, or an organization you cannot see,
+is the usual 404 `not_found`.
+
+**Shapes grow.** The server may add fields to any object below over time. Clients must ignore fields
+they do not know. Ids are opaque strings: store and send them back unchanged. Amounts are
+whole-number strings (`"1200"`); send a number or a decimal string. Times are ISO 8601.
+
+```
+GET    /orgs/:org/crm/pipelines                              → {data:[pipeline]}
+GET    /orgs/:org/crm/tags[?entity=deal|person|company]      → {data:["…"]}
+GET    /orgs/:org/crm/search?q=…[&entity=deal|person|company] → {data:[{entity, id, label, sub}]}
+
+GET    /orgs/:org/crm/deals[?pipeline&stage&status&q&owner&archived&sort&page] → {data:{deals:[row], total, page, per}}
+GET    /orgs/:org/crm/deals/:id                              → {data:deal}
+POST   /orgs/:org/crm/deals                {name, pipeline?, stage?, amount?, currency?, next_action?, owner?, company?, person?} → 201 {data:deal}
+PATCH  /orgs/:org/crm/deals/:id            {name?, amount?, currency?, next_action?, lost_reason?, tags?, version?} → {data:deal}
+POST   /orgs/:org/crm/deals/:id/move       {stage, from_stage?}                → {data:deal}
+PUT    /orgs/:org/crm/deals/:id/owner      {owner: email|"me"|null, expected?} → {data:deal}
+PUT    /orgs/:org/crm/deals/:id/company    {id} | {name, …}, expected?        → {data:deal}
+PUT    /orgs/:org/crm/deals/:id/person     {id} | {full_name, …}, expected?   → {data:deal}
+POST   /orgs/:org/crm/deals/:id/notes      {body}                             → 201 {data:deal}
+POST   /orgs/:org/crm/deals/:id/tasks      {title, due_at?, assignee?}        → 201 {data:deal}
+PATCH  /orgs/:org/crm/deals/:id/tasks/:task_id {done}                         → {data:deal}
+POST   /orgs/:org/crm/deals/:id/archive    {archived}                         → {data:deal}
+
+GET    /orgs/:org/crm/people[?q&sort&page&archived]          → {data:{people:[row], total, page, per}}
+GET    /orgs/:org/crm/people/:id                             → {data:person}
+POST   /orgs/:org/crm/people               {full_name, email?, phone?, job_title?, linkedin_url?, company?} → 201 {data:person}
+PATCH  /orgs/:org/crm/people/:id           {full_name?, email?, phone?, job_title?, linkedin_url?, notes?, tags?, version?} → {data:person}
+POST   /orgs/:org/crm/people/:id/archive   {archived}                         → {data:person}
+
+GET    /orgs/:org/crm/companies[?q&sort&page&archived]       → {data:{companies:[row], total, page, per}}
+GET    /orgs/:org/crm/companies/:id                          → {data:company}
+POST   /orgs/:org/crm/companies            {name, domain?, website?, industry?, linkedin_url?, phone?, city?} → 201 {data:company}
+PATCH  /orgs/:org/crm/companies/:id        {name?, domain?, website?, industry?, linkedin_url?, phone?, city?, notes?, tags?, version?} → {data:company}
+POST   /orgs/:org/crm/companies/:id/archive {archived}                        → {data:company}
+```
+
+**Lists.** `page` starts at 1; `total`, `page` and `per` describe the page you got. Filters are strict: an
+unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take `status`
+(`open`, `won`, `lost`), `stage` (a stage id, or `none`), `owner` (a member email, `me` or `none`) and
+`archived` (`only` or `include`; archived records are left out by default). `stage` without `pipeline` is 422 (also on create). People and companies take `q`, `sort`,
+`page` and `archived`. `search` needs a non-empty `q` and returns at most 5 results per entity (15 in all).
+
+**Shapes.** A deal in a list is a row; fetching one returns the full deal.
+
+```jsonc
+// deal row
+{ "id": "…", "name": "Acme renewal", "amount": "1200" | null, "currency": "USD" | null,
+  "status": "open" | "won" | "lost" | null,
+  "pipeline": {"id": "…" | null, "name": "…"} | null,
+  "stage": {"id": "…", "name": "…", "kind": "…"} | null, "in_stage_since": "…" | null,
+  "company_name": "…" | null, "person_name": "…" | null, "person_email": "…" | null,
+  "owner_email": "…" | null, "next_action": "…" | null,
+  "tags": ["…"], "archived": false, "updated_at": "…" }
+
+// deal (GET/POST/PATCH and every deal action): the row's fields, except company_name,
+// person_name and person_email, plus
+{ "lost_reason": "…" | null, "created_at": "…", "version": "<opaque>", "pipeline_currencies": ["USD"],
+  "company": {…company} | null, "person": {…person} | null,
+  "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}],      // the deal's pipeline
+  "history": [{"occurred_at": "…", "from_stage": "…", "to_stage": "…", "actor": "…", "note": "…"}],
+  "notes": [{"id": "…", "author": "…", "body": "…", "created_at": "…"}], "notes_count": 0,
+  "tasks": [{"id": "…", "title": "…", "status": "…", "due_at": "…" | null, "assignee": "…" | null}] }
+
+// person
+{ "id": "…", "full_name": "…", "email": "…" | null, "phone": "…" | null, "job_title": "…" | null,
+  "linkedin_url": "…" | null, "notes": "…" | null, "company": {"id": "…", "name": "…"} | null,
+  "tags": ["…"], "archived": false, "version": "<opaque>",   // version: single-record responses only
+  "open_deals": 0 }
+
+// company
+{ "id": "…", "name": "…", "domain": "…" | null, "website": "…" | null, "industry": "…" | null,
+  "linkedin_url": "…" | null, "phone": "…" | null, "city": "…" | null, "notes": "…" | null,
+  "tags": ["…"], "archived": false, "version": "<opaque>", "open_deals": 0 }
+
+// person and company, single-record responses also carry
+"deals": [{"id": "…", "name": "…", "pipeline": {"id": "…", "name": "…"} | null, "stage": {"name": "…", "kind": "…"} | null, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
+// and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
+
+// pipeline (live pipelines and stages only)
+{ "id": "…", "name": "…", "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}], "currencies": ["USD"] }
+
+// search result
+{ "entity": "deal" | "person" | "company", "id": "…", "label": "…", "sub": "…" }
+```
+
+The company and person nested in a deal are the core record: no `deals` or `people` list, but with `version` and `deal_count`.
+List rows are narrower than the detail: company rows omit `website`, `linkedin_url`, `phone`, `notes` and `version`;
+person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have `open_deals`). No nested lists; a few counts
+(`open_deals`, `open_value`, `currencies` on companies). `archived` is also given as `archived_at`.
+
+**Writes.**
+
+- **Strict bodies.** A key that is not in the lists above is 422 with `fields.<key>`: `is not allowed`.
+  This differs from tasks on purpose: a typo must not silently drop data. A `PATCH` with none of the
+  editable keys is 422 `fields.base`. Only the fields you send change.
+- **`version` (optional).** Send the `version` you read. If the record changed since, the answer is 409
+  `conflict`, and `details.current` may carry the current record. Omit it and the server uses the current
+  version: last writer wins for the fields you sent. `move` takes `from_stage` and the owner, company and
+  person routes take `expected` (the value you last saw) the same way: sent, a mismatch is 409 `conflict`;
+  omitted, no check.
+- **`tags`** replaces the whole list: at most 20, each at most 200 characters. There is no add/remove;
+  read, change, write back. Sending `tags` together with other fields is two writes. If the second fails,
+  the first stays.
+- **Create.** `owner` defaults to the caller. `owner` and `assignee` accept a member's email
+  (case-insensitive) or `"me"`; anything else is 422. `company` and `person` on a deal or person are either
+  `{id}` of an existing record or the fields of a new one, not both. `pipeline` and `stage` are ids.
+- **Move.** Moving a deal to the stage it is already in is a no-op 200.
+- **Archive.** `archived: true` archives, `false` restores. Nothing is deleted through the API.
+
+Task `done` is set by task id. Extra CRM errors: 409 `crm_not_set_up` (the organization has no CRM yet), 503 `crm_unavailable` (try again
+after `Retry-After` seconds), 409 `conflict` (above), plus the existing 409 `machine_needs_update` and 503
+`machine_not_ready`. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
+`details.saved` (true: the change may already be saved) and `details.id` (on create). When `saved` is true no
+`Retry-After` is sent and you must not retry blindly: read the record first.
+
+## Subscriptions
+
+Subscriptions send task events to your URL ([Receiving events](#receiving-events)). **Every route here
+needs `operator`, reads included**: a subscriber URL can itself be a secret. A member who is not an operator
+gets 403 `forbidden` on every route here, even for an id that does not exist. For an operator, an unknown
+id is 404.
+
+```
+GET    /orgs/:org/subscriptions                       → {data:[sub]}
+GET    /orgs/:org/subscriptions/:id                   → {data:sub}
+POST   /orgs/:org/subscriptions  {name, url, events}  → 201 {data:sub, secret}
+PATCH  /orgs/:org/subscriptions/:id {name?, url?, events?, active?} → {data:sub}
+DELETE /orgs/:org/subscriptions/:id                   → 204
+POST   /orgs/:org/subscriptions/:id/rotate_secret     → {data:sub, secret}
+POST   /orgs/:org/subscriptions/:id/ping              → {data:{delivered, status, error}}
+GET    /orgs/:org/event_types                         → {data:["task.created", …]}   (any member)
+```
+
+```jsonc
+// sub
+{ "id": "sub_…", "name": "…", "url": "https://…", "events": ["task.completed"], "active": true,
+  "created_by": {"id": "u_12", "name": "…"} | null, "last_delivery_at": "…" | null,
+  "last_delivery_status": 200 | 0 | null,    // 0: no HTTP answer (network error or timeout)
+  "consecutive_failures": 0, "created_at": "…" }
+```
+
+- `events` is a non-empty list of types from `GET /event_types` (the seven `task.*` types), or `["*"]` for
+  all of them. An unknown type is 422 `fields.events`; so is `"ping"`, which is not subscribable. A `url` that is not `https`, or that points at a private address, is 422
+  `fields.url`.
+- At most 10 subscriptions per organization (422 `fields.base`).
+- The `secret` is returned once, on create and on `rotate_secret`, and cannot be read again. Rotating
+  replaces it; do not rely on the old secret still working.
+- `ping` sends one `ping` event synchronously and makes a single attempt. It is delivered whatever `events`
+  says and does not change `consecutive_failures`. The answer is `delivered` (a 2xx came back), the HTTP
+  `status` (`null` on a network failure) and a short `error` string (or `null`): `HTTP <n>`, `timeout`,
+  `could not connect`, `TLS error` or `address not allowed or not found`. The ping event has `week: null`,
+  `actor: null` and `data: {}`. One ping runs at a time, and at most 6 a minute per subscription; beyond
+  that it is 429 `rate_limited` with `Retry-After`.
+- `PATCH` with `active: true` re-enables a subscription and resets `consecutive_failures` to 0.
+
+## Receiving events
+
+When a task on the weekly board changes (from the app, the API or an agent), Olympus sends a signed JSON
+`POST` to the `url` of every active subscription that wants that event.
+
+**Event types.**
+
+| type | fires when |
+|---|---|
+| `task.created` | a task is added (alone: no `task.updated`) |
+| `task.updated` | any change to an existing task: text, description, section, tags, flags, assignee, done, subtasks, delegation |
+| `task.completed` | a task becomes done (also sends `task.updated`) |
+| `task.reopened` | a done task is reopened (also sends `task.updated`) |
+| `task.assigned` | the assignee changes, including to nobody (also sends `task.updated`) |
+| `task.delegated` | `delegated_to` becomes non-null (also sends `task.updated`) |
+| `task.deleted` | a task is deleted (alone: no `task.updated`) |
+| `ping` | not subscribable and not in `GET /event_types`; only sent by the `ping` endpoint |
+
+The specific types are sent in addition to `task.updated`, so subscribe to what you want. Reordering alone
+sends nothing. A change to a subtask is a `task.updated` of the parent task, with `changes.subtasks`. A
+new week being filled in with carried-over tasks sends nothing. One write sends at most one event per
+task and type, after it has been saved.
+
+**Request.**
+
+- `Content-Type: application/json`
+- `User-Agent: Olympus-Webhooks/1`
+- `X-Olympus-Event`: the event type.
+- `X-Request-ID`: the event id (`evt_…`). The same on every retry of that event.
+- `X-Webhook-Timestamp`: unix time in seconds, fresh on every attempt.
+- `X-Webhook-Signature-V2`: hex HMAC-SHA256 of `<timestamp>.<raw body>`, keyed with the subscription's secret.
+
+```jsonc
+{ "id": "evt_…", "type": "task.completed", "created_at": "2026-10-12T15:04:05Z",
+  "organization": {"slug": "acme"},
+  "subscription": "sub_…",
+  "actor": {"id": "u_12", "name": "Ann Lee", "kind": "user"} | null,   // null when unknown (and on ping)
+  "week": "2026-10-12",   // null on ping
+  "data": {
+    "task": {…},      // the task item, as GET /orgs/:org/tasks/:id returns it; for task.deleted, its last state
+    "changes": {"done": {"from": false, "to": true}}   // {field: {from, to}}; omitted on created and deleted
+  } }
+```
+
+`changes` uses the API field names (`text`, `description`, `section`, `done`, `assignee` as a person id or
+`null`, `tags`, `today`, `one_thing`, `delegated_to`). Subtask changes read
+`"subtasks": {"added": [id…], "removed": [id…], "updated": [id…]}`. A `ping` has `data: {}`. The body is
+UTF-8 JSON of at most 256 KB; if it would be larger, `description` fields are truncated to fit.
+
+**Delivery.**
+
+- One request per event and subscription. Timeouts: 5 s to connect, 10 s to read. Redirects are not
+  followed; a 3xx counts as a failure. Any 2xx is success.
+- Network errors, timeouts, 408, 429 and 5xx are retried, up to 6 attempts in all, with a growing delay
+  (roughly n⁴ × 3 s, about 49 minutes across the 6 attempts). Any other 4xx is not retried.
+- Delivery is best-effort at-least-once: duplicates are possible, so dedupe on `X-Request-ID`. An event can
+  be lost if the server stops between saving the task and queueing the event. Order is not guaranteed.
+- After 20 failed events in a row the subscription is switched off (`active: false`). Re-enable it with
+  `PATCH` `active: true`, which resets the counter. A success resets it too.
+- URLs must be `https`. Private, loopback, link-local and cloud-metadata addresses are refused when sending.
+
+**Verify every request** before trusting it: compute the HMAC over `<timestamp>.<raw body>` with your
+secret, compare in constant time, and reject timestamps more than about 300 seconds from your clock. Use
+the raw bytes you received, not re-serialised JSON.
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+// headers: lower-cased names (Node's req.headers); rawBody: the exact bytes received.
+export function verify(secret, headers, rawBody, toleranceSeconds = 300) {
+  const ts = headers["x-webhook-timestamp"];
+  const sig = headers["x-webhook-signature-v2"] ?? "";
+  if (!/^\d+$/.test(ts ?? "")) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > toleranceSeconds) return false;
+  const want = createHmac("sha256", secret).update(`${ts}.`).update(rawBody).digest();
+  const got = Buffer.from(sig, "hex");
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+```

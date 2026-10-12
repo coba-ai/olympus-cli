@@ -137,9 +137,6 @@ const SPECS: Record<string, Spec> = {
   "sub delete": { flags: [...W, "yes"], n: 5, build: subDelete },
 };
 
-// Every task flag except --yes and --agent, which other commands (webhook delete/create) also take; cli.ts rejects these on other commands.
-export const TASK_FLAGS = [...new Set(Object.values(SPECS).flatMap((s) => s.flags))].filter((k) => k !== "yes" && k !== "agent");
-
 // Positionals that become path segments, by spec key.
 const ID_POS: Record<string, number[]> = {
   get: [2], update: [2], done: [2], undone: [2], today: [2], star: [2], delete: [2], delegate: [2], breakdown: [2],

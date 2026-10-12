@@ -5,8 +5,10 @@ import {
   CliError, DEFAULT_HOST, api, defaultOrg, envKey, deleteCreds, deviceLogin, fail, loginWithToken, print, readCreds,
   resolveHost, resolveOrg, resolveToken, seg, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
 } from "./core";
-import { DAY_FLAGS, dayPlan } from "./days";
-import { TASK_FLAGS, taskPlan } from "./tasks";
+import { crmPlan } from "./crm";
+import { dayPlan } from "./days";
+import { subscriptionPlan } from "./subscriptions";
+import { GLOBAL, taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
 
 const USAGE = `usage: olympus <command> [flags]
@@ -23,9 +25,23 @@ const USAGE = `usage: olympus <command> [flags]
   task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT]   (both accept --week D)
   day [DATE] | day show [DATE] | day list [--week D]   (DATE: YYYY-MM-DD, default today)
   day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]
+  crm pipelines | crm tags [--entity E] | crm search QUERY [--entity E]
+  crm deals [--pipeline ID] [--stage ID|none] [--status S] [--owner EMAIL|me|none] [--q T] [--archived] [--sort S] [--page N]
+  crm deal get <id> | add NAME | update <id> | move <id> STAGE_ID | owner <id> EMAIL|me|--none | archive <id> [--undo]
+  crm deal add NAME [--pipeline ID] [--stage ID] [--amount N] [--currency C] [--next T] [--owner W] [--company ID | --new-company NAME] [--person ID | --new-person NAME [--person-email E]]
+  crm deal update <id> [--name T] [--amount N] [--currency C] [--next T] [--lost-reason T] [--tag T]... | [--no-tags] | [--add-tag T]... [--remove-tag T]... [--version V]
+  crm deal company <id> COMPANY_ID | --new NAME   crm deal person <id> PERSON_ID | --new NAME [--email E]
+  crm deal note <id> TEXT|-   crm deal task add <id> TITLE [--due ISO] [--assign W]   crm deal task done <id> <task_id> [--undo]
+  crm people | companies [--q T] [--archived] [--sort S] [--page N]   crm person|company get <id> | archive <id> [--undo]
+  crm person add NAME [--email E] [--phone P] [--job-title T] [--linkedin-url U] [--company ID | --new-company NAME]
+  crm company add NAME [--domain D] [--website U] [--industry T] [--linkedin-url U] [--phone P] [--city C]
+  crm person|company update <id> [--name T] [field flags as add] [--notes T] [tag flags] [--version V]   (--add/--remove-tag: read then write, not atomic)
+  subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>
+  subscription create --name N --url URL --event T... ('*' = all) | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]
+  event-types   (event names for --event)
 global flags: --json --host URL --org SLUG -h
 env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG
-exit: 0 ok, 1 usage, 2 auth, 3 not found, 4 forbidden, 5 server/network, 6 invalid, 130 cancelled
+exit: 0 ok, 1 usage, 2 auth, 3 not found, 4 forbidden, 5 server/network, 6 invalid or conflict, 130 cancelled
 `;
 
 const OPTIONS = {
@@ -41,7 +57,13 @@ const OPTIONS = {
   "add-tag": { type: "string", multiple: true }, "remove-tag": { type: "string", multiple: true },
   to: { type: "string" }, shipped: { type: "string" }, reflection: { type: "string" },
   blocker: { type: "string", multiple: true }, learning: { type: "string", multiple: true }, draft: { type: "boolean" },
+  ...Object.fromEntries(("entity pipeline stage status owner q sort page amount currency next company new-company person new-person " +
+    "person-email lost-reason version new email due phone job-title linkedin-url notes domain website industry city url").split(" ")
+    .map((k) => [k, { type: "string" }])),
+  event: { type: "string", multiple: true },
+  archived: { type: "boolean" }, none: { type: "boolean" }, active: { type: "boolean" }, inactive: { type: "boolean" },
 } as const;
+const LEGACY = ["yes", "name", "agent", "instructions", "instructions-file", "full-tools", "with-token", "browser"];
 const SOURCE: Record<OrgSource, string> = {
   flag: "--org", env: "OLYMPUS_ORG", pin: "token pin", stored: "saved by olympus org use", only: "only membership",
 };
@@ -79,14 +101,16 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     const { values: v, positionals: pos } = parsed;
     json = !!v.json;
     const given = (k: string) => (v as Record<string, unknown>)[k] !== undefined;
-    if (!["people", "tasks", "task", "tags", "day"].includes(parsed.positionals[0] ?? "")) {
-      const f = [...TASK_FLAGS, ...DAY_FLAGS].find(given);
+    // These commands validate no flags of their own: only global + legacy flags are theirs; the modules check the rest.
+    if (["login", "logout", "whoami", "org", "agents", "webhook"].includes(pos[0] ?? "")) {
+      const f = Object.keys(OPTIONS).find((k) => given(k) && !GLOBAL.includes(k) && !LEGACY.includes(k));
       if (f) throw usage(`unknown option '--${f}'`);
     }
     if (v.help) { io.out(USAGE); return 0; }
     if (!pos.length) { io.err(USAGE); return 1; }
     const [cmd, sub, arg] = pos;
-    byId = (cmd === "webhook" && arg !== undefined) || (cmd === "task" && pos.length >= 3 && sub !== "list" && sub !== "add");
+    byId = (cmd === "webhook" && arg !== undefined) || (cmd === "task" && pos.length >= 3 && sub !== "list" && sub !== "add") ||
+      (cmd === "crm" && pos.length >= 4 && pos[2] !== "add") || (cmd === "subscription" && pos.length >= 3 && sub !== "create");
     const want = (n: number) => { if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`); };
     const now = () => (io.now ?? Date.now)();
     const warnEnv = () => { if (envKey(io)) io.err("warning: OLYMPUS_API_KEY is set and overrides stored credentials\n"); };
@@ -259,6 +283,10 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       plan = taskPlan(pos, v, io, json, now);
     } else if (cmd === "day") {
       plan = dayPlan(pos, v, io, json, now);
+    } else if (cmd === "crm") {
+      plan = crmPlan(pos, v, io, json, now);
+    } else if (cmd === "subscription" || cmd === "event-types") {
+      plan = subscriptionPlan(pos, v, io, json, now);
     } else throw usage(`unknown command: ${pos.join(" ")}`);
 
     // An env key makes a malformed file irrelevant, except to `org use`, which would overwrite what it cannot read.

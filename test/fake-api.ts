@@ -24,6 +24,10 @@ export type FakeState = {
   now?: () => number;
   // awaited after the request is logged, before `next` and routing (lets a test change the world mid-request)
   onRequest?: (r: { method: string; path: string }) => void | Promise<void>;
+  // org -> stored CRM records; tests reset it with seedCrm()
+  crm: Record<string, CrmStore>;
+  // org -> subscriptions; tests reset it with seedSubscriptions()
+  subscriptions: Record<string, Item[]>;
   // each poll shifts one script entry: "ok" -> token, "echo" -> 400 echoing device_code, empty -> pending, else 400 <code>
   device?: { script: string[]; interval?: number; expires_in?: number; omitComplete?: boolean; codeBody?: unknown };
 };
@@ -100,9 +104,316 @@ export function seedTasks(today: string): TaskStore {
   };
 }
 
+// ---- CRM + event subscriptions. Lean: list filters other than archived are only echoed in the request log; no unknown-key or fields.base 422.
+export type CrmStore = { pipelines: Item[]; deals: Item[]; people: Item[]; companies: Item[] };
+type Res = [number, unknown?];
+const TS = "2026-10-01T09:00:00Z";
+const ver = () => randomBytes(16).toString("hex");
+const E = (s: number, code: string, message: string, details?: unknown): Res => [s, { error: { code, message, ...(details ? { details } : {}) } }];
+const inv = (fields: Record<string, string[]>): Res => E(422, "invalid", "Validation failed.", { fields });
+const FORBIDDEN = E(403, "forbidden", "You are not allowed to do that.");
+const NF = E(404, "not_found", NOT_FOUND);
+const pick = (b: Item, keys: string[]) => Object.fromEntries(keys.filter((k) => k in b).map((k) => [k, b[k]]));
+const blank = (v: unknown) => typeof v !== "string" || !v.trim();
+const CO_KEYS = ["name", "domain", "website", "industry", "linkedin_url", "phone", "city", "notes", "tags"];
+const PE_KEYS = ["full_name", "email", "phone", "job_title", "linkedin_url", "notes", "tags"];
+const DEAL_KEYS = ["name", "amount", "currency", "next_action", "lost_reason", "tags"];
+const nul = (keys: string[]) => Object.fromEntries(keys.map((k) => [k, null]));
+
+export function seedCrm(): Record<string, CrmStore> {
+  const deal = (o: Item): Item => ({
+    amount: null, currency: null, in_stage_since: TS, owner_email: null, next_action: null, tags: [], archived_at: null, updated_at: TS,
+    created_at: TS, lost_reason: null, version: ver(), company_id: null, person_id: null, history: [], notes: [], tasks: [], ...o,
+  });
+  return {
+    acme: {
+      pipelines: [{
+        id: "p_sales", name: "Sales", currencies: ["USD"],
+        stages: [["st_lead", "Lead", "open"], ["st_won", "Won", "won"], ["st_lost", "Lost", "lost"]].map(([id, name, kind], position) => ({ id, name, kind, position })),
+      }],
+      companies: [{ ...nul(CO_KEYS), id: "c_initech", name: "Initech", domain: "initech.test", tags: [], archived_at: null, version: ver() }],
+      people: [{ ...nul(PE_KEYS), id: "pe_dana", full_name: "Dana Lee", email: "dana@initech.test", company_id: "c_initech", tags: [], archived_at: null, version: ver() }],
+      deals: [
+        deal({
+          id: "d_renewal", name: "Initech renewal", amount: "1200", currency: "USD", stage_id: "st_lead", owner_email: "owner@acme.test",
+          tags: ["renewal"], company_id: "c_initech", person_id: "pe_dana",
+          notes: [{ id: "n_1", author: "owner@acme.test", body: "Kickoff call booked", created_at: TS }],
+          tasks: [{ id: "ct_1", title: "Send quote", status: "open", due_at: null, assignee: "owner@acme.test" }],
+        }),
+        deal({ id: "d_old", name: "Old deal", stage_id: "st_lost", archived_at: TS }),
+      ],
+    },
+    beta: { pipelines: [], deals: [], people: [], companies: [] },
+  };
+}
+
+function crmApi(S: CrmStore, method: string, path: string[], q: URLSearchParams, body: unknown, write: boolean, me: string): Res {
+  const b: Item = typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Item) : {};
+  const now = () => new Date().toISOString();
+  const arch = (x: Item) => ({ archived: !!x.archived_at, archived_at: x.archived_at });
+  const stOf = (id: string) => {
+    for (const p of S.pipelines) { const s = p.stages.find((x: Item) => x.id === id); if (s) return { p, s }; }
+  };
+  const co = (id: string | null) => S.companies.find((x) => x.id === id);
+  const pe = (id: string | null) => S.people.find((x) => x.id === id);
+  const who = (v: unknown) => (v === "me" ? me : v ?? null);
+  const open = (d: Item) => !d.archived_at && stOf(d.stage_id)?.s.kind === "open";
+  const dref = (d: Item) => {
+    const l = stOf(d.stage_id);
+    return { id: d.id, name: d.name, pipeline: l ? { id: l.p.id, name: l.p.name } : null, stage: l ? { name: l.s.name, kind: l.s.kind } : null, status: l?.s.kind ?? null, amount: d.amount, currency: d.currency };
+  };
+  const base = (d: Item) => {
+    const l = stOf(d.stage_id);
+    return {
+      id: d.id, name: d.name, amount: d.amount, currency: d.currency, status: l?.s.kind ?? null,
+      pipeline: l ? { id: l.p.id, name: l.p.name } : null, stage: l ? { id: l.s.id, name: l.s.name, kind: l.s.kind } : null,
+      in_stage_since: d.in_stage_since, owner_email: d.owner_email, next_action: d.next_action, tags: d.tags, ...arch(d), updated_at: d.updated_at,
+    };
+  };
+  // core = the shape nested in a deal; detail adds the related arrays; the list row is narrower than either.
+  const cOut = (c: Item, mode: "core" | "detail" | "row") => {
+    const { version, website, linkedin_url, phone, notes, ...slim } = c;
+    const ds = S.deals.filter((d) => d.company_id === c.id);
+    const ps = S.people.filter((p) => p.company_id === c.id);
+    if (mode === "row") return { ...slim, ...arch(c), people: ps.length, open_deals: ds.filter(open).length, open_value: String(ds.filter(open).reduce((a, d) => a + Number(d.amount ?? 0), 0)), currencies: [...new Set(ds.map((d) => d.currency).filter(Boolean))] };
+    const full = { ...slim, website, linkedin_url, phone, notes, ...arch(c), version, deal_count: ds.length };
+    return mode === "core" ? full : { ...full, deals: ds.map(dref), people: ps.map((p) => ({ id: p.id, full_name: p.full_name, email: p.email, job_title: p.job_title })) };
+  };
+  const pOut = (p: Item, mode: "core" | "detail" | "row") => {
+    const { version, company_id, linkedin_url, notes, ...slim } = p;
+    const c = co(company_id);
+    const ds = S.deals.filter((d) => d.person_id === p.id);
+    const head = { ...slim, ...arch(p), company: c ? { id: c.id, name: c.name } : null };
+    if (mode === "row") return { ...head, open_deals: ds.filter(open).length };
+    const full = { ...head, linkedin_url, notes, version, deal_count: ds.length };
+    return mode === "core" ? full : { ...full, deals: ds.map(dref) };
+  };
+  // null_pipeline_id (test-injected) makes the list row's pipeline id null, as the server may send.
+  const dRow = (d: Item) => ({ ...base(d), ...(d.null_pipeline_id && base(d).pipeline ? { pipeline: { id: null, name: base(d).pipeline!.name } } : {}), company_name: co(d.company_id)?.name ?? null, person_name: pe(d.person_id)?.full_name ?? null, person_email: pe(d.person_id)?.email ?? null });
+  const dOut = (d: Item) => {
+    const l = stOf(d.stage_id);
+    const c = co(d.company_id), p = pe(d.person_id);
+    return {
+      ...base(d), lost_reason: d.lost_reason, created_at: d.created_at, version: d.version, pipeline_currencies: l?.p.currencies ?? [],
+      company: c ? cOut(c, "core") : null, person: p ? pOut(p, "core") : null, stages: l?.p.stages ?? [], history: d.history,
+      notes: d.notes, notes_count: d.notes.length, tasks: d.tasks,
+    };
+  };
+  const touch = (x: Item) => { x.version = ver(); if ("updated_at" in x) x.updated_at = now(); };
+  const ok = (d: Item, status = 200): Res => { touch(d); return [status, { data: dOut(d) }]; };
+  const stale = (x: Item, v: unknown, out: (x: Item) => unknown): Res | null =>
+    v !== undefined && v !== x.version ? E(409, "conflict", "The record changed.", { current: out(x) }) : null;
+  const patch = (x: Item, keys: string[]) => {
+    const set = pick(b, keys);
+    if ("amount" in set && set.amount != null) set.amount = String(set.amount);
+    Object.assign(x, set);
+  };
+  // {id} links an existing record; {name|full_name,…} creates one. Returns the id or a 422.
+  const link = (kind: "company" | "person", v: unknown): string | Res => {
+    const o: Item = typeof v === "object" && v !== null ? (v as Item) : {};
+    const list = kind === "company" ? S.companies : S.people;
+    if ("id" in o) return list.some((x) => x.id === o.id) ? o.id : inv({ [kind]: ["not found"] });
+    const nk = kind === "company" ? "name" : "full_name";
+    if (blank(o[nk])) return inv({ [kind]: [`${nk} can't be blank`] });
+    return mk(kind, o).id;
+  };
+  const mk = (kind: "company" | "person", o: Item) => {
+    const keys = kind === "company" ? CO_KEYS : PE_KEYS;
+    const x: Item = { ...nul(keys), id: `${kind === "company" ? "c_" : "pe_"}${rid("", 6)}`, tags: [], archived_at: null, version: ver(), ...pick(o, keys) };
+    if (kind === "person") x.company_id = null;
+    (kind === "company" ? S.companies : S.people).push(x);
+    return x;
+  };
+  const page = (items: Item[], key: string, out: (x: Item) => unknown): Res => {
+    const a = q.get("archived");
+    const rows = items.filter((x) => (a === "only" ? x.archived_at : a === "include" || !x.archived_at));
+    const p = Math.max(1, Number(q.get("page")) || 1);
+    return [200, { data: { [key]: rows.slice((p - 1) * 50, p * 50).map(out), total: rows.length, page: p, per: 50 } }];
+  };
+
+  const [c, id, act, tid] = path;
+  const M = method;
+  if (M !== "GET" && !write) return FORBIDDEN;
+  if (c === "pipelines" && M === "GET") return [200, { data: S.pipelines.map((p) => ({ id: p.id, name: p.name, stages: p.stages, currencies: p.currencies })) }];
+  if (c === "tags" && M === "GET") {
+    const e = q.get("entity");
+    const all = [...(e && e !== "deal" ? [] : S.deals), ...(e && e !== "person" ? [] : S.people), ...(e && e !== "company" ? [] : S.companies)];
+    return [200, { data: [...new Set(all.flatMap((x) => x.tags))] }];
+  }
+  if (c === "search" && M === "GET") {
+    const t = (q.get("q") ?? "").toLowerCase(), e = q.get("entity");
+    if (!t) return inv({ q: ["can't be blank"] });
+    const hits = [
+      ...S.deals.map((x) => ({ entity: "deal", id: x.id, label: x.name, sub: dRow(x).company_name })),
+      ...S.people.map((x) => ({ entity: "person", id: x.id, label: x.full_name, sub: x.email })),
+      ...S.companies.map((x) => ({ entity: "company", id: x.id, label: x.name, sub: x.domain })),
+    ];
+    const per: Record<string, number> = {};
+    return [200, { data: hits.filter((h) => (!e || h.entity === e) && h.label.toLowerCase().includes(t) && (per[h.entity] = (per[h.entity] ?? 0) + 1) <= 5) }];
+  }
+  if (c === "people" || c === "companies") {
+    const company = c === "companies", list = company ? S.companies : S.people, nk = company ? "name" : "full_name";
+    const out = (x: Item, mode: "detail" | "row" = "detail") => (company ? cOut(x, mode) : pOut(x, mode));
+    if (!id) {
+      if (M === "GET") return page(list, c, (x) => out(x, "row"));
+      if (M !== "POST") return NF;
+      if (blank(b[nk])) return inv({ [nk]: ["can't be blank"] });
+      let cid: string | Res | null = null;
+      if (!company && b.company) { cid = link("company", b.company); if (typeof cid !== "string") return cid; }
+      const x = mk(company ? "company" : "person", b);
+      if (!company) x.company_id = cid;
+      return [201, { data: out(x) }];
+    }
+    const x = list.find((r) => r.id === id);
+    if (!x) return NF;
+    if (!act && M === "GET") return [200, { data: out(x) }];
+    if (!act && M === "PATCH") {
+      const s = stale(x, b.version, out);
+      if (s) return s;
+      patch(x, company ? CO_KEYS : PE_KEYS);
+      touch(x);
+      return [200, { data: out(x) }];
+    }
+    if (act === "archive" && M === "POST") { x.archived_at = b.archived === false ? null : now(); touch(x); return [200, { data: out(x) }]; }
+    return NF;
+  }
+  if (c !== "deals") return NF;
+  if (!id) {
+    if (M === "GET") return q.get("stage") && !q.get("pipeline") ? inv({ stage: ["needs pipeline"] }) : page(S.deals, "deals", dRow);
+    if (M !== "POST") return NF;
+    if (blank(b.name)) return inv({ name: ["can't be blank"] });
+    if (b.stage && !b.pipeline) return inv({ stage: ["needs pipeline"] });
+    const p = S.pipelines.find((x) => x.id === (b.pipeline ?? S.pipelines[0]?.id));
+    if (!p) return inv({ pipeline: ["not found"] });
+    const st = p.stages.find((x: Item) => x.id === (b.stage ?? p.stages[0].id));
+    if (!st) return inv({ stage: ["not found"] });
+    const ids: Item = {};
+    for (const k of ["company", "person"] as const) {
+      if (!b[k]) continue;
+      const r = link(k, b[k]);
+      if (typeof r !== "string") return r;
+      ids[`${k}_id`] = r;
+    }
+    const d: Item = {
+      id: `d_${rid("", 6)}`, ...nul(["amount", "currency", "next_action", "lost_reason", "company_id", "person_id"]), currency: p.currencies[0] ?? null,
+      stage_id: st.id, in_stage_since: now(), owner_email: who(b.owner ?? "me"), tags: [], archived_at: null, updated_at: now(), created_at: now(),
+      history: [], notes: [], tasks: [], ...ids, ...pick(b, ["name", "amount", "currency", "next_action"]),
+    };
+    if (d.amount != null) d.amount = String(d.amount);
+    S.deals.push(d);
+    return ok(d, 201);
+  }
+  const d = S.deals.find((r) => r.id === id);
+  if (!d) return NF;
+  if (!act) {
+    if (M === "GET") return [200, { data: dOut(d) }];
+    if (M !== "PATCH") return NF;
+    const s = stale(d, b.version, dOut);
+    if (s) return s;
+    patch(d, DEAL_KEYS);
+    return ok(d);
+  }
+  if (act === "move" && M === "POST") {
+    const l = stOf(d.stage_id);
+    const to = l?.p.stages.find((x: Item) => x.id === b.stage);
+    if (!to) return inv({ stage: ["not found"] });
+    if (b.from_stage !== undefined && b.from_stage !== d.stage_id) return E(409, "conflict", "The deal moved.", { current: dOut(d) });
+    if (to.id === d.stage_id) return [200, { data: dOut(d) }];
+    d.history.push({ occurred_at: now(), from_stage: l!.s.name, to_stage: to.name, actor: me, note: null });
+    d.stage_id = to.id;
+    d.in_stage_since = now();
+    return ok(d);
+  }
+  if (act === "owner" && M === "PUT") {
+    if (b.expected !== undefined && b.expected !== d.owner_email) return E(409, "conflict", "The owner changed.", { current: dOut(d) });
+    d.owner_email = who(b.owner);
+    return ok(d);
+  }
+  if ((act === "company" || act === "person") && M === "PUT") {
+    const key = `${act}_id`;
+    if (b.expected !== undefined && b.expected !== d[key]) return E(409, "conflict", `The ${act} changed.`, { current: dOut(d) });
+    const r = link(act, b);
+    if (typeof r !== "string") return r;
+    d[key] = r;
+    return ok(d);
+  }
+  if (act === "notes" && M === "POST") {
+    if (blank(b.body)) return inv({ body: ["can't be blank"] });
+    d.notes.push({ id: `n_${rid("", 6)}`, author: me, body: b.body, created_at: now() });
+    return ok(d, 201);
+  }
+  if (act === "tasks" && M === "POST") {
+    if (blank(b.title)) return inv({ title: ["can't be blank"] });
+    d.tasks.push({ id: `ct_${rid("", 6)}`, title: b.title, status: "open", due_at: b.due_at ?? null, assignee: who(b.assignee) });
+    return ok(d, 201);
+  }
+  if (act === "tasks" && M === "PATCH") {
+    const t = d.tasks.find((x: Item) => x.id === tid);
+    if (!t) return NF;
+    t.status = b.done === false ? "open" : "done";
+    return ok(d);
+  }
+  if (act === "archive" && M === "POST") { d.archived_at = b.archived === false ? null : now(); return ok(d); }
+  return NF;
+}
+
+const EVENT_TYPES = ["task.created", "task.updated", "task.completed", "task.reopened", "task.assigned", "task.deleted", "task.delegated"];
+
+export function seedSubscriptions(): Record<string, Item[]> {
+  return {
+    acme: [{
+      id: "sub_000000000001", name: "seed", url: "https://example.test/hook", events: ["task.completed"], active: true,
+      created_by: { id: "u_1", name: "Abe Owner" }, last_delivery_at: null, last_delivery_status: null, consecutive_failures: 0, created_at: TS,
+    }],
+    beta: [],
+  };
+}
+
+// path = segments after /subscriptions. Operator only, reads included.
+function subsApi(L: Item[], method: string, path: string[], body: unknown, operator: boolean): Res {
+  if (!operator) return FORBIDDEN; // before the id is looked up: a teammate never learns whether an id exists
+  const b: Item = typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Item) : {};
+  const [id, act] = path;
+  const secret = () => randomBytes(32).toString("hex");
+  const check = (create: boolean) => {
+    const f: Record<string, string[]> = {};
+    for (const k of ["name", "url"]) if ((create || k in b) && blank(b[k])) f[k] = ["can't be blank"];
+    const e = b.events;
+    if ((create || "events" in b) && !(Array.isArray(e) && e.length > 0 && ((e.length === 1 && e[0] === "*") || e.every((x) => EVENT_TYPES.includes(x))))) f.events = ["must be a non-empty list of known event types or *"];
+    if ("active" in b && typeof b.active !== "boolean") f.active = ["must be true or false"];
+    return f;
+  };
+  if (!id) {
+    if (method === "GET") return [200, { data: L }];
+    if (method !== "POST") return NF;
+    const f = check(true);
+    if (Object.keys(f).length) return inv(f);
+    const s: Item = {
+      id: `sub_${rid("", 12)}`, name: b.name.trim(), url: b.url, events: b.events, active: true, created_by: { id: "u_1", name: PERSON_NAMES[TOKENS.owner] },
+      last_delivery_at: null, last_delivery_status: null, consecutive_failures: 0, created_at: new Date().toISOString(),
+    };
+    L.push(s);
+    return [201, { data: s, secret: secret() }];
+  }
+  const s = L.find((x) => x.id === id);
+  if (!s) return NF;
+  if (!act && method === "GET") return [200, { data: s }];
+  if (!act && method === "DELETE") { L.splice(L.indexOf(s), 1); return [204]; }
+  if (!act && method === "PATCH") {
+    const f = check(false);
+    if (Object.keys(f).length) return inv(f);
+    Object.assign(s, pick(b, ["name", "url", "events", "active"]));
+    if (b.active === true) s.consecutive_failures = 0;
+    return [200, { data: s }];
+  }
+  if (act === "rotate_secret" && method === "POST") return [200, { data: s, secret: secret() }];
+  if (act === "ping" && method === "POST") return [200, { data: { delivered: true, status: 200, error: null } }];
+  return NF;
+}
+
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, today: new Date().toISOString().slice(0, 10) };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10) };
   state.tasks = seedTasks(state.today);
   const server = Bun.serve({
     port: 0,
@@ -168,7 +479,9 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         seg[0] === "api" && seg[1] === "v1" &&
         ((r === "me" && seg.length === 3) ||
           (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
-            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)))));
+            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)) ||
+            (sub === "crm" && seg.length >= 6 && seg.length <= 9 && ["pipelines", "tags", "search", "deals", "people", "companies"].includes(seg[5]!)) ||
+            (sub === "subscriptions" && seg.length >= 5 && seg.length <= 7) || (sub === "event_types" && seg.length === 5))));
       if (!known) return notFound();
 
       const who = WHO[(req.headers.get("authorization") ?? "").replace(/^Bearer /, "")];
@@ -192,6 +505,10 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       if (!who.roles[org!] || (who.pin && who.pin !== org)) return notFound();
       const operator = who.roles[org!] === "operator";
       const forbidden = () => err(403, "forbidden", "You are not allowed to do that.");
+      const reply = ([st, o]: Res) => send(st, o);
+      if (sub === "crm") return reply(crmApi((state.crm[org!] ??= { pipelines: [], deals: [], people: [], companies: [] }), req.method, seg.slice(5), u.searchParams, body, operator, who.email));
+      if (sub === "subscriptions") return reply(subsApi((state.subscriptions[org!] ??= []), req.method, seg.slice(5), body, operator));
+      if (sub === "event_types") return req.method === "GET" ? send(200, { data: EVENT_TYPES }) : notFound();
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();
       if (sub === "people" || sub === "tasks" || sub === "tags" || sub === "days") return tasksRoute();
       const list = state.webhooks[org!] ?? (state.webhooks[org!] = []);
