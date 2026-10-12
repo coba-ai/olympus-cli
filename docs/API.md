@@ -35,7 +35,7 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
 | 503 | `crm_unavailable` | the CRM cannot be reached right now; see `Retry-After` (seconds) |
-| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)) |
+| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)); with an `Idempotency-Key` the message says to retry with the same key (see [Idempotent creates](#idempotent-creates)) |
 | 503 | `machine_uncertain` | an update may have been half-applied on the machine; read the webhook again |
 
 Limit: 60 requests per minute per token.
@@ -254,7 +254,11 @@ they do not know. Ids are opaque strings: store and send them back unchanged. Am
 whole-number strings (`"1200"`); send a number or a decimal string. Times are ISO 8601.
 
 ```
-GET    /orgs/:org/crm/pipelines                              → {data:[pipeline]}
+GET    /orgs/:org/crm/pipelines[?archived=include]           → {data:[pipeline]}
+GET    /orgs/:org/crm/pipelines/:id                          → {data:pipeline-detail}
+POST   /orgs/:org/crm/pipelines            {name, stages:[{name, kind}], currencies?} → 201 {data:pipeline-detail}
+PATCH  /orgs/:org/crm/pipelines/:id        {name?, stages?:[{id?, name, kind}], removals?:[{stage, move_to}], restores?:[id], currencies?, version?} → {data:pipeline-detail}
+POST   /orgs/:org/crm/pipelines/:id/archive {archived}                → {data:pipeline-detail}
 GET    /orgs/:org/crm/tags[?entity=deal|person|company]      → {data:["…"]}
 GET    /orgs/:org/crm/search?q=…[&entity=deal|person|company] → {data:[{entity, id, label, sub}]}
 
@@ -270,18 +274,30 @@ POST   /orgs/:org/crm/deals/:id/notes      {body}                             �
 POST   /orgs/:org/crm/deals/:id/tasks      {title, due_at?, assignee?}        → 201 {data:deal}
 PATCH  /orgs/:org/crm/deals/:id/tasks/:task_id {done}                         → {data:deal}
 POST   /orgs/:org/crm/deals/:id/archive    {archived}                         → {data:deal}
+DELETE /orgs/:org/crm/deals/:id/company[?expected=ID]                 → {data:deal}
+DELETE /orgs/:org/crm/deals/:id/person[?expected=ID]                  → {data:deal}
+GET    /orgs/:org/crm/deals/:id/deletion_preview             → {data:{entity, id, name, impact}}
+DELETE /orgs/:org/crm/deals/:id                              → 204
 
 GET    /orgs/:org/crm/people[?q&sort&page&archived]          → {data:{people:[row], total, page, per}}
 GET    /orgs/:org/crm/people/:id                             → {data:person}
 POST   /orgs/:org/crm/people               {full_name, email?, phone?, job_title?, linkedin_url?, company?} → 201 {data:person}
 PATCH  /orgs/:org/crm/people/:id           {full_name?, email?, phone?, job_title?, linkedin_url?, notes?, tags?, version?} → {data:person}
 POST   /orgs/:org/crm/people/:id/archive   {archived}                         → {data:person}
+POST   /orgs/:org/crm/people/:id/tasks     {title, due_at?, assignee?}        → 201 {data:person}
+GET    /orgs/:org/crm/people/:id/deletion_preview            → {data:{entity, id, name, impact}}
+DELETE /orgs/:org/crm/people/:id                             → 204
 
 GET    /orgs/:org/crm/companies[?q&sort&page&archived]       → {data:{companies:[row], total, page, per}}
 GET    /orgs/:org/crm/companies/:id                          → {data:company}
 POST   /orgs/:org/crm/companies            {name, domain?, website?, industry?, linkedin_url?, phone?, city?} → 201 {data:company}
 PATCH  /orgs/:org/crm/companies/:id        {name?, domain?, website?, industry?, linkedin_url?, phone?, city?, notes?, tags?, version?} → {data:company}
 POST   /orgs/:org/crm/companies/:id/archive {archived}                        → {data:company}
+POST   /orgs/:org/crm/companies/:id/tasks  {title, due_at?, assignee?}        → 201 {data:company}
+GET    /orgs/:org/crm/companies/:id/deletion_preview         → {data:{entity, id, name, impact}}
+DELETE /orgs/:org/crm/companies/:id                          → 204
+
+PATCH  /orgs/:org/crm/tasks/:task_id       {done}                             → {data:{id, title, status, due_at, assignee}}
 ```
 
 **Lists.** `page` starts at 1; `total`, `page` and `per` describe the page you got. Filters are strict: an
@@ -309,7 +325,9 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
   "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}],      // the deal's pipeline
   "history": [{"occurred_at": "…", "from_stage": "…", "to_stage": "…", "actor": "…", "note": "…"}],
   "notes": [{"id": "…", "author": "…", "body": "…", "created_at": "…"}], "notes_count": 0,
-  "tasks": [{"id": "…", "title": "…", "status": "…", "due_at": "…" | null, "assignee": "…" | null}] }
+  "tasks": [{"id": "…", "title": "…", "status": "…", "due_at": "…" | null, "assignee": "…" | null}],
+  "interactions": [{"kind": "…", "direction": "…" | null, "occurred_at": "…", "summary": "…" | null}],
+  "legacy_notes": "…" | null }   // legacy_notes: free text from before notes were separate records
 
 // person
 { "id": "…", "full_name": "…", "email": "…" | null, "phone": "…" | null, "job_title": "…" | null,
@@ -323,11 +341,19 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
   "tags": ["…"], "archived": false, "version": "<opaque>", "open_deals": 0 }
 
 // person and company, single-record responses also carry
+"interactions": [{"kind": "…", "direction": "…" | null, "occurred_at": "…", "summary": "…" | null}],
+"tasks": [{"id": "…", "title": "…", "status": "…", "due_at": "…" | null, "assignee": "…" | null}],
 "deals": [{"id": "…", "name": "…", "pipeline": {"id": "…", "name": "…"} | null, "stage": {"name": "…", "kind": "…"} | null, "status": "…", "amount": "…", "currency": "…"}]   // a stage ref has no id
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
 // pipeline (live pipelines and stages only)
 { "id": "…", "name": "…", "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}], "currencies": ["USD"] }
+
+// pipeline-detail (GET/POST/PATCH/archive of one pipeline): the pipeline, plus
+{ "version": "<opaque>", "archived": false, "archived_stages": [{"id": "…", "name": "…", "kind": "…"}] }
+
+// deletion preview
+{ "entity": "deal" | "person" | "company", "id": "…", "name": "…", "impact": {"<name>": 0, …} }
 
 // search result
 { "entity": "deal" | "person" | "company", "id": "…", "label": "…", "sub": "…" }
@@ -355,13 +381,64 @@ person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have 
   (case-insensitive) or `"me"`; anything else is 422. `company` and `person` on a deal or person are either
   `{id}` of an existing record or the fields of a new one, not both. `pipeline` and `stage` are ids.
 - **Move.** Moving a deal to the stage it is already in is a no-op 200.
-- **Archive.** `archived: true` archives, `false` restores. Nothing is deleted through the API.
+- **Archive.** `archived: true` archives, `false` restores. Archiving is reversible and keeps the record.
+- **Delete.** `DELETE` on a deal, person or company removes it for good. It needs `operator`, and unlike
+  archive it **cannot be undone**. First `GET …/deletion_preview`: `impact` is an object of counts of what
+  goes with the record (for example linked tasks, notes or interactions). The keys are chosen by the
+  server and may change, so treat the ones above as examples, not a closed list, and show a person all of
+  them. `DELETE` answers 204. A record that cannot be deleted right now is refused with 409 `conflict` or
+  422 (`message` says why). An unknown id is 404.
+- **Unlink.** `DELETE …/deals/:id/company` and `…/person` detach the linked record and return the deal.
+  The linked record itself is kept. A deal that is already unlinked answers 200 and changes nothing.
+  `expected` (optional) is the id you last saw linked; if something else is linked now, the answer is
+  409 `conflict`. Omitted, no check.
+- **Pipelines.** Reading one is open to any member; create, update and archive need `operator`. `stages`
+  on `PATCH` is the full, ordered list of live stages: existing stages by `id`, new ones without. A
+  live stage that is missing from the list must appear in `removals` as `{stage, move_to}` where
+  `move_to` is a stage that stays live (its deals move there); otherwise 422. `kind` is `open`, `won` or
+  `lost`, and a pipeline keeps at least one stage. Removed stages show up in `archived_stages`;
+  `restores` takes their ids. `version` works as above. `GET /crm/pipelines` lists live pipelines;
+  `?archived=include` adds archived ones.
+- **Tasks.** A task can hang off a deal, a person or a company. `POST` on `/people/:id/tasks` or
+  `/companies/:id/tasks` takes `{title, due_at?, assignee?}` (assignee as for deals) and returns the
+  record's detail with 201. `PATCH /crm/tasks/:task_id {done}` marks any task done or open by its id and
+  returns that task; the deal-scoped route above keeps working.
 
-Task `done` is set by task id. Extra CRM errors: 409 `crm_not_set_up` (the organization has no CRM yet), 503 `crm_unavailable` (try again
+Extra CRM errors: 409 `crm_not_set_up` (the organization has no CRM yet), 503 `crm_unavailable` (try again
 after `Retry-After` seconds), 409 `conflict` (above), plus the existing 409 `machine_needs_update` and 503
-`machine_not_ready`. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
+`machine_not_ready`. The routes for deletion, unlinking, pipeline reads and writes, interactions, and record
+tasks answer 409 `machine_needs_update` while the organization's agent machine has not been updated
+to support them; try again later. A 422 for a duplicate carries `details.existing`. A 503 `machine_not_ready` after a write may carry
 `details.saved` (true: the change may already be saved) and `details.id` (on create). When `saved` is true no
-`Retry-After` is sent and you must not retry blindly: read the record first.
+`Retry-After` is sent and you must not retry blindly: read the record first. A create sent with an
+`Idempotency-Key` is the exception: its message says to retry with the same key, which is safe (below).
+
+## Idempotent creates
+
+Send `Idempotency-Key: <key>` on a CRM create to make a retry safe. The key is 1–128 characters of
+`[A-Za-z0-9_.:-]`; a random UUID is a good one. It is accepted on:
+
+```
+POST /orgs/:org/crm/deals            POST /orgs/:org/crm/deals/:id/notes
+POST /orgs/:org/crm/people           POST /orgs/:org/crm/deals/:id/tasks
+POST /orgs/:org/crm/companies        POST /orgs/:org/crm/people/:id/tasks
+POST /orgs/:org/crm/pipelines        POST /orgs/:org/crm/companies/:id/tasks
+```
+
+- **Replay.** The same key on the same route with the same body returns the original success (201 and
+  the current detail) with the response header `Idempotent-Replayed: true`, and creates nothing.
+- **Whole creates.** A deal created together with a new `company` or `person` is idempotent as a whole:
+  a replay never makes a second company or person.
+- **Mistakes.** A malformed key is 422 with `fields.idempotency_key`. The same key used for a different
+  route or body is 422 with `fields.idempotency_key: ["was already used for a different request"]`.
+- **Expiry.** A key is remembered for 24 hours; after that it is treated as new.
+- **No header, no change.** Without the header a create behaves as before, and repeating it creates
+  another record.
+- **Not updated yet.** If the response carries `Idempotency-Key-Honored: false`, the organization's agent
+  machine has not been updated and did not store the key, so a retry could create a duplicate. Look for
+  the record before retrying.
+- **Unsure outcome.** A 503 `machine_not_ready` with `details.saved` and a key sent means the create may or
+  may not have happened. Retry with the same `Idempotency-Key`: it creates the record once.
 
 ## Subscriptions
 
