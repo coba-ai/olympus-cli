@@ -208,7 +208,7 @@ prints depends on when you stop: before the message is sent, that nothing was se
 that it may have been sent (check `olympus session get ID`); after, the session id to read the reply later
 with `olympus session get ID`. The message endpoint's 202 does not identify the accepted message, so if someone
 else sends a message in the same session at the same moment, the replies cannot be told apart exactly;
-`olympus ask` matches the reply to the text it sent. Only sessions you opened or take part in are visible to you. `sessions` lists open sessions (`--closed`, or `--all`;
+`olympus ask` matches the reply to the text it sent and stops at the first later message from another person. Only sessions you opened or take part in are visible to you. `sessions` lists open sessions (`--closed`, or `--all`;
 `--agent` filters by slug). `session get ID` prints the thread (the last 200 messages; `--after MSG_ID` only
 newer ones) and `session close ID` closes a session; its transcript is kept. `briefing` shows your morning
 briefing for today (`--day` for another date); `--request` asks your agent to write today's. It is exit 6
@@ -333,9 +333,9 @@ newline in task text never splits a row; nothing is printed for an empty list):
 | 2 | auth (401, or no token) |
 | 3 | not found (404, non-member, pin mismatch) |
 | 4 | forbidden (403) |
-| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, a timeout (`timeout`), or an agent machine that is not ready (for `ask`, `busy` and `machine_not_ready` mean nothing was sent; `timeout` and `network_error` mean it was or may have been: read with `session get` before asking again) |
+| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, a timeout (`timeout`), or an agent machine that is not ready (for `ask`, retry only when the message says "nothing was sent", as `busy` and `machine_not_ready` do before sending; after `timeout`, `network_error`, a 5xx on the send itself, or `bad_request` while reading, the message may have been sent: read with `session get` before asking again) |
 | 6 | invalid (400, 422), a 409 conflict ("changed since you read it"), "CRM not set up", `no_agent` (the organization has no agent), `session_closed`, `briefing_not_set_up`, and `ask` `agent_mismatch` |
-| 130 | cancelled (Ctrl-C during login, credentials untouched; a cancelled `day close` prompt, nothing saved; or Ctrl-C during `ask`, which prints the session id) |
+| 130 | cancelled (Ctrl-C during login, credentials untouched; a cancelled `day close` prompt, nothing saved; or Ctrl-C during `ask`, which prints the session id when one exists) |
 
 ## `.env` is not loaded by the binary
 
