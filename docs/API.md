@@ -274,10 +274,12 @@ DELETE /orgs/:org/sessions/:id                                          → {dat
 // turn
 { "state": "idle", "started_at": null, "error": null }
 //   state: "idle" | "queued" | "running" | "failed"
-//   started_at: ISO 8601 or null; error: a short reason when state is "failed", otherwise null
+//   started_at: ISO 8601 or null. It names the turn: it is set when a turn is accepted, stays the same
+//   until that turn ends, and is null when idle. error: a short reason when state is "failed", otherwise null
 // message
 { "id": "1001", "role": "user", "text": "…", "created_at": "…", "sender": {"id": "u_12", "name": "Ada"} }
-//   role: "user" | "assistant"; sender is who typed a user message, null on assistant messages
+//   role: "user" | "assistant"; sender is who typed a user message. It is null on assistant messages,
+//   and on a user message whose author is unknown or no longer in the organization
 ```
 
 Only the text of user and assistant messages is exposed: no tool calls, tool output or file paths.
@@ -288,7 +290,9 @@ Only the text of user and assistant messages is exposed: no tool calls, tool out
   Opening a session does not start a turn; send a message next. 409 `no_agent` when the organization has no agent.
 - **Read.** Without `after` you get the whole thread, capped at the **last 200 messages**. With
   `?after=<message id>` you get only the messages after that id, in order; an id that is not in this
-  session is 422 `fields.after`. `turn` is the same object as `session.turn`. Message text is read
+  session is 422 `fields.after`, except an id the session used to have: after the agent compacts a long
+  conversation, an older id answers 200 with the messages after its position, which can include ones you
+  have already seen. De-duplicate by `id`. `turn` is the same object as `session.turn`. Message text is read
   live from the agent's machine and is not stored by the API; if the machine cannot be reached the
   answer is 503 `machine_not_ready`, never an empty `messages` list that looks like an empty conversation.
 - **Send.** `text` is a non-blank string up to a server-defined maximum (422 `fields.text` otherwise).
