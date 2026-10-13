@@ -302,7 +302,7 @@ that long and send the same message again, so every message gets exactly one rep
 
 **Waiting for a reply.** After the 202, poll `GET /sessions/:id?after=<id of the last message you have>`
 about every 2 seconds, and honour `Retry-After` on any 429 or 503. The turn is over when `turn.state`
-is `idle` (the reply is normally in `messages`; if it is not there yet, read again shortly) or `failed` (`turn.error` says why). Replies can take minutes. The 202 does not identify the accepted message, so if someone else sends a message in the same session at the same moment, a client cannot tell the replies apart exactly.
+is `idle` (the reply is normally in `messages`; if it is not there yet, read again shortly) or `failed` (`turn.error` says why). Replies can take minutes. The 202 does not identify the accepted message, so a client recognises its own message in `messages` by `sender.id` (its own user id) and the text it sent; if someone else sends a message in the same session at the same moment, the replies cannot be told apart exactly.
 
 ## Briefings
 
