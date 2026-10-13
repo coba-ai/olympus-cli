@@ -133,6 +133,12 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         // The reply ends at the next user message from anyone else (a missing sender id counts as someone else).
         const end = first < 0 ? -1 : got.findIndex((m, i) => i > first && m.role === "user" && m.sender?.id !== myId);
         replies = first < 0 ? [] : got.slice(first + 1, end < 0 ? undefined : end).filter((m) => m.role === "assistant");
+        // Once someone else has spoken after our message our turn is over; the session's state now belongs to their turn.
+        const over = first >= 0 && end >= 0;
+        if (over) {
+          if (!replies.length) io.err(`note: the agent finished without a text reply; see olympus session get ${tag}\n`);
+          break;
+        }
         const ts = turn.started_at;
         if (ours && typeof ts === "string" && ts && ts !== ours) { // a later turn's state: it neither fails nor holds up this ask
           if (replies.length) break;
@@ -140,12 +146,6 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         }
         live ||= st !== "failed";
         const failure = () => mk(1, "turn_failed", `${clean(turn.error) || "the agent's turn failed"} (session ${tag})`);
-        // Once someone else has spoken after our message our turn is over; the session's state now belongs to their turn.
-        const over = first >= 0 && end >= 0;
-        if (over) {
-          if (!replies.length) io.err(`note: the agent finished without a text reply; see olympus session get ${tag}\n`);
-          break;
-        }
         if (st === "failed" && (first >= 0 || live)) throw failure();
         if (st !== "idle" && st !== "failed") quiet = 0; // anything but idle/failed (including unknown states) is still working
         else if (replies.length) break;

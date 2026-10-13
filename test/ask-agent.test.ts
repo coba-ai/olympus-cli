@@ -570,6 +570,13 @@ test("a later turn's state before our reply is visible keeps polling for the rep
   expect([r.code, r.out, r.err, gets().length]).toEqual([0, "mine\n", "", 2]);
 });
 
+test("a teammate speaking after a turn with no text finishes it even when the polled turn is a later one", async () => {
+  onPoll((n, s) => { if (n === 1) { appendMessage(fake.state, "acme", "202", "user", "x", { id: "u_1", name: "Owner" }); appendMessage(fake.state, "acme", "202", "user", "hi", { id: "u_2", name: "Other" }); laterTurn(s, "running"); } });
+  const r = await ask(["x"]);
+  expect([r.code, r.out, gets().length]).toEqual([0, "", 1]);
+  expect(r.err).toContain("finished without a text reply");
+});
+
 test("a later turn with our reply never appearing times out", async () => {
   onPoll((n, s) => laterTurn(s, "failed", "boom"));
   const r = await ask(["x", "--timeout", "10"]);
