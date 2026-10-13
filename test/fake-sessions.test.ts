@@ -71,7 +71,7 @@ test("create: 201 shape, and 422 for agent, title and unknown keys", async () =>
   expect((await call("POST", "/sessions", { agent: "hermes" })).json.data.title).toBeNull();
   for (const b of [{}, { agent: "nobody" }, { agent: "hera" }]) expect(fields(await call("POST", "/sessions", b))).toEqual(["agent"]);
   expect(fields(await call("POST", "/sessions", { agent: "hermes", title: "x".repeat(101) }))).toEqual(["title"]);
-  expect(fields(await call("POST", "/sessions", { agent: "hermes", tile: 1, transcript: 2 }))).toEqual(["tile", "transcript"]);
+  expect(fields(await call("POST", "/sessions", { agent: "hermes", color: 1, pinned: 2 }))).toEqual(["color", "pinned"]);
 });
 
 test("thread: shape, cap, after, and 422 for an unknown after", async () => {
