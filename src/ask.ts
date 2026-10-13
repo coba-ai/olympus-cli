@@ -42,13 +42,14 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
       await (io.sleep ?? realSleep)(ms, signal);
       if (signal.aborted) throw cancelled(); // nothing is requested after an abort
     };
-    const base = `/orgs/${seg(await org())}/sessions`;
+    const orgSeg = seg(await org());
+    const base = `/orgs/${orgSeg}/sessions`;
     const read = (after?: string) => req("GET", `${base}/${seg(sid)}${after ? `?${new URLSearchParams({ after })}` : ""}`);
 
     try {
       let myId = "";
       if (!noWait) {
-        const ps = await req("GET", `/orgs/${seg(await org())}/people`);
+        const ps = await req("GET", `/orgs/${orgSeg}/people`);
         const id = Array.isArray(ps) ? ps.find((p: any) => p?.me === true)?.id : undefined;
         if (typeof id !== "string" || !id) throw new CliError(5, { error: { code: "bad_response", message: "could not tell which person you are; nothing was sent" } });
         myId = id;
@@ -74,7 +75,7 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
       for (;;) {
         try {
           if (signal.aborted) throw cancelled();
-          if (deadline - now() <= 0) throw mk(5, sawBusy ? "busy" : "timeout", `${sawBusy ? `the agent is still busy in session ${tag}` : "no time left to send"}; nothing was sent`);
+          if (deadline - now() <= 0) throw mk(5, sawBusy ? "busy" : "not_sent", `${sawBusy ? `the agent is still busy in session ${tag}` : "no time left to send"}; nothing was sent`);
           sent = "inflight";
           turn = (await req("POST", `${base}/${seg(sid)}/messages`, { text }))?.turn;
           sent = "accepted";
@@ -131,6 +132,12 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         replies = first < 0 ? [] : got.slice(first + 1, end < 0 ? undefined : end).filter((m) => m.role === "assistant");
         live ||= st !== "failed";
         const failure = () => mk(1, "turn_failed", `${clean(turn.error) || "the agent's turn failed"} (session ${tag})`);
+        // Once someone else has spoken after our message our turn is over; the session's state now belongs to their turn.
+        const over = first >= 0 && end >= 0;
+        if (over) {
+          if (!replies.length) io.err(`note: the agent finished without a text reply; see olympus session get ${tag}\n`);
+          break;
+        }
         if (st === "failed" && (first >= 0 || live)) throw failure();
         if (st !== "idle" && st !== "failed") quiet = 0; // anything but idle/failed (including unknown states) is still working
         else if (replies.length) break;

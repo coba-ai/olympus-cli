@@ -396,7 +396,7 @@ test("nothing is sent once the deadline has passed, even on the first attempt", 
   };
   const r = await ask(["x", "--timeout", "1", "--json"], { skew });
   const e = errBody(r);
-  expect([r.code, r.out, e.code, e.message, e.details.session_id]).toEqual([5, "", "timeout", "no time left to send; nothing was sent", "202"]);
+  expect([r.code, r.out, e.code, e.message, e.details.session_id]).toEqual([5, "", "not_sent", "no time left to send; nothing was sent", "202"]);
   expect(posts().filter((q) => q.path.endsWith("/messages"))).toHaveLength(0);
 });
 
@@ -471,10 +471,40 @@ const teammateTurn = (text: string, answer: string) => {
 };
 
 test("another person's whole turn before our message is visible is never printed", async () => {
-  plan({ state: "queued" }, { state: "idle", reply: ["mine reply"] });
+  plan({ state: "idle", user: false }, { state: "idle", reply: ["mine reply"] });
   teammateTurn("teammate question", "teammate answer");
   const r = await ask(["mine", "--session", "101"]);
   expect([r.code, r.out]).toEqual([0, "mine reply\n"]);
+});
+
+// A teammate speaks after our message, between our polls; the session state then belongs to their turn.
+const teammateAfterUs = (poll: number) => {
+  let n = 0;
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "GET" && path.endsWith("/101") && ++n === poll) appendMessage(fake.state, "acme", "101", "user", "teammate question", { id: "u_2", name: "Mate" });
+  };
+};
+
+test("a teammate's later turn failing does not fail ours", async () => {
+  plan({ state: "running", reply: ["mine reply"] }, { state: "failed", error: "their boom" });
+  teammateAfterUs(3);
+  const r = await ask(["mine", "--session", "101"]);
+  expect([r.code, r.out, r.err]).toEqual([0, "mine reply\n", ""]);
+});
+
+test("a teammate's later turn still running does not hold ours", async () => {
+  plan({ state: "running", reply: ["mine reply"] }, { state: "running" });
+  teammateAfterUs(3);
+  const r = await ask(["mine", "--session", "101"]);
+  expect([r.code, r.out, r.err]).toEqual([0, "mine reply\n", ""]);
+});
+
+test("a teammate speaking after a turn with no text finishes it without waiting", async () => {
+  plan({ state: "running" }, { state: "running" });
+  teammateAfterUs(3);
+  const r = await ask(["mine", "--session", "101"]);
+  expect([r.code, r.out]).toEqual([0, ""]);
+  expect(r.err).toContain("finished without a text reply");
 });
 
 test("the same text from another sender is not taken for ours", async () => {
