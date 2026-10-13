@@ -46,6 +46,13 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
     const read = (after?: string) => req("GET", `${base}/${seg(sid)}${after ? `?${new URLSearchParams({ after })}` : ""}`);
 
     try {
+      let myId = "";
+      if (!noWait) {
+        const ps = await req("GET", `/orgs/${seg(await org())}/people`);
+        const id = Array.isArray(ps) ? ps.find((p: any) => p?.me === true)?.id : undefined;
+        if (typeof id !== "string" || !id) throw new CliError(5, { error: { code: "bad_response", message: "could not tell which person you are; nothing was sent" } });
+        myId = id;
+      }
       let session: any, after: string | undefined;
       if (v.session !== undefined) {
         sid = String(v.session);
@@ -117,12 +124,10 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         after = lastId(ms) ?? after;
         turn = d?.turn ?? { state: "idle" };
         const st = typeof turn.state === "string" ? turn.state : "idle";
-        // Exact correlation needs a message id the API does not return yet, so match on the text we sent.
-        const mine = got.findIndex((m) => m.role === "user" && m.text?.trim() === text.trim());
-        const first = mine >= 0 ? mine : got.findIndex((m) => m.role === "user");
-        // The reply ends at the next user message that is not provably from the same sender (a missing sender id counts as different).
-        const who = first < 0 ? undefined : got[first].sender?.id;
-        const end = first < 0 ? -1 : got.findIndex((m, i) => i > first && m.role === "user" && !(who && m.sender?.id === who));
+        // Our message is the first new user message from us with the text we sent; the reply is matched by that, not by position.
+        const first = got.findIndex((m) => m.role === "user" && m.sender?.id === myId && m.text?.trim() === text.trim());
+        // The reply ends at the next user message from anyone else (a missing sender id counts as someone else).
+        const end = first < 0 ? -1 : got.findIndex((m, i) => i > first && m.role === "user" && m.sender?.id !== myId);
         replies = first < 0 ? [] : got.slice(first + 1, end < 0 ? undefined : end).filter((m) => m.role === "assistant");
         live ||= st !== "failed";
         const failure = () => mk(1, "turn_failed", `${clean(turn.error) || "the agent's turn failed"} (session ${tag})`);

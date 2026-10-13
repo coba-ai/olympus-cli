@@ -34,7 +34,8 @@ async function cli(args: string[], o: Opts = {}) {
 }
 const ask = (args: string[], o: Opts = {}) => cli(["ask", "hermes", ...args], o);
 const reqs = () => fake.state.requests;
-const gets = () => reqs().filter((r) => r.method === "GET");
+const gets = () => reqs().filter((r) => r.method === "GET" && !r.path.endsWith("/people"));
+const PEOPLE = "GET /api/v1/orgs/acme/people";
 const posts = () => reqs().filter((r) => r.method === "POST");
 const P = "/api/v1/orgs/acme/sessions";
 const plan = (...steps: Step[]) => fake.state.turns.push(steps);
@@ -46,7 +47,7 @@ test("a new session: create, send, then poll the whole thread", async () => {
   const r = await ask(["hello"]);
   expect(r).toMatchObject({ code: 0, out: "Got it: hello\n", err: "" });
   expect(reqs().map((q) => `${q.method} ${q.path}${q.search}`)).toEqual([
-    `POST ${P}`, `POST ${P}/202/messages`, `GET ${P}/202`, `GET ${P}/202`, `GET ${P}/202?after=1005`,
+    PEOPLE, `POST ${P}`, `POST ${P}/202/messages`, `GET ${P}/202`, `GET ${P}/202`, `GET ${P}/202?after=1005`,
   ]);
   expect(posts()[0]!.body).toEqual({ agent: "hermes" });
   expect(posts()[1]!.body).toEqual({ text: "hello" });
@@ -56,8 +57,8 @@ test("--session reads first, prints nothing old, and polls after the last known 
   const r = await ask(["more", "--session", "101"]);
   expect(r).toMatchObject({ code: 0, out: "Got it: more\n" });
   expect(r.out).not.toContain("test a 10% step");
-  expect(reqs().map((q) => `${q.method} ${q.path}${q.search}`).slice(0, 4)).toEqual([
-    `GET ${P}/101`, `POST ${P}/101/messages`, `GET ${P}/101?after=1002`, `GET ${P}/101?after=1002`,
+  expect(reqs().map((q) => `${q.method} ${q.path}${q.search}`).slice(0, 5)).toEqual([
+    PEOPLE, `GET ${P}/101`, `POST ${P}/101/messages`, `GET ${P}/101?after=1002`, `GET ${P}/101?after=1002`,
   ]);
 });
 
@@ -458,4 +459,47 @@ test("cancelling while the message is in flight says it may have been sent", asy
   };
   const r = await ask(["x", "--json"], { signal: ctl.signal });
   expect([r.code, r.out, errBody(r).message]).toEqual([130, "", "cancelled; the message may have been sent; check olympus session get 202"]);
+});
+
+const teammateTurn = (text: string, answer: string) => {
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "POST" && path.endsWith("/101/messages")) {
+      appendMessage(fake.state, "acme", "101", "user", text, { id: "u_2", name: "Mate" });
+      appendMessage(fake.state, "acme", "101", "assistant", answer);
+    }
+  };
+};
+
+test("another person's whole turn before our message is visible is never printed", async () => {
+  plan({ state: "queued" }, { state: "idle", reply: ["mine reply"] });
+  teammateTurn("teammate question", "teammate answer");
+  const r = await ask(["mine", "--session", "101"]);
+  expect([r.code, r.out]).toEqual([0, "mine reply\n"]);
+});
+
+test("the same text from another sender is not taken for ours", async () => {
+  plan({ state: "queued" }, { state: "idle", reply: ["mine reply"] });
+  teammateTurn("mine", "teammate answer");
+  const r = await ask(["mine", "--session", "101"]);
+  expect([r.code, r.out]).toEqual([0, "mine reply\n"]);
+});
+
+test("our message never appearing while a teammate's turn does times out", async () => {
+  plan({ state: "idle", user: false });
+  teammateTurn("teammate question", "teammate answer");
+  const r = await ask(["mine", "--session", "101", "--timeout", "10"]);
+  expect([r.code, r.out]).toEqual([5, ""]);
+  expect(r.err).toContain("olympus session get 101");
+});
+
+test("no row marked as the caller: bad_response and nothing is sent", async () => {
+  fake.state.next = { status: 200, body: { data: [{ id: "u_1", name: "Me", kind: "user", me: false }] } };
+  const r = await ask(["x", "--json"]);
+  expect([r.code, r.out, errBody(r).code]).toEqual([5, "", "bad_response"]);
+  expect(posts()).toHaveLength(0);
+});
+
+test("--no-wait never asks who the caller is", async () => {
+  await ask(["x", "--no-wait"]);
+  expect(reqs().some((q) => q.path.endsWith("/people"))).toBe(false);
 });
