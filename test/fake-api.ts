@@ -9,6 +9,9 @@ export const DEVICE_CODE = `dev_${randomBytes(16).toString("hex")}`;
 
 type Webhook = Record<string, any>;
 type Item = Record<string, any>;
+// A turn step: state is queued | running | idle | failed (anything else is echoed). The accepted user message joins the thread on the first
+// GET whose step is not queued, unless that step sets user: false (then on a later one); `reply` adds assistant messages once the user's is there.
+export type Step = { state: string; reply?: string[]; error?: string; user?: boolean };
 export type TaskStore = Record<string, Record<string, { version: number; tasks: Item[] }>>;
 export type FakeState = {
   next?: { status: number; body?: unknown; headers?: Record<string, string>; delayMs?: number };
@@ -31,6 +34,18 @@ export type FakeState = {
   // org -> subscriptions; tests reset it with seedSubscriptions()
   subscriptions: Record<string, Item[]>;
   // each poll shifts one script entry: "ok" -> token, "echo" -> 400 echoing device_code, empty -> pending, else 400 <code>
+  // org -> sessions (with their messages); tests reset it with seedSessions(now)
+  sessions: Record<string, Item[]>;
+  // org -> user id -> day -> briefing; tests reset it with seedBriefings(today)
+  briefings: Record<string, Record<string, Record<string, Item>>>;
+  // one plan per accepted message, taken from the front; empty -> defaultPlan(text). Each GET of the session advances one step.
+  turns: Step[][];
+  // the next N message POSTs answer 409 busy (Retry-After: 5), on top of a live turn being busy
+  busy?: number;
+  // "none": 503 machine_not_ready on thread reads, creates, message POSTs and the briefing POST; "no_agent": 409 on creates, messages and the briefing POST
+  machine?: "none" | "no_agent";
+  // page size of GET /sessions (default 20)
+  sessionsPer?: number;
   device?: { script: string[]; interval?: number; expires_in?: number; omitComplete?: boolean; codeBody?: unknown };
 };
 
@@ -473,10 +488,169 @@ function subsApi(L: Item[], method: string, path: string[], body: unknown, opera
   return NF;
 }
 
+// ---- Sessions (ask an agent) + briefings. Only the opener sees a session; message bodies live in the stored thread.
+const MAX_TEXT_BYTES = 32000;
+const NO_STEER = { "Retry-After": "5" };
+type SRes = [number, unknown?, Record<string, string>?];
+const isoAt = (ms: number) => new Date(ms).toISOString();
+const defaultPlan = (text: string): Step[] => [{ state: "queued" }, { state: "running" }, { state: "idle", reply: [`Got it: ${text}`] }];
+const stepOf = (l: Item): Step => l.plan[Math.max(0, Math.min(l.n, l.plan.length) - 1)];
+const IDLE = { state: "idle", started_at: null, error: null };
+
+export function seedSessions(now: string | number): Record<string, Item[]> {
+  const t = (min: number) => isoAt(new Date(now).getTime() - min * 60000);
+  const owner = { id: "u_1", name: PERSON_NAMES[TOKENS.owner]! }, mate = { id: "u_2", name: PERSON_NAMES[TOKENS.teammate]! };
+  const hermes = { slug: "hermes", name: "Hermes" };
+  const session = (id: string, o: Item): Item => ({ id, agent: hermes, title: null, state: "open", opened_by: owner, created_at: t(60), last_activity_at: null, turn: IDLE, messages: [], ...o });
+  const msg = (id: string, role: string, text: string, min: number, sender: Item | null): Item => ({ id, role, text, created_at: t(min), sender });
+  return {
+    acme: [
+      session("101", {
+        title: "Pricing questions", last_activity_at: t(29),
+        messages: [msg("1001", "user", "What should we charge for the pro plan?", 30, owner), msg("1002", "assistant", "Start from the plan you sell most and test a 10% step up.", 29, null)],
+      }),
+      session("102", { created_at: t(10) }),
+      session("103", { state: "closed", title: "Old thread", last_activity_at: t(900) }),
+      session("201", {
+        opened_by: mate, last_activity_at: t(20),
+        messages: [msg("1003", "user", "Where is the onboarding checklist?", 21, mate), msg("1004", "assistant", "It lives in the team handbook.", 20, null)],
+      }),
+    ],
+    beta: [],
+  };
+}
+
+export function seedBriefings(today: string): FakeState["briefings"] {
+  return {
+    acme: {
+      u_1: {
+        [today]: {
+          day: today, state: "ready", session_id: "101", requested_at: `${today}T07:00:00Z`,
+          document: {
+            headline: "A quiet day with two things to decide",
+            summary: "Two meetings are on the calendar.\nThe pricing review is the one that needs preparation.",
+            items: [{ title: "Pricing review", detail: "Bring the draft tiers." }, { title: "Inbox", detail: "Nothing urgent is waiting." }],
+          },
+        },
+      },
+    },
+  };
+}
+
+// Adds a message to a session's thread (ids increase across the whole fake) and bumps its activity. Tests use it from onRequest to model another client.
+export function appendMessage(state: FakeState, org: string, sessionId: string, role: "user" | "assistant", text: string, sender: Item | null = null): Item {
+  const s = state.sessions[org]!.find((x) => x.id === sessionId)!;
+  const top = Math.max(0, ...Object.values(state.sessions).flat().flatMap((x) => x.messages.map((m: Item) => Number(m.id))));
+  const at = isoAt(state.now?.() ?? Date.now());
+  const m = { id: String(top + 1), role, text, created_at: at, sender };
+  s.messages.push(m);
+  s.last_activity_at = at;
+  return m;
+}
+
+function sessionsApi(state: FakeState, org: string, me: { id: string; name: string }, method: string, path: string[], q: URLSearchParams, body: unknown): SRes {
+  const mine = (state.sessions[org] ??= []);
+  const at = isoAt(state.now?.() ?? Date.now());
+  const pub = ({ messages, _live, ...s }: Item) => s;
+  const gate = (read: boolean): Res | undefined =>
+    state.machine === "none" ? E(503, "machine_not_ready", "The agent machine is not ready.")
+    : state.machine === "no_agent" && !read ? E(409, "no_agent", "This organization has no agent yet.") : undefined;
+  const open = (agent: Item, title: string | null): Item => {
+    const id = String(Math.max(100, ...Object.values(state.sessions).flat().map((x) => Number(x.id))) + 1);
+    const s: Item = { id, agent: { slug: agent.profile_name, name: agent.name }, title, state: "open", opened_by: me, created_at: at, last_activity_at: null, turn: IDLE, messages: [] };
+    mine.push(s);
+    return s;
+  };
+
+  if (path[0] === "briefings") {
+    const day = path[1] === "today" ? state.today : path[1]!;
+    if (!validDay(day)) return inv({ day: ["is not a valid date"] });
+    const rows = ((state.briefings[org] ??= {})[me.id] ??= {});
+    if (method === "GET") return [200, { data: rows[day] ?? { day, state: "none", document: null, session_id: null, requested_at: null } }];
+    if (method !== "POST" || path[1] !== "today") return NF;
+    const g = gate(false);
+    if (g) return g;
+    if (me.id === "u_2") return E(409, "briefing_not_set_up", "Set up your briefing first.");
+    if (!rows[day]) rows[day] = { day, state: "pending", document: null, session_id: open(AGENTS[0]!, "Morning briefing").id, requested_at: at };
+    return [202, { data: rows[day] }];
+  }
+
+  const [, id, tail] = path;
+  if (!id) {
+    if (method === "GET") {
+      const want = q.get("state") ?? "open", page = q.get("page") ?? "1", per = state.sessionsPer ?? 20;
+      const bad: Record<string, string[]> = {};
+      if (!["open", "closed", "all"].includes(want)) bad.state = ["must be open, closed or all"];
+      if (!/^\d+$/.test(page) || Number(page) < 1) bad.page = ["must be a positive integer"];
+      if (Object.keys(bad).length) return inv(bad);
+      const rows = mine
+        .filter((s) => s.opened_by.id === me.id && (want === "all" || s.state === want) && (!q.get("agent") || s.agent.slug === q.get("agent")))
+        .sort((a, b) => (b.last_activity_at ?? b.created_at).localeCompare(a.last_activity_at ?? a.created_at));
+      return [200, { data: { sessions: rows.slice((Number(page) - 1) * per, Number(page) * per).map(pub), total: rows.length, page: Number(page), per } }];
+    }
+    if (method !== "POST") return NF;
+    const g = gate(false);
+    if (g) return g;
+    const b = (body && typeof body === "object" ? body : {}) as Item;
+    const bad: Record<string, string[]> = {};
+    for (const k of Object.keys(b)) if (k !== "agent" && k !== "title") bad[k] = ["is not allowed"];
+    const agent = AGENTS.find((a) => a.profile_name === b.agent && !a.paused);
+    if (!agent) bad.agent = ["is missing, unknown or paused"];
+    if (b.title != null && (typeof b.title !== "string" || b.title.length > 100)) bad.title = ["must be a string of at most 100 characters"];
+    if (Object.keys(bad).length) return inv(bad);
+    return [201, { data: pub(open(agent!, b.title ?? null)) }];
+  }
+
+  const s = mine.find((x) => x.id === id && x.opened_by.id === me.id);
+  if (!s) return NF;
+  if (!tail && method === "DELETE") {
+    s.state = "closed";
+    return [200, { data: pub(s) }];
+  }
+  if (!tail && method === "GET") {
+    const g = gate(true);
+    if (g) return g;
+    const after = q.get("after");
+    if (after !== null && !s.messages.some((m: Item) => m.id === after)) return inv({ after: ["is not a message of this session"] });
+    const l = s._live;
+    if (l) {
+      l.n++;
+      const st = stepOf(l);
+      s.turn = { state: st.state, started_at: st.state === "running" ? at : null, error: st.error ?? null };
+      if (l.n <= l.plan.length) {
+        if (st.state !== "queued" && !l.userAdded && st.user !== false) l.userAdded = !!appendMessage(state, org, s.id, "user", l.text, me);
+        if (l.userAdded) for (const r of st.reply ?? []) appendMessage(state, org, s.id, "assistant", r);
+      }
+    }
+    const m = after === null ? s.messages.slice(-200) : s.messages.slice(s.messages.findIndex((x: Item) => x.id === after) + 1);
+    return [200, { data: { session: pub(s), messages: m, turn: s.turn } }];
+  }
+  if (tail === "messages" && method === "POST") {
+    const g = gate(false);
+    if (g) return g;
+    if (s.state === "closed") return E(409, "session_closed", "This session is closed.");
+    const text = (body as Item | undefined)?.text;
+    if (blank(text)) return inv({ text: ["can't be blank"] });
+    if (Buffer.byteLength(text) > MAX_TEXT_BYTES) return inv({ text: ["is too long"] });
+    const running = s._live && !["idle", "failed"].includes(stepOf(s._live).state);
+    if (running || (state.busy ?? 0) > 0) {
+      if (state.busy) state.busy--;
+      return [409, { error: { code: "busy", message: "The agent is still answering the last message." } }, NO_STEER];
+    }
+    const plan = state.turns.shift() ?? defaultPlan(text);
+    s._live = { plan, n: 0, text, userAdded: false };
+    s.turn = { state: plan[0]!.state, started_at: null, error: plan[0]!.error ?? null };
+    return [202, { data: { turn: s.turn } }];
+  }
+  return NF;
+}
+
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10) };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10), sessions: {}, briefings: {}, turns: [] };
   state.tasks = seedTasks(state.today);
+  state.sessions = seedSessions(new Date().toISOString());
+  state.briefings = seedBriefings(state.today);
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -543,7 +717,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
           (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
             (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)) ||
             (sub === "crm" && seg.length >= 6 && seg.length <= 9 && ["pipelines", "tags", "search", "tasks", "deals", "people", "companies"].includes(seg[5]!)) ||
-            (sub === "subscriptions" && seg.length >= 5 && seg.length <= 7) || (sub === "event_types" && seg.length === 5))));
+            (sub === "subscriptions" && seg.length >= 5 && seg.length <= 7) || (sub === "sessions" && seg.length >= 5 && seg.length <= 7) || (sub === "briefings" && seg.length === 6) || (sub === "event_types" && seg.length === 5))));
       if (!known) return notFound();
 
       const who = WHO[(req.headers.get("authorization") ?? "").replace(/^Bearer /, "")];
@@ -579,6 +753,11 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         const [st, o] = run();
         if (st < 300) state.idempotency[slot] = { fp, status: st, body: o };
         return send(st, o);
+      }
+      if (sub === "sessions" || sub === "briefings") {
+        const me = usersOf(org!).find((p) => p.t === (req.headers.get("authorization") ?? "").replace(/^Bearer /, ""))!;
+        const [st, o, h] = sessionsApi(state, org!, { id: me.id, name: me.name }, req.method, seg.slice(4), u.searchParams, body);
+        return send(st, o, { "Cache-Control": "no-store", ...h });
       }
       if (sub === "subscriptions") return reply(subsApi((state.subscriptions[org!] ??= []), req.method, seg.slice(5), body, operator));
       if (sub === "event_types") return req.method === "GET" ? send(200, { data: EVENT_TYPES }) : notFound();

@@ -1,5 +1,5 @@
 import { CliError, create, idempotencyKey, print, seg, usage, type Api, type Io } from "./core";
-import { clean, display, keyValue, table, when } from "./format";
+import { clean, display, keyValue, pageFooter, table, when } from "./format";
 import { PIPELINE_SPECS } from "./crm-pipelines";
 import { checkFlags, dash, type Plan } from "./tasks";
 
@@ -92,8 +92,7 @@ function listPlan(c: Ctx, url: string, key: string | null, cols: string[], tty: 
     const d = b.data ?? {}, rows = arr(key ? d[key] : d);
     print(c.io, c.json, b, () => rows.map((r) => row(cols, r)).join("\n"), () => {
       if (!rows.length) return empty;
-      const p = Number(d.page) || 1, per = Number(d.per) || rows.length, total = Number(d.total), more = p * per < total;
-      const foot = Number.isFinite(total) && (more || p > 1) ? `\n\nPage ${p} · showing ${rows.length} of ${total}.${more ? ` Next: --page ${p + 1}` : ""}` : "";
+      const foot = pageFooter(d, rows.length);
       return table(tty.map((f) => f.toUpperCase().replace(/_/g, " ")), rows.map((r) => tty.map((f) => ttyCell(f, r?.[f], c.now())))) + foot;
     });
   };
@@ -199,9 +198,8 @@ const TASK_ADD_FLAGS = [["due", "due_at"], ["assign", "assignee"]];
 const taskAdd = (kind: Kind): Spec => ({
   flags: ["due", "assign", "idempotency-key"], n: 6,
   build: (c) => mutate(c, kind, "POST", `/${KIND[kind].path}/${seg(c.pos[4]!)}/tasks`, copyFlags({ title: c.pos[5] }, c.v, TASK_ADD_FLAGS),
-    // Record detail lists a capped set of tasks, so the new one may be absent or not last: claim no id for person/company.
-    // The deal sentence still names tasks.at(-1) and can be wrong (issue #20).
-    (d) => kind === "deal" ? `Added task ${dash(arr(d.tasks).at(-1)?.id)} to deal ${clean(c.pos[4])}.` : `Added a task to ${kind} ${clean(c.pos[4])}.`, keyOf(c)),
+    // Record detail lists a capped set of tasks, so the new one may be absent or not last: claim no id.
+    () => `Added a task to ${kind} ${clean(c.pos[4])}.`, keyOf(c)),
 });
 const unlink = (what: "company" | "person"): Spec => ({
   flags: [], n: 4,

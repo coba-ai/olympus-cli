@@ -66,3 +66,9 @@ export const display = (x: unknown): string | null => {
   const y = o && typeof o === "object" && !Array.isArray(o) ? o.name ?? o.full_name ?? o.id : Array.isArray(x) ? (x.length ? x.join(",") : null) : x;
   return y == null || y === "" ? null : String(y);
 };
+
+/** Paging footer for list bodies: "" unless there is a next or previous page. `d` is the body's data, `shown` the rows on this page. */
+export function pageFooter(d: Record<string, any>, shown: number): string {
+  const p = Number(d.page) || 1, per = Number(d.per) || shown, total = Number(d.total), more = p * per < total;
+  return Number.isFinite(total) && (more || p > 1) ? `\n\nPage ${p} · showing ${shown} of ${total}.${more ? ` Next: --page ${p + 1}` : ""}` : "";
+}
