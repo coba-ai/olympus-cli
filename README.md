@@ -77,6 +77,11 @@ olympus crm person|company update <id> [--name T] [the add flags] [--notes T] [t
 olympus subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>
 olympus subscription create --name N --url URL --event T... | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]
 olympus event-types                 # event names accepted by --event ('*' = all events)
+olympus ask AGENT TEXT|- [--session ID] [--timeout SECONDS] [--no-wait]   # - reads the text from stdin
+olympus sessions [--closed | --all] [--agent SLUG] [--page N]
+olympus session get <id> [--after MSG_ID] | session close <id>
+olympus briefing [--day YYYY-MM-DD] [--request]
+olympus version | --version
 ```
 
 Global flags: `--json`, `--host URL`, `--org SLUG`, `-h/--help`. No flag takes a token.
@@ -191,6 +196,21 @@ either (exit 130).
 The wording of prompts and of terminal-mode confirmations is not a stable interface; the piped forms
 below are.
 
+Asking an agent: `olympus ask AGENT TEXT` (AGENT is the agent's slug from `olympus agents list`) opens a
+session with the agent, sends the text, waits for the reply and prints it. TEXT `-` reads it from stdin.
+Replies take minutes, not seconds: the CLI checks about every 2 s (more slowly after an error, and it
+honours `Retry-After`), which is about 30 requests a minute, under the 60 a minute a token gets. `--timeout`
+is whole seconds, default 300, at most 86400. If the agent is busy with another message in that session
+the CLI waits and retries until the timeout. `--session ID` continues a session instead of opening one
+(the agent must match the session's; otherwise exit 6, `agent_mismatch`). `--no-wait` sends and returns at
+once without a reply (it cannot be combined with `--timeout`). Stop waiting with Ctrl-C: the message is
+already sent, and the session id is printed so you can read the reply later with `olympus session get ID`.
+Only sessions you opened are visible to you. `sessions` lists open sessions (`--closed`, or `--all`;
+`--agent` filters by slug). `session get ID` prints the thread (the last 200 messages; `--after MSG_ID` only
+newer ones) and `session close ID` closes a session; its transcript is kept. `briefing` shows your morning
+briefing for today (`--day` for another date); `--request` asks your agent to write today's. It is exit 6
+until your briefing is set up in the Olympus app.
+
 ## Environment
 
 | Variable | Meaning |
@@ -280,16 +300,39 @@ newline in task text never splits a row; nothing is printed for an empty list):
 - `day list`: five rows, Monday to Friday, `day<TAB>closed|draft|-<TAB>score|-<TAB>shipped|-`
   (`draft` = saved but not closed, `-` = nothing saved).
 
+**Piped sessions output** (same rules: tab-separated, control characters stripped, nothing for an empty list):
+
+- `sessions`: `id  open|closed  agent-slug  turn  last-activity|-  title|-`, where turn is `idle`, `queued`,
+  `running` or `failed`, and last-activity is an ISO time. One page; `--page N` for the next.
+- `session get`: one line per message, `role: text` or `role sender-id: text` (role is `user` or `assistant`; the
+  text is flattened to one line). No header: the session, the turn and the timestamps are in `--json`.
+- `session close` prints `closed <id>`.
+- `briefing` and `briefing --request`: `day:`, `state:` (`none`, `pending`, `failed` or `ready`), `session_id:`,
+  `requested_at:` (empty prints `-`), then one `document.<path>: value` line per leaf of the briefing document,
+  in the server's order (array items are numbered, `document.items.0.title`; empty values print `-`; the
+  document's fields are set by the server and can grow). There are no `document` lines when there is no document.
+- `ask`: stdout is the reply text only (several assistant messages are separated by a blank line). On a
+  terminal the new session's id is also printed to stderr as `session <id>`; piped, stderr stays quiet. With
+  `--no-wait`, stdout is the session id (on a terminal, a sentence naming it).
+- `ask --json` prints `{"session":…,"messages":[…],"turn":…}`: `messages` is every new message in the
+  thread, including the one you sent; with `--no-wait` it is `[]`. In scripts use `--json` and read
+  `.session.id` on success. Any failure after the session exists (a timeout, a failed turn, a closed session)
+  prints the error object with `error.details.session_id`, so you can continue with `--session`.
+  A failed turn is exit 1 with `error.code` `turn_failed`: tell it apart from a usage error by `error.code`.
+  If the network drops while sending, the message may have been delivered; check with `olympus session get`
+  before sending again.
+- `version` / `--version`: `olympus <version>`; `version --json` is `{"data":{"version":"…"}}`.
+
 | Exit | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | usage |
+| 1 | usage; also an `ask` whose turn failed (`error.code` `turn_failed`) |
 | 2 | auth (401, or no token) |
 | 3 | not found (404, non-member, pin mismatch) |
 | 4 | forbidden (403) |
-| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)" and "agent machine needs an update" |
-| 6 | invalid (400, 422), a 409 conflict ("changed since you read it"), "CRM not set up" |
-| 130 | cancelled (Ctrl-C during login, credentials untouched; or a cancelled `day close` prompt, nothing saved) |
+| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, a timeout (`timeout`), or an agent machine that is not ready |
+| 6 | invalid (400, 422), a 409 conflict ("changed since you read it"), "CRM not set up", `no_agent` (the organization has no agent), `session_closed`, `briefing_not_set_up`, and `ask` `agent_mismatch` |
+| 130 | cancelled (Ctrl-C during login, credentials untouched; a cancelled `day close` prompt, nothing saved; or Ctrl-C during `ask`, which prints the session id) |
 
 ## `.env` is not loaded by the binary
 
@@ -302,10 +345,14 @@ identity. (`bun src/cli.ts` in development still loads `.env`.)
 Arguments are parsed strictly: `--instructions -foo` is refused as an unknown option; write
 `--instructions=-foo`. `--instructions-file -` (or `=-`) reads stdin.
 
+Text that starts with `-` needs `--`: `olympus ask hermes -- "-text"`.
+
 ## Release
 
 Push a `vX.Y.Z` tag: the release workflow builds `olympus-linux-x64`, `olympus-linux-arm64`,
 `olympus-darwin-x64`, `olympus-darwin-arm64` plus `SHA256SUMS` and creates a GitHub release.
+Release binaries print their tag (`olympus --version` → `olympus 0.7.0` for `v0.7.0`); a local build or
+`bun src/cli.ts` prints `olympus dev`.
 `workflow_dispatch`, or a PR touching release files, runs a dry-run build (artifact only, no release).
 
 ## Develop
