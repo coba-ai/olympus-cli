@@ -94,6 +94,8 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         }
       }
 
+      // The turn this message started; a poll showing a different start time is a later turn (someone else's, or our own second message).
+      const ours = typeof turn?.started_at === "string" && turn.started_at ? turn.started_at : undefined;
       if (noWait) {
         const body = { session, messages: [], turn };
         const line = `Sent to ${clean(session?.agent?.name ?? agent)} in session ${tag}. Read the reply later: olympus session get ${tag}`;
@@ -121,7 +123,8 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         wait = 2000;
         session = d?.session ?? session;
         const ms: any[] = Array.isArray(d?.messages) ? d.messages : [];
-        got.push(...ms);
+        const seen = new Set(got.map((m) => m?.id).filter((i) => i != null));
+        got.push(...ms.filter((m) => m?.id == null || !seen.has(m.id))); // a cursor the server has compacted away can re-send messages
         after = lastId(ms) ?? after;
         turn = d?.turn ?? { state: "idle" };
         const st = typeof turn.state === "string" ? turn.state : "idle";
@@ -130,6 +133,11 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         // The reply ends at the next user message from anyone else (a missing sender id counts as someone else).
         const end = first < 0 ? -1 : got.findIndex((m, i) => i > first && m.role === "user" && m.sender?.id !== myId);
         replies = first < 0 ? [] : got.slice(first + 1, end < 0 ? undefined : end).filter((m) => m.role === "assistant");
+        const ts = turn.started_at;
+        if (ours && typeof ts === "string" && ts && ts !== ours) { // a later turn's state: it neither fails nor holds up this ask
+          if (replies.length) break;
+          continue;
+        }
         live ||= st !== "failed";
         const failure = () => mk(1, "turn_failed", `${clean(turn.error) || "the agent's turn failed"} (session ${tag})`);
         // Once someone else has spoken after our message our turn is over; the session's state now belongs to their turn.

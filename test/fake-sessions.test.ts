@@ -118,7 +118,7 @@ test("message 422: blank, missing, over the byte limit", async () => {
 test("default plan: queued, running, idle with the reply; the user message joins on the first non-queued GET", async () => {
   const r = await post("101", "hello");
   expect(r.status).toBe(202);
-  expect(r.json.data).toEqual({ turn: { state: "queued", started_at: null, error: null } });
+  expect(r.json.data).toEqual({ turn: { state: "queued", started_at: expect.any(String), error: null } });
   const a = await get("101", "1002");
   expect([a.json.data.turn.state, a.json.data.messages]).toEqual(["queued", []]);
   const b = await get("101", "1002");
@@ -138,7 +138,7 @@ test("failed plan: error text, no reply", async () => {
   await post("101", "x");
   expect((await get("101")).json.data.turn).toMatchObject({ state: "running" });
   const f = await get("101");
-  expect(f.json.data.turn).toEqual({ state: "failed", started_at: null, error: "The agent ran out of credit." });
+  expect(f.json.data.turn).toEqual({ state: "failed", started_at: expect.any(String), error: "The agent ran out of credit." });
   expect(f.json.data.messages.slice(-1)[0]).toMatchObject({ role: "user", text: "x" });
   expect((await post("101", "retry")).status).toBe(202);
 });

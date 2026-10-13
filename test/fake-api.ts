@@ -616,7 +616,7 @@ function sessionsApi(state: FakeState, org: string, me: { id: string; name: stri
     if (l) {
       l.n++;
       const st = stepOf(l);
-      s.turn = { state: st.state, started_at: st.state === "running" ? at : null, error: st.error ?? null };
+      s.turn = { state: st.state, started_at: st.state === "idle" ? null : l.startedAt, error: st.error ?? null };
       if (l.n <= l.plan.length) {
         if (st.state !== "queued" && !l.userAdded && st.user !== false) l.userAdded = !!appendMessage(state, org, s.id, "user", l.text, me);
         if (l.userAdded) for (const r of st.reply ?? []) appendMessage(state, org, s.id, "assistant", r);
@@ -638,8 +638,8 @@ function sessionsApi(state: FakeState, org: string, me: { id: string; name: stri
       return [409, { error: { code: "busy", message: "The agent is still answering the last message." } }, NO_STEER];
     }
     const plan = state.turns.shift() ?? defaultPlan(text);
-    s._live = { plan, n: 0, text, userAdded: false };
-    s.turn = { state: plan[0]!.state, started_at: null, error: plan[0]!.error ?? null };
+    s._live = { plan, n: 0, text, userAdded: false, startedAt: at }; // one start time per accepted message, like the server
+    s.turn = { state: plan[0]!.state, started_at: plan[0]!.state === "idle" ? null : at, error: plan[0]!.error ?? null };
     return [202, { data: { turn: s.turn } }];
   }
   return NF;

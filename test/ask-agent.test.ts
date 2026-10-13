@@ -533,3 +533,62 @@ test("--no-wait never asks who the caller is", async () => {
   await ask(["x", "--no-wait"]);
   expect(reqs().some((q) => q.path.endsWith("/people"))).toBe(false);
 });
+
+// A later turn: another process by the same user sent a message after ours. The fake keeps one live plan per session, so these tests write the thread directly.
+const LATER = "2000-01-01T00:00:00Z";
+const onPoll = (fn: (n: number, s: any) => void) => {
+  let n = 0;
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "GET" && path === `${P}/202`) fn(++n, fake.state.sessions.acme!.find((x) => x.id === "202")!);
+  };
+};
+const laterTurn = (s: any, state: string, error: string | null = null) => {
+  s._live = undefined;
+  s.turn = { state, started_at: LATER, error };
+};
+const ourReply = (s: any, text: string) => {
+  appendMessage(fake.state, "acme", "202", "user", "x", { id: "u_1", name: "Owner" });
+  appendMessage(fake.state, "acme", "202", "assistant", text);
+};
+
+test("a later turn of ours that fails does not fail this ask", async () => {
+  onPoll((n, s) => { if (n === 1) { ourReply(s, "mine"); appendMessage(fake.state, "acme", "202", "user", "also", { id: "u_1", name: "Owner" }); laterTurn(s, "failed", "boom"); } });
+  const r = await ask(["x"]);
+  expect([r.code, r.err]).toEqual([0, ""]);
+  expect(r.out.startsWith("mine")).toBe(true);
+});
+
+test("a later turn still running does not hold this ask until the timeout", async () => {
+  onPoll((n, s) => { if (n === 1) { ourReply(s, "mine"); laterTurn(s, "running"); } });
+  const r = await ask(["x"]);
+  expect([r.code, r.out, r.err]).toEqual([0, "mine\n", ""]);
+});
+
+test("a later turn's state before our reply is visible keeps polling for the reply", async () => {
+  onPoll((n, s) => { if (n === 1) laterTurn(s, "failed", "boom"); else if (n === 2) { ourReply(s, "mine"); laterTurn(s, "failed", "boom"); } });
+  const r = await ask(["x"]);
+  expect([r.code, r.out, r.err, gets().length]).toEqual([0, "mine\n", "", 2]);
+});
+
+test("a later turn with our reply never appearing times out", async () => {
+  onPoll((n, s) => laterTurn(s, "failed", "boom"));
+  const r = await ask(["x", "--timeout", "10"]);
+  expect([r.code, r.out]).toEqual([5, ""]);
+  expect(r.err).toContain("no reply within 10s");
+});
+
+test("messages a poll sends again are not repeated", async () => {
+  const me = { id: "u_1", name: "Owner" };
+  const u = { id: "9001", role: "user", text: "x", created_at: NOW, sender: me }, a = { id: "9002", role: "assistant", text: "mine", created_at: NOW, sender: null };
+  const b = { id: "9003", role: "assistant", text: "more", created_at: NOW, sender: null };
+  const session = { id: "202", agent: { slug: "hermes", name: "Hermes" } };
+  onPoll((n) => {
+    fake.state.next = { status: 200, body: { data: n === 1 ? { session, messages: [u, a], turn: { state: "running" } } : { session, messages: [u, a, b], turn: { state: "idle" } } } };
+  });
+  const r = await ask(["x", "--json"]);
+  const ids = JSON.parse(r.out).messages.map((m: any) => m.id);
+  expect([r.code, ids]).toEqual([0, ["9001", "9002", "9003"]]);
+  expect(r.err).toBe("");
+});
+
+// A server that reports no start time (null in the 202) behaves as before: see "idle at accept time with the reply two polls later is still printed".
