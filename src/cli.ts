@@ -5,8 +5,11 @@ import {
   CliError, DEFAULT_HOST, api, defaultOrg, envKey, deleteCreds, deviceLogin, fail, loginWithToken, print, readCreds,
   resolveHost, resolveOrg, resolveToken, seg, usage, writeCreds, type Api, type Creds, type Exit, type Io, type Me, type OrgSource,
 } from "./core";
+import { askPlan } from "./ask";
+import { briefingPlan } from "./briefing";
 import { crmPlan } from "./crm";
 import { dayPlan } from "./days";
+import { sessionsPlan } from "./sessions";
 import { subscriptionPlan } from "./subscriptions";
 import { checkFlags, taskPlan } from "./tasks";
 import { ago, clean, delivery, keyValue, table, when } from "./format";
@@ -46,6 +49,9 @@ const USAGE = `usage: olympus <command> [flags]
   subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>
   subscription create --name N --url URL --event T... ('*' = all) | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]
   event-types   (event names for --event)
+  ask AGENT TEXT|- [--session ID] [--timeout SECONDS] [--no-wait]   (exit 1 turn failed, 5 timeout, 6 no agent or session closed)
+  sessions [--closed | --all] [--agent SLUG] [--page N]   session get <id> [--after MSG_ID] | session close <id>
+  briefing [--day YYYY-MM-DD] [--request]   version | --version
 global flags: --json --host URL --org SLUG -h
 env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG
 exit: 0 ok, 1 usage, 2 auth, 3 not found, 4 forbidden, 5 server/network, 6 invalid or conflict, 130 cancelled
@@ -70,9 +76,14 @@ const OPTIONS = {
     "person-email lost-reason version new email due phone job-title linkedin-url notes domain website industry city url").split(" ")
     .map((k) => [k, { type: "string" }])),
   event: { type: "string", multiple: true },
+  session: { type: "string" }, timeout: { type: "string" }, after: { type: "string" }, day: { type: "string" },
+  wait: { type: "boolean" }, closed: { type: "boolean" }, all: { type: "boolean" }, request: { type: "boolean" },
   archived: { type: "boolean" }, none: { type: "boolean" }, active: { type: "boolean" }, inactive: { type: "boolean" },
 } as const;
 const LEGACY = ["yes", "name", "agent", "instructions", "instructions-file", "full-tools", "with-token", "browser"];
+// Set by `bun build --define OLYMPUS_VERSION=...` on a tagged release; source and local builds report "dev".
+declare const OLYMPUS_VERSION: string;
+const VERSION = typeof OLYMPUS_VERSION === "string" ? OLYMPUS_VERSION : "dev";
 const SOURCE: Record<OrgSource, string> = {
   flag: "--org", env: "OLYMPUS_ORG", pin: "token pin", stored: "saved by olympus org use", only: "only membership",
 };
@@ -99,6 +110,10 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
   let json = argv.includes("--json");
   let host = "";
   let orgFromCreds: string | undefined;
+  // `ask` only: aborted by Ctrl-C (listener around the plan below) or by io.signal; other commands never see it.
+  const ctl = new AbortController();
+  const signal = io.signal ? AbortSignal.any([ctl.signal, io.signal]) : ctl.signal;
+  if (argv.length === 1 && argv[0] === "--version") { io.out(`olympus ${VERSION}\n`); return 0; }
   let byId = false; // webhook <verb> <id>: a 404 may be the webhook, not the org, so no stored-org hint
   try {
     let parsed;
@@ -120,7 +135,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     if (!pos.length) { io.err(USAGE); return 1; }
     const [cmd, sub, arg] = pos;
     byId = (cmd === "webhook" && arg !== undefined) || (cmd === "task" && pos.length >= 3 && sub !== "list" && sub !== "add") ||
-      (cmd === "crm" && pos.length >= 4 && pos[2] !== "add") || (cmd === "subscription" && pos.length >= 3 && sub !== "create");
+      (cmd === "crm" && pos.length >= 4 && pos[2] !== "add") || (cmd === "subscription" && pos.length >= 3 && sub !== "create") ||
+      (cmd === "session" && pos.length >= 3) || (cmd === "ask" && v.session !== undefined);
     const want = (n: number) => { if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`); };
     const now = () => (io.now ?? Date.now)();
     const warnEnv = () => { if (envKey(io)) io.err("warning: OLYMPUS_API_KEY is set and overrides stored credentials\n"); };
@@ -158,6 +174,13 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       const deleted = await deleteCreds(io);
       print(io, json, { data: { deleted } }, () => (deleted ? "logged out" : "no stored credentials"),
         () => (deleted ? "Logged out; stored credentials removed." : "Not logged in; no stored credentials."));
+      return 0;
+    }
+
+    if (cmd === "version") {
+      want(1);
+      checkFlags(v, []);
+      print(io, json, { data: { version: VERSION } }, () => `olympus ${VERSION}`);
       return 0;
     }
 
@@ -297,6 +320,12 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       plan = crmPlan(pos, v, io, json, now);
     } else if (cmd === "subscription" || cmd === "event-types") {
       plan = subscriptionPlan(pos, v, io, json, now);
+    } else if (cmd === "sessions" || cmd === "session") {
+      plan = sessionsPlan(pos, v, io, json, now);
+    } else if (cmd === "briefing") {
+      plan = briefingPlan(pos, v, io, json, now);
+    } else if (cmd === "ask") {
+      plan = await askPlan(pos, v, io, json, now, signal);
     } else throw usage(`unknown command: ${pos.join(" ")}`);
 
     // An env key makes a malformed file irrelevant, except to `org use`, which would overwrite what it cannot read.
@@ -307,7 +336,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     host = resolveHost(v.host, io, creds);
     // A stored org belongs to the host it was saved for.
     const scoped: Creds = { ...creds, org: creds.host === host ? creds.org : undefined };
-    const call = api(host, resolveToken(host, io, creds));
+    const call = api(host, resolveToken(host, io, creds), undefined, cmd === "ask" ? signal : undefined);
     let meCache: Promise<Me> | undefined;
     const me = () => (meCache ??= call("GET", "/me").then((b) => b.data as Me));
     const org = async () => {
@@ -316,7 +345,18 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       if (r.from === "stored") orgFromCreds = r.slug;
       return r.slug;
     };
-    await plan(call, org, creds, me, scoped);
+    if (cmd !== "ask") {
+      await plan(call, org, creds, me, scoped);
+      return 0;
+    }
+    // Attached only here: askPlan has already read stdin, so Ctrl-C while typing keeps its default behaviour.
+    const abort = () => ctl.abort();
+    process.once("SIGINT", abort);
+    try {
+      await plan(call, org, creds, me, scoped);
+    } finally {
+      process.off("SIGINT", abort);
+    }
     return 0;
   } catch (e) {
     if (e instanceof CliError) return fail(io, json, e, { orgFromCreds: byId ? undefined : orgFromCreds });

@@ -30,12 +30,16 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 404 | `not_found` | not found, or an organization you cannot see (also: a token limited to another organization) |
 | 409 | `conflict` | the record changed since you read it; `details.current` may carry the current record |
 | 409 | `crm_not_set_up` | this organization's CRM is not set up yet |
+| 409 | `busy` | the agent is still answering the last message; see `Retry-After` (seconds), then send the same message again (see [Sessions](#sessions-ask-an-agent)) |
+| 409 | `session_closed` | the session is closed; open a new one |
+| 409 | `no_agent` | this organization has no agent to ask |
+| 409 | `briefing_not_set_up` | you have not set up your briefing yet (see [Briefings](#briefings)) |
 | 409 | `machine_needs_update` / `route_missing` | the organization's agent machine needs an update, or no longer has this webhook |
 | 422 | `invalid` | `details.fields` is `{field: ["message", …]}` |
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
 | 503 | `crm_unavailable` | the CRM cannot be reached right now; see `Retry-After` (seconds) |
-| 503 | `machine_not_ready` | the agent machine is unreachable or not connected; nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)); with an `Idempotency-Key` follow the message: it says whether a retry with the same key is safe or to read the record and not repeat the request (see [Idempotent creates](#idempotent-creates)) |
+| 503 | `machine_not_ready` | the agent machine is unreachable or not connected (a session read never returns an empty list instead); nothing was saved, except a CRM write with `details.saved: true`, which may already be saved (see [CRM](#crm)); with an `Idempotency-Key` follow the message: it says whether a retry with the same key is safe or to read the record and not repeat the request (see [Idempotent creates](#idempotent-creates)) |
 | 503 | `machine_uncertain` | an update may have been half-applied on the machine; read the webhook again |
 
 Limit: 60 requests per minute per token.
@@ -69,6 +73,9 @@ POST   /orgs/:org/tasks/:id/breakdown[?week]             {agent?} → {data:{tas
 GET    /orgs/:org/days[?week]                            → {data:{week, days:[{day, closed, closed_at, score, entry}]}}
 GET    /orgs/:org/days/:day                              → {data:{day, closed, closed_at, score, entry|null}}
 PUT    /orgs/:org/days/:day                              {shipped?, blockers?, learnings?, reflection?, close?} → {data:{…as GET…}}
+
+GET    /orgs/:org/sessions[/:id]                         → ask an agent: also POST, POST …/messages, DELETE (see Sessions)
+GET    /orgs/:org/briefings/today | /:day                → {data:briefing}; POST /briefings/today asks for one (see Briefings)
 
 GET    /orgs/:org/crm/…                                  → CRM: pipelines, tags, search, deals, people, companies (see CRM)
 GET    /orgs/:org/subscriptions[/:id]                    → {data:[sub…]} | {data:sub}; also POST, PATCH, DELETE, rotate_secret, ping (see Subscriptions)
@@ -242,6 +249,92 @@ has `entry:null`, `closed:false`, `closed_at:null`, `score:null`.
 - **Read-only.** `summary`, `score` and `agent_note` are computed by the server; they cannot be set
   through this endpoint. Closing a week is not available through the API.
 - Types are strict; a wrong type is 422 on that field.
+
+## Sessions (ask an agent)
+
+A session is a conversation with one agent. Any member can open one and talk to any active agent in
+the organization. A session is private to the person who opened it and its participants; to anyone
+else it is a plain 404 `not_found`. Responses carry `Cache-Control: no-store`.
+
+```
+GET    /orgs/:org/sessions[?state=open|closed|all&agent=<slug>&page=N]  → {data:{sessions:[session…], total, page, per}}
+POST   /orgs/:org/sessions                {agent, title?}               → 201 {data:session}
+GET    /orgs/:org/sessions/:id[?after=<message id>]                     → {data:{session, messages:[message…], turn}}
+POST   /orgs/:org/sessions/:id/messages   {text}                        → 202 {data:{turn}}
+DELETE /orgs/:org/sessions/:id                                          → {data:session}
+```
+
+```jsonc
+// session
+{ "id": "123", "agent": {"slug": "hermes", "name": "Hermes"}, "title": null,   // string or null
+  "state": "open",                                  // "open" | "closed"
+  "opened_by": {"id": "u_12", "name": "Ada"},       // or null
+  "created_at": "…", "last_activity_at": null,      // ISO 8601; last_activity_at may be null
+  "turn": turn }
+// turn
+{ "state": "idle", "started_at": null, "error": null }
+//   state: "idle" | "queued" | "running" | "failed"
+//   started_at: ISO 8601 or null. It names the turn: it is set when a turn is accepted, stays the same
+//   until that turn ends, and is null when idle. error: a short reason when state is "failed", otherwise null
+// message
+{ "id": "1001", "role": "user", "text": "…", "created_at": "…", "sender": {"id": "u_12", "name": "Ada"} }
+//   role: "user" | "assistant"; sender is who typed a user message. It is null on assistant messages,
+//   and on a user message whose author is unknown or no longer in the organization
+```
+
+Only the text of user and assistant messages is exposed: no tool calls, tool output or file paths.
+
+- **List.** `state` defaults to `open`; newest activity first. A bad `state` or `page` is 422 on that field.
+- **Open.** `agent` is the agent's `profile_name`; an unknown or paused agent is 422 `fields.agent`.
+  `title` is optional, at most 100 characters (422 `fields.title`). Any other key is 422 on that key.
+  Opening a session does not start a turn; send a message next. 409 `no_agent` when the organization has no agent.
+- **Read.** Without `after` you get the whole thread, capped at the **last 200 messages**. With
+  `?after=<message id>` you get only the messages after that id, in order; an id that is not in this
+  session is 422 `fields.after`, except an id the session used to have: after the agent compacts a long
+  conversation, an older id answers 200 with the messages after its position, which can include ones you
+  have already seen. De-duplicate by `id`. `turn` is the same object as `session.turn`. Message text is read
+  live from the agent's machine and is not stored by the API; if the machine cannot be reached the
+  answer is 503 `machine_not_ready`, never an empty `messages` list that looks like an empty conversation.
+- **Send.** `text` is a non-blank string up to a server-defined maximum (422 `fields.text` otherwise).
+  The reply is 202 with the turn, which starts `queued`. The agent answers asynchronously.
+- **Close.** `DELETE` closes the session and returns it with `state: "closed"`. The transcript is kept.
+  Sending to a closed session is 409 `session_closed`.
+
+**One turn at a time.** While the agent is still answering, another message is 409 `busy` with
+`Retry-After` (seconds). The API does not queue the message and does not steer the running turn: wait
+that long and send the same message again, so every message gets exactly one reply.
+
+**Waiting for a reply.** After the 202, poll `GET /sessions/:id?after=<id of the last message you have>`
+about every 2 seconds, and honour `Retry-After` on any 429 or 503. The turn is over when `turn.state`
+is `idle` (the reply is normally in `messages`; if it is not there yet, read again shortly) or `failed` (`turn.error` says why). Replies can take minutes. The 202 does not identify the accepted message, so a client recognises its own message in `messages` by `sender.id` (its own user id) and the text it sent; if someone else sends a message in the same session at the same moment, the replies cannot be told apart exactly.
+
+## Briefings
+
+A briefing is the morning summary your own agent writes for you. These routes only ever show **your
+own** briefing, never a teammate's. Responses carry `Cache-Control: no-store`.
+
+```
+GET  /orgs/:org/briefings/today          → {data:briefing}
+GET  /orgs/:org/briefings/:day           → {data:briefing}    # YYYY-MM-DD
+POST /orgs/:org/briefings/today          → 202 {data:briefing}
+```
+
+```jsonc
+{ "day": "2026-10-12", "state": "ready",     // "none" | "pending" | "ready" | "failed"
+  "document": {…},                           // an object when ready, otherwise null
+  "session_id": "123", "requested_at": "…" } // both null while state is "none"
+```
+
+- A day with no briefing is `state: "none"` with 200, not a 404. A `:day` that is not a valid date is
+  422 `fields.day`.
+- `pending` means the agent is writing it; `failed` means it could not. Poll `GET /briefings/today`
+  until it is `ready` or `failed`. `session_id` is the session in which the agent wrote it.
+- `document` is present only when the state is `ready`. Its fields are set by the server and can
+  grow over time: read the ones you know and ignore the rest.
+- `POST /briefings/today` asks your agent to write today's briefing and answers 202 with the briefing
+  (normally `pending`). Repeating it is safe: it does not start a second one.
+- Errors: 409 `briefing_not_set_up` when you have not set up your briefing yet; 409 `no_agent` when the
+  organization has no agent; 503 `machine_not_ready` when the agent machine cannot be reached.
 
 ## CRM
 

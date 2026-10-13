@@ -119,7 +119,7 @@ test("AC10 outputs: piped is the detail form, TTY is the sentence then the block
   expect(await tty(["deal", "company", "d_renewal", "c_initech"])).toStartWith("Linked company Initech to deal d_renewal.\n\n");
   expect(await tty(["deal", "person", "d_renewal", "pe_dana"])).toStartWith("Linked Dana Lee to deal d_renewal.\n\n");
   expect(await tty(["deal", "note", "d_renewal", "hi"])).toStartWith("Added a note to deal d_renewal.\n\n");
-  expect(await tty(["deal", "task", "add", "d_renewal", "T"])).toMatch(/^Added task ct_[0-9a-z]+ to deal d_renewal\.\n\n/);
+  expect(await tty(["deal", "task", "add", "d_renewal", "T"])).toStartWith("Added a task to deal d_renewal.\n\n");
   expect(await tty(["deal", "task", "done", "d_renewal", "ct_1"])).toStartWith("Marked task ct_1 done.\n\n");
   expect(await tty(["deal", "task", "done", "d_renewal", "ct_1", "--undo"])).toStartWith("Marked task ct_1 not done.\n\n");
   expect(await tty(["deal", "archive", "d_renewal"])).toStartWith("Archived deal d_renewal.\n\n");

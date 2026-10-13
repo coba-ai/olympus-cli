@@ -22,6 +22,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun script/build-release.ts
       - run: ./dist/olympus-linux-x64 -h
+      - if: github.ref_type == 'tag'
+        run: test "$(./dist/olympus-linux-x64 --version)" = "olympus ${GITHUB_REF_NAME#v}"
       - run: (cd dist && sha256sum -c SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:

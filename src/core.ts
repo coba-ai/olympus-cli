@@ -14,6 +14,7 @@ export type Io = {
   openBrowser?: (url: string) => void;
   ask?: (prompt: string) => Promise<string | null>;
   close?: () => void;
+  signal?: AbortSignal; // test seam: aborts `ask` like Ctrl-C does
 };
 export type Exit = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 130;
 type ApiErrorBody = { error: { code: string; message: string; details?: unknown } };
@@ -151,8 +152,10 @@ export async function create(call: Api, path: string, body: unknown, key: string
   }
 }
 
+const SEMANTIC_409 = ["conflict", "crm_not_set_up", "no_agent", "session_closed", "briefing_not_set_up"];
+
 export function exitForStatus(status: number, code?: string): Exit {
-  if (status === 409 && (code === "conflict" || code === "crm_not_set_up")) return 6;
+  if (status === 409 && code !== undefined && SEMANTIC_409.includes(code)) return 6;
   if (status === 401) return 2;
   if (status === 404) return 3;
   if (status === 403) return 4;
@@ -268,7 +271,7 @@ export async function loginWithToken(io: Io, host: string, token: string, signal
   return me;
 }
 
-const realSleep = (ms: number, signal?: AbortSignal) =>
+export const realSleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((res) => {
     const done = () => (clearTimeout(t), signal?.removeEventListener("abort", done), res());
     const t = setTimeout(done, ms);
