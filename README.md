@@ -203,9 +203,12 @@ honours `Retry-After`), which is about 30 requests a minute, under the 60 a minu
 is whole seconds, default 300, at most 86400. If the agent is busy with another message in that session
 the CLI waits and retries until the timeout. `--session ID` continues a session instead of opening one
 (the agent must match the session's; otherwise exit 6, `agent_mismatch`). `--no-wait` sends and returns at
-once without a reply (it cannot be combined with `--timeout`). Stop waiting with Ctrl-C: the message is
-already sent, and the session id is printed so you can read the reply later with `olympus session get ID`.
-Only sessions you opened are visible to you. `sessions` lists open sessions (`--closed`, or `--all`;
+once without a reply (it cannot be combined with `--timeout`). Stop waiting with Ctrl-C (exit 130); what it
+prints depends on when you stop: before the message is sent, that nothing was sent; while it is being sent,
+that it may have been sent (check `olympus session get ID`); after, the session id to read the reply later
+with `olympus session get ID`. The message endpoint's 202 does not identify the accepted message, so if someone
+else sends a message in the same session at the same moment, the replies cannot be told apart exactly;
+`olympus ask` matches the reply to the text it sent. Only sessions you opened or take part in are visible to you. `sessions` lists open sessions (`--closed`, or `--all`;
 `--agent` filters by slug). `session get ID` prints the thread (the last 200 messages; `--after MSG_ID` only
 newer ones) and `session close ID` closes a session; its transcript is kept. `briefing` shows your morning
 briefing for today (`--day` for another date); `--request` asks your agent to write today's. It is exit 6
@@ -330,7 +333,7 @@ newline in task text never splits a row; nothing is printed for an empty list):
 | 2 | auth (401, or no token) |
 | 3 | not found (404, non-member, pin mismatch) |
 | 4 | forbidden (403) |
-| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, a timeout (`timeout`), or an agent machine that is not ready |
+| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, a timeout (`timeout`), or an agent machine that is not ready (for `ask`, `busy` and `machine_not_ready` mean nothing was sent; `timeout` and `network_error` mean it was or may have been: read with `session get` before asking again) |
 | 6 | invalid (400, 422), a 409 conflict ("changed since you read it"), "CRM not set up", `no_agent` (the organization has no agent), `session_closed`, `briefing_not_set_up`, and `ask` `agent_mismatch` |
 | 130 | cancelled (Ctrl-C during login, credentials untouched; a cancelled `day close` prompt, nothing saved; or Ctrl-C during `ask`, which prints the session id) |
 
