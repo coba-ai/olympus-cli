@@ -59,10 +59,25 @@ test("the new flags are accepted by the parser but refused by commands that do n
 });
 
 test("ask, sessions, session and briefing are dispatched, not unknown commands", async () => {
-  for (const args of [["ask"], ["sessions", "--closed"], ["session", "get", "x"], ["briefing", "--request"]]) {
+  const base = "/api/v1/orgs/acme";
+  const cases: [string[], string | null][] = [
+    [["ask"], null],
+    [["sessions", "--closed"], `GET ${base}/sessions?state=closed`],
+    [["session", "get", "x"], `GET ${base}/sessions/x`],
+    [["briefing", "--request"], `POST ${base}/briefings/today`],
+  ];
+  for (const [args, hit] of cases) {
+    fake.state.requests.length = 0;
     const r = await cli(args);
     expect(r.err).not.toContain("unknown command");
-    expect(r.out).toBe("");
+    const seen = fake.state.requests.map((q) => `${q.method} ${q.path}${q.search}`);
+    if (hit === null) {
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("ask needs an agent and TEXT");
+      expect(seen).toEqual([]);
+    } else {
+      expect(seen).toContain(hit);
+    }
   }
 });
 
