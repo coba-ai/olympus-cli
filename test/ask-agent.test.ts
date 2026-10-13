@@ -140,6 +140,37 @@ test("another client's messages while we wait for a busy agent are not part of o
   expect(gets()[1]!.search).toBe("?after=1002");
 });
 
+test("another client's whole turn between our read and our accepted send is not part of our reply", async () => {
+  let first = true;
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "POST" && path.endsWith("/101/messages") && first) {
+      first = false;
+      appendMessage(fake.state, "acme", "101", "user", "teammate question", { id: "u_2", name: "Mate" });
+      appendMessage(fake.state, "acme", "101", "assistant", "teammate answer");
+    }
+  };
+  const r = await ask(["mine", "--session", "101"]);
+  expect([r.code, r.out]).toEqual([0, "Got it: mine\n"]);
+});
+
+test("no message is sent at or after the deadline, even when a nap runs out the clock", async () => {
+  fake.state.busy = 1000;
+  const r = await ask(["x", "--timeout", "12", "--json"]);
+  expect([r.code, errBody(r).code, r.sleeps]).toEqual([5, "busy", [5000, 5000, 2000]]);
+  expect(posts().filter((q) => q.path.endsWith("/messages"))).toHaveLength(3);
+});
+
+test("cancelling during the busy wait says nothing was sent", async () => {
+  fake.state.busy = 1000;
+  const ctl = new AbortController();
+  const r = await ask(["x"], { signal: ctl.signal, onSleep: () => ctl.abort() });
+  expect([r.code, r.out]).toEqual([130, ""]);
+  expect(r.err).toContain("cancelled; nothing was sent (session 202)");
+  expect(posts().filter((q) => q.path.endsWith("/messages"))).toHaveLength(1);
+  const j = await ask(["x", "--json"], { signal: ctl.signal });
+  expect([j.code, errBody(j).message]).toEqual([130, "cancelled; nothing was sent"]);
+});
+
 test("polling never runs faster than every two seconds", async () => {
   plan({ state: "running" });
   const r = await ask(["x", "--timeout", "10"]);
@@ -246,7 +277,7 @@ test("--no-wait: piped id, terminal sentence, json object; no read after the acc
   expect(gets()).toHaveLength(0);
   const t = await ask(["x", "--no-wait"], { tty: true });
   expect(t.out).toBe("Sent to Hermes in session 203. Read the reply later: olympus session get 203\n");
-  expect(t.err).toBe("session 203\n");
+  expect(t.err).toBe("");
   const j = JSON.parse((await ask(["x", "--no-wait", "--json"], { tty: true })).out);
   expect([j.session.id, j.messages, j.turn.state]).toEqual(["204", [], "queued"]);
 });

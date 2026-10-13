@@ -24,7 +24,11 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
     let sid = "", tag = ""; // tag: sid as safe to print
     const mk = (exit: 1 | 5 | 6 | 130, code: string, message: string) =>
       new CliError(exit, { error: { code, message, ...(sid ? { details: { session_id: sid } } : {}) } });
-    const cancelled = () => mk(130, "cancelled", sid ? `cancelled; read it later: olympus session get ${tag}` : "cancelled; nothing was sent");
+    let sent = 0; // 0: message not attempted, 1: POST in flight, 2: accepted
+    const cancelled = () =>
+      sent === 2 ? mk(130, "cancelled", `cancelled; read it later: olympus session get ${tag}`)
+      : sent === 1 ? mk(130, "cancelled", `cancelled; the message may have been sent; check olympus session get ${tag}`)
+      : mk(130, "cancelled", `cancelled; nothing was sent${sid && !json ? ` (session ${tag})` : ""}`);
     const req = async (method: "GET" | "POST", path: string, body?: unknown) => {
       if (signal.aborted) throw cancelled();
       try {
@@ -55,15 +59,19 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         if (typeof session?.id !== "string" || !session.id) throw new CliError(5, { error: { code: "bad_response", message: "unexpected response when opening the session" } });
         sid = session.id;
         tag = clean(sid);
-        if (io.tty && !json) io.err(`session ${tag}\n`);
+        if (io.tty && !json && !noWait) io.err(`session ${tag}\n`);
       }
 
       let turn: any;
       for (;;) {
         try {
+          if (signal.aborted) throw cancelled();
+          sent = 1;
           turn = (await req("POST", `${base}/${seg(sid)}/messages`, { text }))?.turn;
+          sent = 2;
           break;
         } catch (e) {
+          if (sent === 1 && e instanceof CliError && e.exit !== 130) sent = 0; // refused or failed: handled below
           if (!(e instanceof CliError)) throw e;
           // A network failure may have delivered the message, so it is never retried; a refusal (busy, rate limit) is safe to.
           if (e.status === undefined && e.body.error.code === "network_error") throw mk(5, "network_error", `the message may have been sent; check olympus session get ${tag}`);
@@ -72,6 +80,7 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
           if (left <= 0) throw mk(5, "busy", `the agent is still busy in session ${tag}; nothing was sent`);
           await nap(Math.min(retryMs(e) ?? 5000, left));
           after = lastId((await read(after))?.messages) ?? after; // skip what others wrote while we waited
+          if (deadline - now() <= 0) throw mk(5, "busy", `the agent is still busy in session ${tag}; nothing was sent`);
         }
       }
 
@@ -106,7 +115,9 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         after = lastId(ms) ?? after;
         turn = d?.turn ?? { state: "idle" };
         const st = typeof turn.state === "string" ? turn.state : "idle";
-        const first = got.findIndex((m) => m.role === "user");
+        // Exact correlation needs a message id the API does not return yet, so match on the text we sent.
+        const mine = got.findIndex((m) => m.role === "user" && m.text === text);
+        const first = mine >= 0 ? mine : got.findIndex((m) => m.role === "user");
         replies = first < 0 ? [] : got.slice(first + 1).filter((m) => m.role === "assistant");
         live ||= st !== "failed";
         const failure = () => mk(1, "turn_failed", `${clean(turn.error) || "the agent's turn failed"} (session ${tag})`);
