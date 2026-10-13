@@ -19,7 +19,7 @@ beforeEach(() => {
   delete s.machine;
 });
 
-type Opts = { tty?: boolean; stdin?: string; signal?: AbortSignal; onSleep?: (n: number) => void; env?: Record<string, string> };
+type Opts = { tty?: boolean; stdin?: string; signal?: AbortSignal; onSleep?: (n: number) => void; skew?: { ms: number }; env?: Record<string, string> };
 async function cli(args: string[], o: Opts = {}) {
   const home = await mkdtemp(join(tmpdir(), "oly-"));
   let out = "", err = "", reads = 0, clock = 0;
@@ -28,7 +28,7 @@ async function cli(args: string[], o: Opts = {}) {
     env: { OLYMPUS_HOST: fake.url, OLYMPUS_API_KEY: TOKENS.owner, OLYMPUS_ORG: "acme", ...o.env }, home,
     stdin: async () => { reads++; return o.stdin ?? ""; },
     out: (s) => { out += s; }, err: (s) => { err += s; }, tty: o.tty ?? false, signal: o.signal,
-    now: () => clock, sleep: async (ms) => { sleeps.push(ms); clock += ms; o.onSleep?.(sleeps.length); },
+    now: () => clock + (o.skew?.ms ?? 0), sleep: async (ms) => { sleeps.push(ms); clock += ms; o.onSleep?.(sleeps.length); },
   });
   return { code, out, err, reads, sleeps };
 }
@@ -386,4 +386,76 @@ test("usage errors send nothing", async () => {
     const r = await cli(a);
     expect([r.code, reqs().length]).toEqual([1, 0]);
   }
+});
+
+test("nothing is sent once the deadline has passed, even on the first attempt", async () => {
+  const skew = { ms: 0 };
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "POST" && path === P) skew.ms = 2000; // opening the session takes longer than --timeout
+  };
+  const r = await ask(["x", "--timeout", "1", "--json"], { skew });
+  const e = errBody(r);
+  expect([r.code, r.out, e.code, e.message, e.details.session_id]).toEqual([5, "", "timeout", "no time left to send; nothing was sent", "202"]);
+  expect(posts().filter((q) => q.path.endsWith("/messages"))).toHaveLength(0);
+});
+
+test("the reply stops at another sender's later question, even when it arrives in the same poll", async () => {
+  plan({ state: "idle", user: false });
+  let polls = 0;
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "GET" && path.endsWith("/101") && ++polls === 2) {
+      appendMessage(fake.state, "acme", "101", "user", "mine", { id: "u_1", name: "Me" });
+      appendMessage(fake.state, "acme", "101", "assistant", "mine answer");
+      appendMessage(fake.state, "acme", "101", "user", "teammate question", { id: "u_2", name: "Mate" });
+      appendMessage(fake.state, "acme", "101", "assistant", "teammate answer");
+    }
+  };
+  const r = await ask(["mine", "--session", "101", "--json"]);
+  expect(r.code).toBe(0);
+  const j = JSON.parse(r.out);
+  expect(j.messages.map((m: any) => m.text)).toEqual(["mine", "mine answer", "teammate question", "teammate answer"]);
+  polls = 0;
+  fake.state.sessions = seedSessions(NOW);
+  plan({ state: "idle", user: false });
+  const t = await ask(["mine", "--session", "101"]);
+  expect([t.code, t.out]).toEqual([0, "mine answer\n"]);
+});
+
+test("the person's own later message is folded into the reply", async () => {
+  plan({ state: "idle", user: false });
+  let polls = 0;
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "GET" && path.endsWith("/101") && ++polls === 2) {
+      const me = { id: "u_1", name: "Me" };
+      appendMessage(fake.state, "acme", "101", "user", "mine", me);
+      appendMessage(fake.state, "acme", "101", "assistant", "first");
+      appendMessage(fake.state, "acme", "101", "user", "steer", me);
+      appendMessage(fake.state, "acme", "101", "assistant", "second");
+    }
+  };
+  expect((await ask(["mine", "--session", "101"])).out).toBe("first\n\nsecond\n");
+});
+
+test("stdin text with a trailing newline still matches the server's trimmed copy", async () => {
+  plan({ state: "idle", reply: ["mine reply"] });
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "POST" && path.endsWith("/101/messages")) {
+      appendMessage(fake.state, "acme", "101", "user", "teammate question", { id: "u_2", name: "Mate" });
+      appendMessage(fake.state, "acme", "101", "assistant", "teammate answer");
+    } else if (method === "GET") {
+      const live = fake.state.sessions.acme!.find((x) => x.id === "101")!._live;
+      if (live) live.text = live.text.trim(); // the server strips what it stores
+    }
+  };
+  const r = await ask(["-", "--session", "101"], { stdin: "mine\n" });
+  expect([r.code, r.out]).toEqual([0, "mine reply\n"]);
+});
+
+test("cancelling while the message is in flight says it may have been sent", async () => {
+  const ctl = new AbortController();
+  fake.state.onRequest = ({ method, path }) => {
+    if (method === "POST" && path.endsWith("/messages")) ctl.abort();
+  };
+  const r = await ask(["x", "--json"], { signal: ctl.signal });
+  expect([r.code, r.out, errBody(r).message]).toEqual([130, "", "cancelled; the message may have been sent; check olympus session get 202"]);
 });

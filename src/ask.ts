@@ -24,10 +24,11 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
     let sid = "", tag = ""; // tag: sid as safe to print
     const mk = (exit: 1 | 5 | 6 | 130, code: string, message: string) =>
       new CliError(exit, { error: { code, message, ...(sid ? { details: { session_id: sid } } : {}) } });
-    let sent = 0; // 0: message not attempted, 1: POST in flight, 2: accepted
+    let sent: "none" | "inflight" | "accepted" = "none";
+    let sawBusy = false;
     const cancelled = () =>
-      sent === 2 ? mk(130, "cancelled", `cancelled; read it later: olympus session get ${tag}`)
-      : sent === 1 ? mk(130, "cancelled", `cancelled; the message may have been sent; check olympus session get ${tag}`)
+      sent === "accepted" ? mk(130, "cancelled", `cancelled; read it later: olympus session get ${tag}`)
+      : sent === "inflight" ? mk(130, "cancelled", `cancelled; the message may have been sent; check olympus session get ${tag}`)
       : mk(130, "cancelled", `cancelled; nothing was sent${sid && !json ? ` (session ${tag})` : ""}`);
     const req = async (method: "GET" | "POST", path: string, body?: unknown) => {
       if (signal.aborted) throw cancelled();
@@ -66,28 +67,29 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
       for (;;) {
         try {
           if (signal.aborted) throw cancelled();
-          sent = 1;
+          if (deadline - now() <= 0) throw mk(5, sawBusy ? "busy" : "timeout", `${sawBusy ? `the agent is still busy in session ${tag}` : "no time left to send"}; nothing was sent`);
+          sent = "inflight";
           turn = (await req("POST", `${base}/${seg(sid)}/messages`, { text }))?.turn;
-          sent = 2;
+          sent = "accepted";
           break;
         } catch (e) {
-          if (sent === 1 && e instanceof CliError && e.exit !== 130) sent = 0; // refused or failed: handled below
+          if (sent === "inflight" && e instanceof CliError && e.exit !== 130) sent = "none"; // refused or failed: handled below
           if (!(e instanceof CliError)) throw e;
           // A network failure may have delivered the message, so it is never retried; a refusal (busy, rate limit) is safe to.
           if (e.status === undefined && e.body.error.code === "network_error") throw mk(5, "network_error", `the message may have been sent; check olympus session get ${tag}`);
           if (e.status !== 429 && !(e.status === 409 && e.body.error.code === "busy")) throw e;
+          sawBusy ||= e.status === 409;
           const left = deadline - now();
           if (left <= 0) throw mk(5, "busy", `the agent is still busy in session ${tag}; nothing was sent`);
           await nap(Math.min(retryMs(e) ?? 5000, left));
           after = lastId((await read(after))?.messages) ?? after; // skip what others wrote while we waited
-          if (deadline - now() <= 0) throw mk(5, "busy", `the agent is still busy in session ${tag}; nothing was sent`);
         }
       }
 
       if (noWait) {
         const body = { session, messages: [], turn };
-        const sent = `Sent to ${clean(session?.agent?.name ?? agent)} in session ${tag}. Read the reply later: olympus session get ${tag}`;
-        return print(io, json, body, () => tag, () => sent);
+        const line = `Sent to ${clean(session?.agent?.name ?? agent)} in session ${tag}. Read the reply later: olympus session get ${tag}`;
+        return print(io, json, body, () => tag, () => line);
       }
 
       const got: any[] = [];
@@ -116,9 +118,12 @@ export async function askPlan(pos: string[], v: Record<string, unknown>, io: Io,
         turn = d?.turn ?? { state: "idle" };
         const st = typeof turn.state === "string" ? turn.state : "idle";
         // Exact correlation needs a message id the API does not return yet, so match on the text we sent.
-        const mine = got.findIndex((m) => m.role === "user" && m.text === text);
+        const mine = got.findIndex((m) => m.role === "user" && m.text?.trim() === text.trim());
         const first = mine >= 0 ? mine : got.findIndex((m) => m.role === "user");
-        replies = first < 0 ? [] : got.slice(first + 1).filter((m) => m.role === "assistant");
+        // The reply ends at the next user message that is not provably from the same sender (a missing sender id counts as different).
+        const who = first < 0 ? undefined : got[first].sender?.id;
+        const end = first < 0 ? -1 : got.findIndex((m, i) => i > first && m.role === "user" && !(who && m.sender?.id === who));
+        replies = first < 0 ? [] : got.slice(first + 1, end < 0 ? undefined : end).filter((m) => m.role === "assistant");
         live ||= st !== "failed";
         const failure = () => mk(1, "turn_failed", `${clean(turn.error) || "the agent's turn failed"} (session ${tag})`);
         if (st === "failed" && (first >= 0 || live)) throw failure();
