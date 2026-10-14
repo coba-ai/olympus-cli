@@ -187,25 +187,59 @@ describe("A2 claim and store", () => {
     expect(e.message).toContain(fileOf());
   });
 
-  test("the raw token reaches no sink: pairing prints nothing, and no error body carries it", async () => {
-    const { machine } = await pair(fake.url, { name: "quiet" });
+  test("a token-shaped string the server controls reaches no sink: relay url, machine id, name, a non-404 body", async () => {
+    // Obviously fake, and lower case on purpose: `new URL` lower-cases a host, so a mixed-case literal
+    // would make the redirect channel below pass without testing anything.
+    const LEAK = "obm_fake_not_a_real_token";
+    const good = { token: "obm_fake_machine_token", machine_id: "bm_0000000000000001", relay_url: relayOf(fake) };
+    const errs: CliError[] = [];
+    // Every refusal is checked for the two things a leak would need: a thrown message, and a file.
+    const refused = async (next: NonNullable<typeof fake.state.next>) => {
+      fake.state.next = next;
+      const e = await thrown(pair(fake.url));
+      errs.push(e);
+      expect(await text()).toBeNull();
+      return e;
+    };
+
+    // 1. The relay url, in a query and as the host itself.
+    for (const relay_url of [`wss://127.0.0.1:1/api/v1/browser/relay?token=${LEAK}`, `wss://${LEAK}.example.test/relay`])
+      expect((await refused({ status: 201, body: { data: { ...good, relay_url } } })).body.error.code).toBe("bad_response");
+    // 2. A machine id that IS the response's token: refused on its format rather than stored and printed.
+    expect((await refused({ status: 201, body: { data: { ...good, token: LEAK, machine_id: LEAK } } })).body.error.code).toBe("bad_response");
+    // 3. A non-404 refusal: message, details.fields and Retry-After are all strings a stranger chose
+    // (the pair route is unauthenticated), and fail() prints all three.
+    await refused({
+      status: 500,
+      body: { error: { code: "boom", message: `the server broke: ${LEAK}`, details: { fields: { code: [LEAK] } } } },
+      headers: { "Retry-After": LEAK },
+    });
+    // 4. A 3xx: fail() prints the Location's host as "redirected to …".
+    await refused({ status: 302, body: "", headers: { Location: `https://${LEAK}.example.test/` } });
+    // 5. The 404, whose message is written in this repo.
+    errs.push(await thrown(pair(fake.url, { code: "NOSUCHCD" })));
+
+    // A real claim: the token the server actually minted must reach no sink either, and pairing prints nothing.
+    const real = (await pair(fake.url, { name: "quiet" })).machine;
     expect([io.o, io.e]).toEqual([[], []]);
 
-    const errs: CliError[] = [];
-    fake.state.next = { status: 201, body: { data: { token: machine.token, machine_id: "bm_1", relay_url: "wss://evil.example.test/relay" } } };
-    errs.push(await thrown(pair(fake.url, { code: "SECONDCD" })));
-    fake.state.next = { status: 201, body: { data: { token: machine.token, relay_url: relayOf(fake) } } };
-    errs.push(await thrown(pair(fake.url, { code: "THIRDCDE" })));
-    fake.state.next = { status: 500, body: { error: { code: "boom", message: "the server broke" } } };
-    errs.push(await thrown(pair(fake.url, { code: "FOURTHCD" })));
-    errs.push(await thrown(pair(fake.url, { code: "NOSUCHCD" })));
-    await writeFile(fileOf(), `{"machines":{"h":{"token":"${machine.token}"}}}`);
+    // 6. A name the server sends back: the client stores the one it sent.
+    fake.state.next = { status: 201, body: { data: { ...good, name: LEAK } } };
+    const { machine } = await pair(fake.url, { code: "SECONDCD", name: "studio" });
+    expect(machine).toEqual({ machine_id: good.machine_id, token: good.token, name: "studio" });
+
+    // 7. The file, which holds a real token and is read back on every attach.
+    await writeFile(fileOf(), `{"machines":{"h":{"token":"${real.token}"}}}`);
     errs.push(await thrown(readBrowserMachine(io, "h")));
 
-    for (const e of errs) for (const json of [true, false]) fail(io, json, e);
+    for (const e of errs) {
+      expect(e.message).not.toContain(LEAK);
+      expect(JSON.stringify(e.body)).not.toContain(LEAK);
+      for (const json of [true, false]) fail(io, json, e);
+    }
     const all = [...io.o, ...io.e].join("");
     expect(all.length).toBeGreaterThan(0);
-    expect(all).not.toContain(machine.token);
+    for (const secret of [LEAK, real.token, good.token]) expect(all).not.toContain(secret);
     expect(io.o).toEqual([]);
   });
 });

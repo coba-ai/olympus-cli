@@ -29,6 +29,7 @@ import {
   encodeCdp,
   encodeFrame,
   isWorkbenchStream,
+  type CdpReader,
   type CdpSend,
   type Frame,
   type Op,
@@ -60,10 +61,25 @@ const RESUME_BELOW = 1024 * 1024;
 const DRAIN_POLL_MS = 50;
 
 // The length prefix inside a `cdp` stream is attacker-controlled (§3: the workbench side is the
-// untrusted one) and `cdpReader` trusts it, so the bytes it holds for a message that never completes
-// are bounded here instead. The number is a choice, not a measurement: this direction carries CDP
-// commands, which are small, and the largest legitimate one anybody has named is a script body.
+// untrusted one), so every `cdp` stream's reader is given this as its `max`: a prefix declaring more
+// is refused before its body is buffered, and the reader's tail is therefore always under it. The
+// number is a choice, not a measurement: this direction carries CDP commands, which are small, and
+// the largest legitimate one anybody has named is a script body.
 const CDP_REASSEMBLY_CEILING = 16 * 1024 * 1024;
+
+// Two aggregate bounds, because the per-stream ceiling alone multiplies by however many streams the
+// peer opens, and every fresh odd-id OPEN costs a reader, a filter, a task and eventually a Chromium
+// WebSocket. Both numbers are choices, not measurements.
+//
+// MAX_CDP_STREAMS bounds how many `cdp` streams are live at once; an OPEN past it is answered with
+// CLOSE and never reaches Chromium, and closing one makes room again. Chromium drives one, and a
+// bridge reconnecting may briefly hold a second, so eight is slack rather than a fit.
+//
+// CDP_REASSEMBLY_TOTAL bounds the sum of every reader's held tail. A DATA frame that would carry the
+// total past it closes the stream it arrived on, before the reader buffers it — so the sum never
+// exceeds the number, rather than exceeding it by a frame.
+const MAX_CDP_STREAMS = 8;
+const CDP_REASSEMBLY_TOTAL = 32 * 1024 * 1024;
 
 const STALLED =
   "the organization's agent machine is not answering the relay; it may be on an older image — ask an operator to redeploy it";
@@ -93,6 +109,15 @@ export type CdpChannel = {
   onMessage?: (message: string) => void;
   /** The workbench closed the stream, the socket dropped, or we killed it. */
   onClose?: () => void;
+  /**
+   * A5, set by the consumer on the tick the stream is handed over, like `onMessage`: stop and
+   * restart reading from whatever feeds this stream — the CDP socket to Chromium. The relay calls
+   * them while its own `bufferedAmount` is over A5's threshold and when it drains, and on a stream
+   * registered while that pause is already active. Nothing sets them today, so the CDP side of the
+   * pause does not reach Chromium; this is the seam for wiring it, not the wiring.
+   */
+  pause?: () => void;
+  resume?: () => void;
 };
 
 /** One line of `--json` per state change (Assumption 11), rendered by the command. Never carries the token. */
@@ -166,12 +191,24 @@ const STOP: Record<number, { exit: 2 | 5 | 6; code: string; message: string }> =
 type Entry = {
   data: (bytes: Uint8Array) => void;
   gone: () => void;
-  /** Only a laptop-opened `tcp:` stream has these: an ACK to deliver, and a local socket to pause. */
+  /** Only a laptop-opened `tcp:` stream has this: a dial to acknowledge. */
   ack?: () => void;
   pause?: () => void;
   resume?: () => void;
+  /** A5: the fragments of this stream's writes still waiting on a drain, in order. */
+  tail?: Promise<void>;
 };
-type Conn = { handle: RelayHandle; streams: Map<number, Entry>; nextEven: number; paused: boolean; closed: boolean };
+type Conn = {
+  handle: RelayHandle;
+  streams: Map<number, Entry>;
+  /** Every live `cdp` stream's reader, which is what the two aggregate bounds are measured over. */
+  cdps: Set<CdpReader>;
+  nextEven: number;
+  paused: boolean;
+  /** Set while `drain` is polling, so a deferred write has something to await rather than spin. */
+  drained: Promise<void> | null;
+  closed: boolean;
+};
 
 export function createRelay(io: Io, host: string, machine: BrowserMachine, o: RelayOptions): Relay {
   const sleep = io.sleep ?? realSleep;
@@ -190,24 +227,80 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
     pressure(c);
   };
   const frame = (c: Conn, id: number, op: Op, payload?: Uint8Array) => sendRaw(c, encodeFrame(id, op, payload));
+
+  // A5: one write's DATA frames, in order. Synchronous while the socket's buffer is under the
+  // threshold; the first fragment that finds it OVER stops there and the rest of the write waits on
+  // the drain, so a large CDP response no longer pours every remaining fragment into a full buffer.
+  // Later writes on the same stream chain behind that tail, which is what keeps them in order.
+  // A `close` does NOT chain: it deletes the id, so whatever fragments were still deferred are
+  // dropped and the CLOSE goes out at once.
   const stream = (c: Conn, id: number, bytes: Uint8Array) => {
-    for (const part of chunkPayload(bytes)) frame(c, id, DATA, part);
+    const e = c.streams.get(id);
+    if (!e) return;
+    const parts = chunkPayload(bytes);
+    if (e.tail) return chain(c, e, id, parts, 0);
+    const next = burst(c, id, parts, 0);
+    if (next >= parts.length) return;
+    pressure(c); // published here, not on the next tick, so crossing the threshold always says so
+    chain(c, e, id, parts, next);
   };
+  /** Queues `parts` behind what this stream still owes, and clears the tail once it owes nothing — a stream that hit the threshold once is synchronous again afterwards. */
+  const chain = (c: Conn, e: Entry, id: number, parts: Uint8Array[], from: number) => {
+    const tail = (e.tail ?? Promise.resolve()).then(() => deferred(c, id, parts, from));
+    e.tail = tail;
+    const settle = () => {
+      if (e.tail === tail) e.tail = undefined;
+    };
+    void tail.then(settle, settle);
+  };
+  /** Sends parts from `from` until the buffer goes over the threshold or the stream goes; returns where it stopped. */
+  function burst(c: Conn, id: number, parts: Uint8Array[], from: number): number {
+    let i = from;
+    for (; i < parts.length; i++) {
+      if (c.closed || !c.streams.has(id)) return parts.length;
+      if (c.handle.bufferedAmount > PAUSE_ABOVE) break;
+      frame(c, id, DATA, parts[i]!);
+    }
+    return i;
+  }
+  async function deferred(c: Conn, id: number, parts: Uint8Array[], from: number): Promise<void> {
+    let i = from;
+    while (i < parts.length) {
+      if (c.closed || !c.streams.has(id)) return;
+      i = burst(c, id, parts, i);
+      if (i >= parts.length) return;
+      pressure(c);
+      // `c.drained` is null between the poll finishing and the pause being lifted, and null when the
+      // buffer is over the threshold with no pause published (a closed connection). Poll, not spin.
+      await (c.drained ?? sleep(DRAIN_POLL_MS));
+    }
+  }
 
   function pressure(c: Conn) {
     if (c.paused || c.closed || c.handle.bufferedAmount <= PAUSE_ABOVE) return;
     c.paused = true;
     for (const e of c.streams.values()) e.pause?.();
     o.onBackpressure?.(true);
-    void drain(c);
+    c.drained = drain(c);
   }
   async function drain(c: Conn) {
     while (!c.closed && c.handle.bufferedAmount >= RESUME_BELOW) await sleep(DRAIN_POLL_MS);
+    c.drained = null;
     if (!c.paused) return; // teardown got there first and already resumed
     c.paused = false;
     for (const e of c.streams.values()) e.resume?.();
     o.onBackpressure?.(false);
   }
+
+  // A5: a stream registered while the pause is already active is paused too, or it would read at
+  // full speed into a socket every other stream has stopped feeding. On a microtask because the
+  // consumer sets `pause` after `open` returns, or inside `onCdpStream` — not before we register it.
+  const joinPause = (c: Conn, e: Entry) => {
+    if (!c.paused) return;
+    queueMicrotask(() => {
+      if (c.paused && !c.closed) e.pause?.();
+    });
+  };
 
   /** Ends a stream from our side: CLOSE to the peer, and the consumer is told, because it did not ask for this. */
   const kill = (c: Conn, id: number) => {
@@ -233,36 +326,58 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
       return emit({ state: "refused", id, target, reason: "that stream id is already open" });
     }
     if (target !== "cdp") return refuse(c, id, target, "the workbench may open `cdp` streams only");
+    if (c.cdps.size >= MAX_CDP_STREAMS)
+      return refuse(c, id, target, `${MAX_CDP_STREAMS} cdp streams are already open`);
 
-    const reader = cdpReader();
-    let held = 0; // bytes `reader` is holding for a message that has not completed
+    // The per-stream ceiling is the reader's own `max`, so it refuses an oversize declaration before
+    // buffering the body and its tail stays under the number without anything here counting bytes.
+    const reader = cdpReader(CDP_REASSEMBLY_CEILING);
+    c.cdps.add(reader);
+    const release = () => {
+      c.cdps.delete(reader);
+      reader.close();
+    };
     const cdp: CdpChannel = {
       send: (message) => {
         if (c.streams.has(id)) stream(c, id, encodeCdp(message));
       },
       close: () => {
         if (!c.streams.delete(id)) return;
-        reader.close();
+        release();
         frame(c, id, CLOSE);
       },
     };
-    c.streams.set(id, {
+    const entry: Entry = {
       data(bytes) {
-        held += bytes.length;
-        const messages = reader.push(bytes);
-        for (const m of messages) held -= 4 + Buffer.byteLength(m);
+        // Wire bytes only, summed over every live reader, and checked before this frame is buffered.
+        let total = bytes.length;
+        for (const r of c.cdps) total += r.held;
+        if (total > CDP_REASSEMBLY_TOTAL) {
+          kill(c, id);
+          return emit({ state: "refused", id, target, reason: `cdp reassembly over ${CDP_REASSEMBLY_TOTAL} bytes across all streams` });
+        }
+        let messages: string[];
+        try {
+          messages = reader.push(bytes);
+        } catch (e) {
+          // A declared length over the ceiling, or bytes that are not UTF-8: either way the peer is
+          // not speaking §4's inner framing, so the stream goes rather than the frame being dropped.
+          kill(c, id);
+          return emit({ state: "refused", id, target, reason: (e as Error).message });
+        }
         for (const m of messages) cdp.onMessage?.(m);
-        if (held <= CDP_REASSEMBLY_CEILING) return;
-        kill(c, id);
-        emit({ state: "refused", id, target, reason: `a cdp message over ${CDP_REASSEMBLY_CEILING} bytes` });
       },
       gone() {
-        reader.close();
+        release();
         cdp.onClose?.();
       },
-    });
+      pause: () => cdp.pause?.(),
+      resume: () => cdp.resume?.(),
+    };
+    c.streams.set(id, entry);
     emit({ state: "stream", id, target });
     o.onCdpStream(cdp);
+    joinPause(c, entry);
   }
 
   function message(c: Conn, bytes: Uint8Array) {
@@ -320,15 +435,17 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
         if (c.streams.delete(id)) frame(c, id, CLOSE);
       },
     };
-    c.streams.set(id, {
+    const entry: Entry = {
       data: (bytes) => s.onData?.(bytes),
       gone: () => s.onClose?.(),
       ack: () => s.onAck?.(),
       pause: () => s.pause?.(),
       resume: () => s.resume?.(),
-    });
+    };
+    c.streams.set(id, entry);
     frame(c, id, OPEN, ENC.encode(target));
     emit({ state: "stream", id, target });
+    joinPause(c, entry);
     return s;
   };
 
@@ -364,7 +481,7 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
         message: (bytes) => message(c, bytes),
         close: finish,
       });
-      c = { handle, streams: new Map(), nextEven: 2, paused: false, closed: false };
+      c = { handle, streams: new Map(), cdps: new Set(), nextEven: 2, paused: false, drained: null, closed: false };
       if (signal?.aborted) return abort();
       signal?.addEventListener("abort", abort, { once: true });
     });

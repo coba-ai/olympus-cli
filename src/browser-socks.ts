@@ -14,9 +14,12 @@
 // This server performs NO DNS (§5.4): a query here would leave the member's machine and put the
 // browsed name on their LAN, and the workbench resolves the name again at its end anyway. So a
 // DOMAINNAME is matched as the name was sent, and an address literal as the literal; a name is never
-// resolved to compare against the address rules below. The consequence, stated rather than hidden: a
-// name that resolves to a private or loopback address at the far end is NOT caught here, and nothing
-// in this file could catch it. The workbench-side allowlist on the resolved address (§6.3) is what
+// resolved to compare against the address rules below. A name field carrying an ADDRESS is not that
+// case — `2130706433` and `::1` are loopback with no query asked — so `classifyName` canonicalises
+// those spellings and the address rules apply whichever ATYP carried them. The consequence of the real
+// limit, stated rather than hidden: a NAME that resolves to a private or loopback address at the far
+// end is NOT caught here, and nothing in this file could catch it. The workbench-side allowlist on the
+// resolved address (§6.3) is what
 // covers that, and it does not exist yet (loop D).
 import type { Socket } from "bun";
 import type { Stream, StreamOpener } from "./browser-frame";
@@ -42,6 +45,14 @@ const ACK_MS = 30_000;
 const EMPTY = new Uint8Array(0);
 const DEC = new TextDecoder();
 
+// Ceiling on remote `tcp:` bytes this process holds for ONE browser socket: payloads that arrived
+// before the ACK plus whatever a partial `sock.write` left behind. Over it the stream is closed and
+// the browser socket goes with it — 0x04 before the reply, a hang-up after it — instead of the queue
+// growing. Held bytes peak at this plus the one payload that crossed it, since the check follows the
+// write attempt. Enforced by `toClient` and `onData`. It bounds this direction only; the browser's own
+// bytes are bounded by A5's `sock.pause()` on the relay's queue, and `c.buf` by nothing.
+const MAX_PENDING = 1024 * 1024;
+
 // [VER][REP][RSV][ATYP IPv4][BND.ADDR 0.0.0.0][BND.PORT 0]. The bound address means nothing for a
 // CONNECT that is really a tunnel; Chromium accepted this exact shape in the probe above.
 const reply = (rep: number) => new Uint8Array([VERSION, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
@@ -53,30 +64,58 @@ const concat = (a: Uint8Array, b: Uint8Array) => {
   return out;
 };
 
+/** One copy for the whole queue, rather than one per arriving chunk (as `cdpReader` was already fixed). */
+const concatAll = (chunks: Uint8Array[], total: number) => {
+  if (chunks.length === 1) return chunks[0]!;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+};
+
 /** One `--allow-origin` entry. `port` unset means the two default ports, not every port. */
 export type AllowOrigin = { host: string; port?: number };
 
 /**
+ * The characters a `HOST` may be built from: anything that is not a URL delimiter, whitespace or a
+ * control. It keeps a path, userinfo, query, fragment or embedded space out of the host BEFORE
+ * `new URL` gets a chance to quietly accept the whole URL and hand back only its hostname. Non-ASCII
+ * is deliberately inside the class: an IDN has to survive as far as the punycoding below.
+ */
+const HOST_CHARS = /^[^\u0000-\u0020\u007f/\\?#@[\]:%<>"{}|^`]+$/;
+
+/**
  * `HOST`, `HOST:PORT`, `[v6]` or `[v6]:PORT`. A bare IPv6 literal is several colons with no brackets,
- * so `2001:db8::1` is a host and not a host with port 1. Hosts go through `new URL`, which lowercases,
- * punycodes an IDN (Chromium sends the A-label, so `café.example` would otherwise never match) and
- * canonicalises an IPv6 literal (so `2001:db8::1` and its expanded spelling are the same entry).
+ * so `2001:db8::1` is a host and not a host with port 1. The grammar is checked first; only then do
+ * hosts go through `new URL`, which lowercases, punycodes an IDN (Chromium sends the A-label, so
+ * `café.example` would otherwise never match) and canonicalises an IPv6 literal (so `2001:db8::1` and
+ * its expanded spelling are the same entry).
  */
 export function parseAllowOrigin(raw: string): AllowOrigin {
   const s = raw.trim();
-  const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(s);
-  let host = s;
+  const bad = () => usage(`invalid --allow-origin "${raw}"; expected HOST, HOST:PORT or [v6]:PORT`);
+  const bracketed = /^\[([0-9A-Fa-f:.]+)\](?::(\d+))?$/.exec(s);
+  let host: string;
   let port: string | undefined;
   if (bracketed) {
     host = bracketed[1]!;
     port = bracketed[2];
-  } else if (s.includes(":") && s.indexOf(":") === s.lastIndexOf(":")) {
-    host = s.slice(0, s.lastIndexOf(":"));
-    port = s.slice(s.lastIndexOf(":") + 1);
+  } else if (s.includes(":") && s.indexOf(":") !== s.lastIndexOf(":")) {
+    // Several colons and no brackets: a bare IPv6 literal, which `new URL` below is what validates.
+    if (!/^[0-9A-Fa-f:.]+$/.test(s)) throw bad();
+    host = s;
+  } else {
+    const i = s.lastIndexOf(":");
+    host = i === -1 ? s : s.slice(0, i);
+    port = i === -1 ? undefined : s.slice(i + 1);
+    if (!HOST_CHARS.test(host)) throw bad();
   }
-  const bad = () => usage(`invalid --allow-origin "${raw}"; expected HOST, HOST:PORT or [v6]:PORT`);
+  if (port !== undefined && !/^\d{1,5}$/.test(port)) throw bad();
   const n = port === undefined ? undefined : Number(port);
-  if (n !== undefined && !(Number.isInteger(n) && n >= 1 && n <= 65535)) throw bad();
+  if (n !== undefined && !(n >= 1 && n <= 65535)) throw bad();
   let canonical: string;
   try {
     const u = new URL(`http://${host.includes(":") ? `[${host}]` : host}/`);
@@ -113,6 +152,103 @@ const privateIPv6 = (b: Uint8Array) =>
 /** `::ffff:a.b.c.d` — the spelling that would otherwise walk an IPv4 range straight past the check. */
 const ipv4Mapped = (b: Uint8Array) => b[10] === 0xff && b[11] === 0xff && b.subarray(0, 10).every((x) => x === 0);
 
+/** The host string and the verdict for one address, whichever ATYP (or name field) delivered it. */
+type Verdict = { host: string; denied: boolean };
+
+const fromIPv4 = (a: number, b: number, c: number, d: number): Verdict => ({
+  host: `${a}.${b}.${c}.${d}`,
+  denied: privateIPv4(a, b, c),
+});
+
+const canonicalIPv6 = (v6: Uint8Array) => {
+  const groups: string[] = [];
+  for (let i = 0; i < 16; i += 2) groups.push((((v6[i]! << 8) | v6[i + 1]!) >>> 0).toString(16));
+  return new URL(`http://[${groups.join(":")}]/`).hostname.slice(1, -1); // canonical, so it matches an --allow-origin entry
+};
+
+const fromIPv6 = (v6: Uint8Array): Verdict =>
+  // Normalised to its IPv4 form before the ranges are applied.
+  ipv4Mapped(v6) ? fromIPv4(v6[12]!, v6[13]!, v6[14]!, v6[15]!) : { host: canonicalIPv6(v6), denied: privateIPv6(v6) };
+
+/** The 16 bytes of an already-canonical IPv6 string (hex groups, at most one `::`, no embedded IPv4). */
+function expandIPv6(canonical: string): Uint8Array | null {
+  const halves = canonical.split("::");
+  if (halves.length > 2) return null;
+  const split = (s: string) => (s ? s.split(":") : []);
+  const head = split(halves[0]!);
+  const tail = halves.length === 2 ? split(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? fill !== 0 : fill < 1) return null;
+  const groups = [...head, ...new Array<string>(halves.length === 2 ? fill : 0).fill("0"), ...tail];
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    const n = parseInt(groups[i]!, 16);
+    if (!Number.isInteger(n) || n < 0 || n > 0xffff) return null;
+    out[i * 2] = n >> 8;
+    out[i * 2 + 1] = n & 0xff;
+  }
+  return out;
+}
+
+/** `new URL` is the IPv6 grammar here, and it folds `::ffff:127.0.0.1` into hex groups on the way. */
+function ipv6FromText(text: string): Uint8Array | null {
+  let canonical: string;
+  try {
+    canonical = new URL(`http://[${text}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+  return canonical ? expandIPv6(canonical) : null;
+}
+
+/** One dotted part, with C's base prefixes: `0x7f` is 127, `0177` is 127, `127` is 127. */
+function ipv4Part(p: string): number | null {
+  if (p.startsWith("0x")) return /^[0-9a-f]{1,8}$/.test(p.slice(2)) ? parseInt(p.slice(2), 16) : null;
+  if (p.length > 1 && p.startsWith("0")) return /^[0-7]{1,11}$/.test(p.slice(1)) ? parseInt(p.slice(1), 8) : null;
+  return /^[0-9]{1,10}$/.test(p) ? Number(p) : null;
+}
+
+/** A label is an IPv4 attempt once its LAST part is numeric; `0x` is an attempt and a failed one. */
+const NUMERIC_PART = /^(0x[0-9a-f]*|[0-9]+)$/;
+const NAME_LABEL = /^[a-z0-9_-]{1,63}$/;
+
+/**
+ * What arrived in the ATYP 0x03 name field. `2130706433`, `0177.0.0.1`, `0x7f.1`, `127.1`, `::1` and
+ * `[::1]` are spellings of an address, not names, and recognising them costs no DNS — so they return a
+ * `Verdict` and go through the same ranges as a literal that arrived under ATYP 0x01 or 0x04.
+ * `"name"` is a name, which this server still never resolves (see the header). `"bad"` is neither, and
+ * is refused rather than handed to the workbench as a name. Enforced by the ATYP 0x03 cases in
+ * `test/browser-socks.test.ts`; which spellings of an address exist is not something this file can
+ * assert it has enumerated.
+ */
+function classifyName(raw: string): Verdict | "name" | "bad" {
+  const s = raw.toLowerCase();
+  const inner = s.startsWith("[") && s.endsWith("]") ? s.slice(1, -1) : s.includes(":") ? s : null;
+  if (inner !== null) {
+    const v6 = ipv6FromText(inner);
+    return v6 ? fromIPv6(v6) : "bad";
+  }
+
+  const labels = s.split(".");
+  if (labels.length > 1 && labels[labels.length - 1] === "") labels.pop(); // a name's one trailing dot
+  const last = labels[labels.length - 1];
+  if (last === undefined || !NUMERIC_PART.test(last)) {
+    return labels.length > 0 && s.length <= 253 && labels.every((l) => NAME_LABEL.test(l)) ? "name" : "bad";
+  }
+  if (labels.length > 4) return "bad";
+  const parts: number[] = [];
+  for (const l of labels) {
+    const n = ipv4Part(l);
+    if (n === null) return "bad";
+    parts.push(n);
+  }
+  // inet_aton: every part but the last is one byte, and the last absorbs the bytes nobody named.
+  const tail = parts.pop()!;
+  if (parts.some((n) => n > 255) || tail >= 256 ** (4 - parts.length)) return "bad";
+  const v = parts.reduce((acc, n, i) => acc + n * 256 ** (3 - i), tail);
+  return fromIPv4(v >>> 24, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
+}
+
 export type SocksProxy = {
   /** The ephemeral loopback port 2.4 puts in `--proxy-server=socks5://127.0.0.1:<port>`. */
   readonly port: number;
@@ -136,9 +272,12 @@ type Conn = {
   timer: ReturnType<typeof setTimeout> | null;
   /**
    * Stream bytes the client socket has not taken: held until the ACK puts the success reply on the
-   * wire ahead of them, or left over from a partial write and sent again from `drain`.
+   * wire ahead of them, or left over from a partial write and sent again from `drain`. A chunk list,
+   * concatenated once when it goes out, and capped at `MAX_PENDING` by `pendingBytes`.
    */
-  pending: Uint8Array;
+  pending: Uint8Array[];
+  /** `pending`'s total length, kept beside it so the cap costs no walk of the list. */
+  pendingBytes: number;
 };
 
 export function startSocksProxy(o: SocksOptions): SocksProxy {
@@ -156,7 +295,7 @@ export function startSocksProxy(o: SocksOptions): SocksProxy {
     port: 0,
     socket: {
       open(sock) {
-        sock.data = { phase: "greeting", buf: EMPTY, stream: null, timer: null, pending: EMPTY };
+        sock.data = { phase: "greeting", buf: EMPTY, stream: null, timer: null, pending: [], pendingBytes: 0 };
       },
       data(sock, chunk) {
         const c = sock.data;
@@ -202,9 +341,21 @@ export function startSocksProxy(o: SocksOptions): SocksProxy {
   function toClient(sock: Sock, bytes: Uint8Array) {
     const c = sock.data;
     if (c.phase === "dead") return;
-    const out = c.pending.length ? concat(c.pending, bytes) : bytes;
+    if (bytes.length) {
+      c.pending.push(bytes);
+      c.pendingBytes += bytes.length;
+    }
+    if (!c.pendingBytes) return;
+    const out = concatAll(c.pending, c.pendingBytes);
     const n = sock.write(out);
-    c.pending = n >= out.length ? EMPTY : new Uint8Array(out.subarray(n));
+    if (n >= out.length) {
+      c.pending = [];
+      c.pendingBytes = 0;
+      return;
+    }
+    c.pending = [new Uint8Array(out.subarray(n))];
+    c.pendingBytes = out.length - n;
+    if (c.pendingBytes > MAX_PENDING) kill(sock); // the browser socket is not keeping up
   }
 
   /** `[VER][NMETHODS][METHODS…]`. A9: no authentication method but 0x00. */
@@ -245,24 +396,19 @@ export function startSocksProxy(o: SocksOptions): SocksProxy {
     let host: string;
     let denied: boolean;
     if (atyp === ATYP_IPV4) {
-      const [w, x, y, z] = [b[4]!, b[5]!, b[6]!, b[7]!];
-      host = `${w}.${x}.${y}.${z}`;
-      denied = privateIPv4(w, x, y);
+      ({ host, denied } = fromIPv4(b[4]!, b[5]!, b[6]!, b[7]!));
     } else if (atyp === ATYP_IPV6) {
-      const v6 = b.subarray(4, 20);
-      if (ipv4Mapped(v6)) {
-        const [w, x, y, z] = [v6[12]!, v6[13]!, v6[14]!, v6[15]!];
-        host = `${w}.${x}.${y}.${z}`; // normalised to its IPv4 form before the ranges are applied
-        denied = privateIPv4(w, x, y);
-      } else {
-        const groups: string[] = [];
-        for (let i = 0; i < 16; i += 2) groups.push((((v6[i]! << 8) | v6[i + 1]!) >>> 0).toString(16));
-        host = new URL(`http://[${groups.join(":")}]/`).hostname.slice(1, -1); // canonical, so it matches an --allow-origin entry
-        denied = privateIPv6(v6);
-      }
+      ({ host, denied } = fromIPv6(b.subarray(4, 20)));
     } else {
-      host = DEC.decode(b.subarray(5, 4 + addrLen)).toLowerCase(); // the name as sent; never resolved
-      denied = false;
+      const raw = DEC.decode(b.subarray(5, 4 + addrLen));
+      const what = classifyName(raw);
+      if (what === "bad") return refuse(sock, NOT_ALLOWED);
+      if (what === "name") {
+        host = raw.toLowerCase(); // the name as sent; never resolved
+        denied = false;
+      } else {
+        ({ host, denied } = what); // an address literal that merely arrived wearing ATYP 0x03
+      }
     }
 
     if (denied || !permitted(host, port)) return refuse(sock, NOT_ALLOWED);
@@ -299,9 +445,13 @@ export function startSocksProxy(o: SocksOptions): SocksProxy {
     };
     stream.onData = (bytes) => {
       // Stream bytes before the ACK cannot go out: they would land in front of the success reply.
-      // Held for `onAck` to flush. Nothing in §4 stops the workbench sending DATA before its ACK.
-      if (c.phase === "connecting") c.pending = c.pending.length ? concat(c.pending, bytes) : bytes;
-      else toClient(sock, bytes);
+      // Held for `onAck` to flush. Nothing in §4 stops the workbench sending DATA before its ACK, and
+      // nothing stops it sending more than the browser ever asked for — past `MAX_PENDING` the stream
+      // gets the same 0x04 as the other two ways it can fail to answer.
+      if (c.phase !== "connecting") return toClient(sock, bytes);
+      c.pending.push(bytes);
+      c.pendingBytes += bytes.length;
+      if (c.pendingBytes > MAX_PENDING) refuse(sock, UNREACHABLE);
     };
     // A5: the relay calls these when its own send queue is over the threshold, so the browser gets TCP
     // backpressure instead of this process buffering the page it is uploading.

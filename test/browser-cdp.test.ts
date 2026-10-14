@@ -3,13 +3,17 @@ import { cdpFilter, refusal, REFUSED, SETUP_ID } from "../src/browser-cdp";
 
 const S = "S1"; // the one page session the harness attaches
 
-const attachEvent = (sessionId: string, type: string) =>
+const attachEvent = (sessionId: string, type: string, waitingForDebugger = false) =>
   JSON.stringify({
     method: "Target.attachedToTarget",
-    params: { sessionId, targetInfo: { targetId: "T1", type, url: "about:blank", attached: true }, waitingForDebugger: false },
+    params: { sessionId, targetInfo: { targetId: "T1", type, url: "about:blank", attached: true }, waitingForDebugger },
   });
 
-function harness() {
+/**
+ * `ready: false` leaves the browser-wide install the filter issues on construction unanswered, which
+ * is how the tests below see the gate before it opens; the default answers it successfully.
+ */
+function harness({ ready = true } = {}) {
   const toBrowser: string[] = [];
   const toWorkbench: string[] = [];
   const f = cdpFilter((m) => void toBrowser.push(m), (m) => void toWorkbench.push(m));
@@ -17,12 +21,18 @@ function harness() {
     f,
     toBrowser,
     toWorkbench,
-    /** Chromium attaches a page target; the A8 setup commands it triggers are cleared away. */
-    attach(sessionId = S) {
-      f.fromBrowser(attachEvent(sessionId, "page"));
+    /** Answers every command the filter has sent Chromium so far, successfully, and clears both logs. */
+    settle(outcome: object = { result: {} }) {
+      for (const m of toBrowser.map((raw) => JSON.parse(raw)))
+        if (typeof m.id === "number") f.fromBrowser(JSON.stringify({ id: m.id, sessionId: m.sessionId, ...outcome }));
       toBrowser.length = 0;
       toWorkbench.length = 0;
       return h;
+    },
+    /** Chromium attaches a page target; the A8 setup commands it triggers succeed and are cleared away. */
+    attach(sessionId = S) {
+      f.fromBrowser(attachEvent(sessionId, "page"));
+      return h.settle();
     },
     send(cmd: object) {
       f.fromWorkbench(JSON.stringify(cmd));
@@ -30,8 +40,11 @@ function harness() {
     },
     /** What went to Chromium, as [method, sessionId, params]. */
     issued: () => toBrowser.map((m) => JSON.parse(m)).map((m) => [m.method, m.sessionId, m.params ?? null]),
+    /** The ids of the commands the filter has sent Chromium since the last clear. */
+    ids: () => toBrowser.map((m) => JSON.parse(m).id as number),
     last: (): any => JSON.parse(toWorkbench.at(-1)!),
   };
+  if (ready) h.settle(); // the construction-time browser-wide install succeeds
   return h;
 }
 
@@ -61,7 +74,7 @@ describe("A6 CDP allowlist: what is allowed", () => {
       ["Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false }],
       ["Log.enable"],
       ["Accessibility.getFullAXTree"],
-      ["Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }],
+      ["Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }],
     ];
     for (const [method, params] of allowed) expect(refusal({ id: 1, method, sessionId: S, params }, pages)).toBeUndefined();
 
@@ -147,6 +160,24 @@ describe("A6 CDP allowlist: every refusal", () => {
   test("Target.setAutoAttach with flatten: false, or with none at all", () => {
     for (const flatten of [false, undefined])
       refuse({ id: 8, method: "Target.setAutoAttach", sessionId: S, params: { autoAttach: true, waitForDebuggerOnStart: false, flatten } }, "requires flatten: true");
+  });
+
+  // The filter's own paused auto-attach (below) is installed on the browser session, which is the
+  // same session a sessionless workbench Target.setAutoAttach lands on: without these two the
+  // workbench turns the pause off in one command and a target runs before the filter has seen it.
+  test("Target.setAutoAttach that would weaken the filter's own paused auto-attach", () => {
+    for (const p of [{ autoAttach: false }, { autoAttach: undefined }, { autoAttach: "true" }])
+      refuse({ id: 60, method: "Target.setAutoAttach", params: { waitForDebuggerOnStart: true, flatten: true, ...p } }, "requires autoAttach: true");
+    for (const waitForDebuggerOnStart of [false, undefined, "true"])
+      refuse(
+        { id: 61, method: "Target.setAutoAttach", params: { autoAttach: true, flatten: true, waitForDebuggerOnStart } },
+        "requires waitForDebuggerOnStart: true",
+      );
+  });
+
+  test("a command whose id is in the range the filter reserves for its own commands", () => {
+    for (const id of [SETUP_ID, SETUP_ID + 1, Number.MAX_SAFE_INTEGER])
+      refuse({ id, method: "Page.reload", sessionId: S }, "is reserved for this filter's own commands");
   });
 
   test("an unknown domain", () => {
@@ -335,5 +366,143 @@ describe("A8 downloads and file choosers", () => {
     const unparseable = "}{";
     for (const m of [theirs, event, unparseable]) h.f.fromBrowser(m);
     expect(h.toWorkbench).toEqual([theirs, event, unparseable]);
+  });
+
+  // The other half of the same rule: a high id the filter never sent belongs to the workbench, and
+  // dropping it is the silent hang this file says it avoids. Only ids still outstanding are dropped.
+  test("forwards a response carrying a high id the filter never sent, and drops one only once", () => {
+    const h = harness();
+    h.f.fromBrowser(attachEvent(S, "page"));
+    const [first] = h.ids();
+    h.toWorkbench.length = 0;
+
+    const stranger = JSON.stringify({ id: SETUP_ID + 9_999, result: { ok: true }, sessionId: S });
+    h.f.fromBrowser(stranger);
+    expect(h.toWorkbench).toEqual([stranger]);
+
+    const ours = JSON.stringify({ id: first, result: {}, sessionId: S });
+    h.f.fromBrowser(ours); // the answer to one of ours: dropped
+    expect(h.toWorkbench).toEqual([stranger]);
+    h.f.fromBrowser(ours); // a second copy of that id is no longer outstanding, so it is the workbench's
+    expect(h.toWorkbench).toEqual([stranger, ours]);
+  });
+});
+
+// Finding 1. Everything above installs protection when a page ATTACHES, and the workbench chooses
+// whether to attach. These tests are about what holds when it does not.
+describe("A8 browser-wide protection, installed before anything is forwarded", () => {
+  const install: [string, string | undefined, unknown][] = [
+    ["Browser.setDownloadBehavior", undefined, { behavior: "deny" }],
+    ["Target.setAutoAttach", undefined, { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }],
+  ];
+
+  test("issues browser-wide download denial and paused auto-attach on construction", () => {
+    const h = harness({ ready: false });
+    expect(h.issued()).toEqual(install);
+    expect(h.toWorkbench).toEqual([]);
+  });
+
+  test("refuses every workbench command until that install has succeeded, and forwards none of them", () => {
+    const h = harness({ ready: false });
+    for (const cmd of [
+      { id: 1, method: "Target.createTarget", params: { url: "https://example.test/" } },
+      { id: 2, method: "Target.getTargets" },
+    ])
+      h.send(cmd);
+    expect(h.issued()).toEqual(install); // nothing of the workbench's beside the filter's own two
+    expect(h.toWorkbench.length).toBe(2);
+    expect(h.last().error.code).toBe(REFUSED);
+    expect(h.last().error.message).toContain("still installing");
+  });
+
+  test("fails closed when Chromium refuses that install: every later command is refused, allowed or not", () => {
+    const h = harness({ ready: false });
+    const [downloads] = h.ids();
+    h.f.fromBrowser(JSON.stringify({ id: downloads, error: { code: -32601, message: "method not found" } }));
+    h.f.fromBrowser(JSON.stringify({ id: h.ids()[1], result: {} })); // the other half still succeeding changes nothing
+    h.toBrowser.length = 0;
+    h.f.fromBrowser(attachEvent(S, "page"));
+    h.toBrowser.length = 0;
+
+    h.send({ id: 1, method: "Page.navigate", sessionId: S, params: { url: "https://example.test/" } });
+    expect(h.toBrowser).toEqual([]);
+    expect(h.last().error.message).toContain("method not found");
+  });
+
+  // `browserContextId` is optional on Browser.setDownloadBehavior and the protocol's own text says
+  // the default browser context is used when it is omitted, so the construction-time command above
+  // does not reach a context the workbench creates later. UNVERIFIED against a running Chromium
+  // (nothing in this repo launches one), which is why the context gets its own command rather than
+  // a comment reasoning that it inherits one.
+  test("denies downloads in a context the workbench creates, before the workbench learns its id", () => {
+    const h = harness().attach();
+    h.send({ id: 70, method: "Target.createBrowserContext", params: { disposeOnDetach: true } });
+    expect(h.toBrowser.length).toBe(1); // forwarded
+    h.toBrowser.length = 0;
+
+    const response = JSON.stringify({ id: 70, result: { browserContextId: "C1" } });
+    h.f.fromBrowser(response);
+    expect(h.issued()).toEqual([["Browser.setDownloadBehavior", undefined, { behavior: "deny", browserContextId: "C1" }]]);
+    expect(h.toWorkbench).toEqual([response]); // and the workbench still gets its answer
+  });
+
+  test("fails closed when that context denial is refused", () => {
+    const h = harness().attach();
+    h.send({ id: 71, method: "Target.createBrowserContext", params: {} });
+    h.f.fromBrowser(JSON.stringify({ id: 71, result: { browserContextId: "C1" } }));
+    h.f.fromBrowser(JSON.stringify({ id: h.ids().at(-1), error: { code: -32000, message: "no such context" } }));
+    h.toBrowser.length = 0;
+
+    h.send({ id: 72, method: "Page.navigate", sessionId: S, params: { url: "https://example.test/" } });
+    expect(h.toBrowser).toEqual([]);
+    expect(h.last().error.message).toContain("no such context");
+  });
+});
+
+describe("A8 paused attachment: a page runs only after its setup succeeded", () => {
+  const paused = (sessionId: string) => attachEvent(sessionId, "page", true);
+
+  test("a paused page is not resumed and not usable until every setup command has succeeded", () => {
+    const h = harness();
+    h.f.fromBrowser(paused(S));
+    const ids = h.ids();
+    expect(ids.length).toBe(3);
+    h.toWorkbench.length = 0;
+
+    h.send({ id: 1, method: "Page.reload", sessionId: S });
+    expect(h.last().error.message).toContain("still installing");
+
+    for (const id of ids.slice(0, 2)) h.f.fromBrowser(JSON.stringify({ id, result: {}, sessionId: S }));
+    expect(h.issued().map(([m]) => m)).toEqual(["Page.enable", "Page.setDownloadBehavior", "Page.setInterceptFileChooserDialog"]);
+
+    h.f.fromBrowser(JSON.stringify({ id: ids[2], result: {}, sessionId: S }));
+    expect(h.issued().at(-1)).toEqual(["Runtime.runIfWaitingForDebugger", S, null]);
+    h.toBrowser.length = 0;
+    h.send({ id: 2, method: "Page.reload", sessionId: S });
+    expect(h.toBrowser.length).toBe(1); // usable now
+  });
+
+  test("a setup command Chromium refuses fails closed: never usable, never resumed", () => {
+    const h = harness();
+    h.f.fromBrowser(paused(S));
+    const ids = h.ids();
+    h.f.fromBrowser(JSON.stringify({ id: ids[0], result: {}, sessionId: S }));
+    h.f.fromBrowser(JSON.stringify({ id: ids[1], error: { code: -32000, message: "chooser interception unavailable" }, sessionId: S }));
+    h.f.fromBrowser(JSON.stringify({ id: ids[2], result: {}, sessionId: S }));
+    h.toBrowser.length = 0;
+
+    h.send({ id: 1, method: "Page.reload", sessionId: S });
+    expect(h.toBrowser).toEqual([]); // nothing forwarded, and no Runtime.runIfWaitingForDebugger either
+    expect(h.last().error.message).toContain("chooser interception unavailable");
+  });
+
+  test("resumes a paused target that is not a page, which gets no page setup to wait for", () => {
+    for (const type of ["iframe", "worker", "service_worker", "other"]) {
+      const h = harness();
+      h.f.fromBrowser(attachEvent("S9", type, true));
+      expect(h.issued()).toEqual([["Runtime.runIfWaitingForDebugger", "S9", null]]);
+      h.send({ id: 1, method: "Runtime.evaluate", sessionId: "S9", params: { expression: "1" } });
+      expect(h.last().error.message).toContain("never attached to a page target");
+    }
   });
 });

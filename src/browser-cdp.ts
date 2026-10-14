@@ -2,17 +2,21 @@
 //
 // The workbench is the UNTRUSTED side (§3): anything holding COMPANION_TOKEN - every agent in the
 // organization with a terminal on the tenant machine - can drive this socket or attach a fake
-// laptop. So this is default-deny: a command reaches Chromium only when its domain is allowlisted,
-// no rule below names it, and it rides a flattened sessionId this filter watched attach to a page
-// target. Everything else is answered with a CDP error response and never forwarded - never
-// dropped silently, because a dropped command leaves the workbench waiting forever.
+// laptop. So this is default-deny: a command reaches Chromium only when the filter's own A8
+// protection is installed browser-wide (`cdpFilter` below), its domain is allowlisted, no rule
+// below names it, and it rides a flattened sessionId this filter watched attach to a page target
+// AND finish its own A8 setup. Everything else is answered with a CDP error response and never
+// forwarded - never dropped silently, because a dropped command leaves the workbench waiting
+// forever.
 //
 // Only COMMANDS are filtered (Assumption 10). Chromium's responses and events pass through to the
 // workbench unread, except three events this filter acts on along the way:
 // Target.attachedToTarget and Target.detachedFromTarget (session tracking) and
-// Page.fileChooserOpened (A8). Nothing here stops an event from carrying what a refused domain
-// would have produced - some arrive with no domain enabled at all - and nothing needs to: the
-// workbench is the transport, so it already sees every page byte.
+// Page.fileChooserOpened (A8) - plus one RESPONSE, the answer to a workbench
+// Target.createBrowserContext, which carries the new context's id and is read so the filter can
+// deny downloads in it before the workbench knows that id. Nothing here stops an event from
+// carrying what a refused domain would have produced - some arrive with no domain enabled at all -
+// and nothing needs to: the workbench is the transport, so it already sees every page byte.
 import type { CdpSend } from "./browser-frame";
 
 type Params = Record<string, unknown>;
@@ -35,9 +39,11 @@ function cdpError(id: number, why: string, sessionId?: string): string {
   return JSON.stringify(body);
 }
 
-// The filter's own A8 setup commands take ids from here up, and Chromium's answers to them are
-// dropped on the way back because the workbench never sent them. That id is the only thing read in
-// the browser-to-workbench direction. A workbench using ids this high loses its own responses.
+// The filter's own A8 commands take ids from here up. Which responses are dropped on the way back
+// is decided by the EXACT ids still outstanding (`mine` in cdpFilter), not by magnitude, so an
+// answer to an accepted workbench command is never swallowed; and `refusal` refuses a workbench
+// command whose id is in this range at ingress, which is what makes the range genuinely reserved -
+// without it the two sides could hold the same outstanding id and neither response could be placed.
 export const SETUP_ID = 1_000_000_000;
 
 // §5.2's allowed domains. Every one is a PAGE domain, reached only through a flattened session;
@@ -141,7 +147,21 @@ const RULES: Record<string, Rule> = {
   // which are not inspected, so it is refused outright rather than filtered: only flattened
   // sessions exist. CDP's `flatten` defaults to the old nested behaviour, so absent is not true.
   "Target.attachToTarget": (p) => (p.flatten === true ? undefined : "Target.attachToTarget requires flatten: true"),
-  "Target.setAutoAttach": (p) => (p.flatten === true ? undefined : "Target.setAutoAttach requires flatten: true"),
+  // The filter installs a paused auto-attach of its own on the browser session (cdpFilter below),
+  // and a sessionless workbench setAutoAttach lands on that same session: `autoAttach: false` would
+  // switch it off and `waitForDebuggerOnStart: false` would let a new target run before the filter
+  // has seen it attach. So the workbench may re-state this command and may not weaken it - which
+  // also means it cannot auto-attach a sub-target un-paused. What enforces the pause is this rule
+  // plus the filter's own command; nothing in Chromium does, and `Target.autoAttachRelated`, the
+  // other way to set it, is kept out by TARGET_METHODS above rather than by a rule here.
+  "Target.setAutoAttach": (p) =>
+    p.flatten !== true
+      ? "Target.setAutoAttach requires flatten: true"
+      : p.autoAttach !== true
+        ? "Target.setAutoAttach requires autoAttach: true: the filter's own auto-attach may not be switched off"
+        : p.waitForDebuggerOnStart !== true
+          ? "Target.setAutoAttach requires waitForDebuggerOnStart: true: a target must not run before the filter has seen it attach"
+          : undefined,
   // A new context is created with a routing and reach of its own, so this method is allowlisted by
   // PARAMETER the way the rest of the file is allowlisted by method: `disposeOnDetach`, which only
   // says when the context dies, is the one that passes, and EVERY other parameter is refused by
@@ -197,8 +217,18 @@ const domainOf = (method: string) => {
   return dot > 0 && dot <= 40 ? method.slice(0, dot) : "";
 };
 
-/** Why this command is refused, or undefined to forward it. The whole decision, as a pure function. */
-export function refusal(cmd: CdpCommand, pageSessions: ReadonlySet<string>): string | undefined {
+/**
+ * Why this command is refused, or undefined to forward it. The whole decision, as a pure function.
+ * `unusable` carries the page sessions that attached but are not usable: their setup is still in
+ * flight, or Chromium refused it. They are refused with a reason of their own rather than with the
+ * never-attached message, which would be the false comment of rule 0 in a protocol field.
+ */
+export function refusal(
+  cmd: CdpCommand,
+  pageSessions: ReadonlySet<string>,
+  unusable: ReadonlyMap<string, { why: string }> = new Map(),
+): string | undefined {
+  if (cmd.id >= SETUP_ID) return `a command id at or above ${SETUP_ID} is reserved for this filter's own commands`;
   const domain = domainOf(cmd.method);
   if (!domain) return "not a CDP method";
   if (domain === "Target") {
@@ -217,7 +247,7 @@ export function refusal(cmd: CdpCommand, pageSessions: ReadonlySet<string>): str
   if (cmd.sessionId === undefined) {
     if (domain !== "Target") return `${domain} needs a flattened page session, and this command carries no sessionId`;
   } else if (!pageSessions.has(cmd.sessionId)) {
-    return "this sessionId never attached to a page target";
+    return unusable.get(cmd.sessionId)?.why ?? "this sessionId never attached to a page target";
   }
   return undefined;
 }
@@ -225,16 +255,112 @@ export function refusal(cmd: CdpCommand, pageSessions: ReadonlySet<string>): str
 export type CdpFilter = {
   /** A message from the workbench: forwarded to Chromium verbatim, or answered with a CDP error. */
   fromWorkbench: (message: string) => void;
-  /** A message from Chromium: forwarded to the workbench, with the three events above acted on. */
+  /** A message from Chromium: forwarded to the workbench, with the three events and the one response above acted on. */
   fromBrowser: (message: string) => void;
 };
 
-/** The terminator's filter over one CDP connection. Both sends are injected; this opens no socket. */
+// What a page session that attached but is not usable is refused with. The whole value of the map
+// entry, so `refusal` above can read it without this file allocating a second map per command.
+type Unusable = { why: string };
+
+/**
+ * The terminator's filter over one CDP connection. Both sends are injected; this opens no socket.
+ *
+ * A8's protection is installed in TWO places, because installing it only where a page attaches made
+ * it depend on the untrusted side choosing to attach:
+ *
+ *   - browser-wide, from this constructor, before the first workbench command is allowed through:
+ *     `Browser.setDownloadBehavior` deny (a command the FILTER issues - the whole Browser domain is
+ *     refused to the workbench) and a paused `Target.setAutoAttach`, so a target the workbench
+ *     creates and never attaches to, or a page a script opens, inherits the denial and cannot run
+ *     before this filter has seen it. The workbench is refused until both have SUCCEEDED, and if
+ *     either is refused by Chromium the filter refuses everything from then on. That gate is what
+ *     makes "before anything is forwarded" true - not the order of the sends, which assumes a
+ *     FIFO-per-session Chromium this repo cannot verify (nothing here launches a browser).
+ *   - per page session, as before: Page.enable, download deny, chooser interception.
+ *
+ * What is enforced, exactly: no workbench command is forwarded until the browser-wide denial is
+ * acknowledged, and no page session is usable until its own three commands are acknowledged. What
+ * is NOT: that Chromium's browser-wide denial actually covers every present and future context -
+ * the protocol's text says an omitted `browserContextId` means the DEFAULT context, which is why a
+ * context the workbench creates gets its own command below, and the rest is UNVERIFIED; and that
+ * auto-attach on the browser session reaches every target Chromium can create, which is UNVERIFIED
+ * too. A page the filter never sees attach therefore gets the download denial and NOT the
+ * file-chooser interception, which is narrower than it was, not closed.
+ */
 export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
   const pages = new Set<string>();
+  const unusable = new Map<string, Unusable>();
+  /** Our own outstanding request ids, each with what to do with its answer. The answer is dropped. */
+  const mine = new Map<number, (m: any) => void>();
+  /** Workbench Target.createBrowserContext ids waiting for the response that names the new context. */
+  const contexts = new Set<number>();
   let nextId = SETUP_ID;
-  const issue = (sessionId: string, method: string, params?: Params) =>
-    toBrowser(JSON.stringify({ id: nextId++, method, params, sessionId }));
+  let installed = 0;
+  let broken: string | undefined;
+
+  const issue = (sessionId: string | undefined, method: string, params?: Params, settle?: (m: any) => void) => {
+    const id = nextId++;
+    mine.set(id, settle ?? (() => {}));
+    // `sessionId: undefined` drops out of the JSON, which is how a command addresses the
+    // browser-level session this CLI holds.
+    toBrowser(JSON.stringify({ id, method, params, sessionId }));
+  };
+
+  // Chromium's own wording where there is one, so a refusal says why rather than that something
+  // went wrong. `m.error` on a CDP response is {code, message}; nothing guarantees the shape here.
+  const said = (m: any) => (typeof m?.error?.message === "string" ? m.error.message : JSON.stringify(m?.error));
+
+  // Fail closed, and stay closed: a half-installed protection forwards nothing. There is no retry -
+  // the workbench reconnects, which builds a new filter and a new install.
+  const fail = (what: string, m: any) => {
+    broken ??= `${what} failed to install (${said(m)}); this filter forwards nothing`;
+  };
+
+  // A8, browser-wide. Issued here rather than on attach; see the comment on this function.
+  const opened = (m: any) => {
+    if (m?.error) return fail("the browser-wide download denial", m);
+    installed++;
+  };
+  issue(undefined, "Browser.setDownloadBehavior", { behavior: "deny" }, opened);
+  issue(undefined, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, opened);
+
+  // A8 per page session, and the only thing that makes one usable. Until all three are acknowledged
+  // the session is refused with a reason of its own, and a command Chromium refuses is not
+  // discarded - it ends the setup, and the session stays refused for as long as it exists. A target
+  // that attached PAUSED is then never resumed, so it never runs; one that attached running - a
+  // workbench Target.attachToTarget, where waitingForDebugger is false - was already running before
+  // this filter saw it, and all it loses is the session. The browser-wide denial is what covers it.
+  //
+  // Page.enable comes first because fileChooserOpened is a Page event and the workbench may never
+  // enable the domain; whether Chromium withholds the event without it is UNVERIFIED (nothing here
+  // launches a browser - that is 2.4), and the cost of enabling is that the workbench receives Page
+  // events it never asked for.
+  const install = (sid: string, paused: boolean) => {
+    const state = { left: 3, why: "this page session is not usable yet: the filter's download and file-chooser protection is still installing" };
+    // If the same sessionId ever attaches twice, the second attach starts unusable rather than
+    // inheriting the first setup's success.
+    pages.delete(sid);
+    unusable.set(sid, state);
+    const settle = (m: any) => {
+      if (unusable.get(sid) !== state || state.left <= 0) return; // detached, re-attached, or already failed
+      if (m?.error) {
+        state.left = -1;
+        state.why = `this page session is unusable: Chromium refused the filter's protection setup (${said(m)})`;
+        return;
+      }
+      if (--state.left > 0) return;
+      unusable.delete(sid);
+      pages.add(sid);
+      // Only now: the target has been paused since it attached, and this is what lets it run.
+      // UNVERIFIED that Chromium rejects this on a target that was not waiting, which is why it is
+      // sent only for one that was.
+      if (paused) issue(sid, "Runtime.runIfWaitingForDebugger");
+    };
+    issue(sid, "Page.enable", undefined, settle);
+    issue(sid, "Page.setDownloadBehavior", { behavior: "deny" }, settle);
+    issue(sid, "Page.setInterceptFileChooserDialog", { enabled: true }, settle);
+  };
 
   return {
     fromWorkbench(message) {
@@ -247,12 +373,20 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
       const sessionId = typeof m?.sessionId === "string" ? m.sessionId : undefined;
       if (typeof m?.id !== "number" || typeof m?.method !== "string")
         return toWorkbench(cdpError(typeof m?.id === "number" ? m.id : 0, "a CDP command needs a numeric id and a string method", sessionId));
+      // The A8 gate. Refused rather than queued: a queue would hold a command this filter has
+      // already decided may never be forwarded if the install turns out to have failed.
+      if (broken !== undefined) return toWorkbench(cdpError(m.id, broken, sessionId));
+      if (installed < 2)
+        return toWorkbench(cdpError(m.id, "the filter's browser-wide download denial is still installing; nothing is forwarded until it succeeds", sessionId));
       // Anything but a JSON object for params counts as no params, so a rule that reads one sees
       // nothing rather than something it cannot read, and default-deny refuses.
       const params = m.params !== null && typeof m.params === "object" && !Array.isArray(m.params) ? (m.params as Params) : undefined;
-      const why = refusal({ id: m.id, method: m.method, sessionId, params }, pages);
+      const why = refusal({ id: m.id, method: m.method, sessionId, params }, pages, unusable);
+      if (why !== undefined) return toWorkbench(cdpError(m.id, why, sessionId));
+      // The response to this one names the new context, which the filter reads on the way back.
+      if (m.method === "Target.createBrowserContext") contexts.add(m.id);
       // Forwarded as it arrived, not re-serialized: this filter is not the one to rewrite it.
-      return why === undefined ? toBrowser(message) : toWorkbench(cdpError(m.id, why, sessionId));
+      return toBrowser(message);
     },
 
     fromBrowser(message) {
@@ -262,22 +396,42 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
       } catch {
         return toWorkbench(message);
       }
-      if (typeof m?.id === "number" && m.id >= SETUP_ID) return; // the answer to one of our own
+      if (typeof m?.id === "number") {
+        const settle = mine.get(m.id);
+        if (settle !== undefined) {
+          // The answer to one of our own: never forwarded, because the workbench never sent it.
+          mine.delete(m.id);
+          settle(m);
+          return;
+        }
+        if (contexts.has(m.id)) {
+          contexts.delete(m.id);
+          const browserContextId = m.result?.browserContextId;
+          // Issued BEFORE the response is forwarded, so it is on the wire ahead of anything the
+          // workbench can send about a context whose id it does not have yet. A refusal fails the
+          // whole filter closed rather than leaving one context downloading.
+          if (typeof browserContextId === "string")
+            issue(undefined, "Browser.setDownloadBehavior", { behavior: "deny", browserContextId }, (r) =>
+              r?.error ? fail(`the download denial for browser context ${browserContextId}`, r) : undefined,
+            );
+        }
+      }
       const sid = m?.params?.sessionId;
       if (m?.method === "Target.attachedToTarget") {
-        if (typeof sid === "string" && m.params?.targetInfo?.type === "page") {
-          pages.add(sid);
-          // A8, issued by the filter itself on every page session. Page.enable comes first because
-          // fileChooserOpened is a Page event and the workbench may never enable the domain;
-          // whether Chromium withholds the event without it is UNVERIFIED (nothing here launches a
-          // browser - that is 2.4), and the cost of enabling is that the workbench receives Page
-          // events it never asked for.
-          issue(sid, "Page.enable");
-          issue(sid, "Page.setDownloadBehavior", { behavior: "deny" });
-          issue(sid, "Page.setInterceptFileChooserDialog", { enabled: true });
+        if (typeof sid === "string") {
+          if (m.params?.targetInfo?.type === "page") install(sid, m.params?.waitingForDebugger === true);
+          // Not a page, so no page protection applies to it and nothing here will ever make it a
+          // usable session - but the filter's own waitForDebuggerOnStart pauses it too, and leaving
+          // it paused would hang whatever is waiting on it. The browser-wide download denial does
+          // not depend on this one running or not. UNVERIFIED whether a non-page target can open a
+          // file chooser; if one can, it is not intercepted.
+          else if (m.params?.waitingForDebugger === true) issue(sid, "Runtime.runIfWaitingForDebugger");
         }
       } else if (m?.method === "Target.detachedFromTarget") {
-        if (typeof sid === "string") pages.delete(sid);
+        if (typeof sid === "string") {
+          pages.delete(sid);
+          unusable.delete(sid);
+        }
       } else if (m?.method === "Page.fileChooserOpened" && typeof m.sessionId === "string" && pages.has(m.sessionId)) {
         // A8's answer: cancel it. `cancel` is the protocol's own dismissal flag. UNVERIFIED against
         // a real Chromium, and one that rejects the parameter leaves the chooser intercepted and

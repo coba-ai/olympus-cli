@@ -40,7 +40,13 @@ function spy() {
   };
 }
 
-type Client = { send: (bytes: number[] | Uint8Array) => void; read: (n: number) => Promise<Uint8Array>; end: () => void };
+type Client = {
+  send: (bytes: number[] | Uint8Array) => void;
+  read: (n: number) => Promise<Uint8Array>;
+  /** Stops taking bytes off the socket, which is how a slow browser is driven here. */
+  pause: () => void;
+  end: () => void;
+};
 
 const until = async (p: () => boolean) => {
   for (let i = 0; i < 500 && !p(); i++) await Bun.sleep(1);
@@ -86,6 +92,7 @@ async function connect(port: number): Promise<Client> {
   const client: Client = {
     send: (bytes) => void sock.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)),
     read: (n) => new Promise<Uint8Array>((resolve) => ((want = { n, resolve }), pump())),
+    pause: () => sock.pause(),
     end: () => sock.end(),
   };
   clients.push(client);
@@ -179,6 +186,53 @@ describe("A9 refusals", () => {
   });
 });
 
+// Chromium sends every host as ATYP 0x03 (the header's measurement), so the name field is the field an
+// attacker holding the companion token reaches for. A numeric spelling there is an address literal
+// wearing the name type, not the DNS uncertainty the header accepts, and every one of these opened an
+// allowed `tcp:` stream on a default port before this round.
+describe("A9 an address literal in the ATYP 0x03 name field", () => {
+  const refused: [string, string, string[]][] = [
+    ["dotted-quad loopback", "127.0.0.1", []],
+    ["dotted-quad loopback even when the list names it", "127.0.0.1", ["127.0.0.1"]],
+    ["the cloud metadata address", "169.254.169.254", []],
+    ["a bare decimal literal", "2130706433", []],
+    ["an octal literal", "0177.0.0.1", []],
+    ["a hex literal with a short tail", "0x7f.1", []],
+    ["a wholly hex literal", "0x7f000001", []],
+    ["the two-part short form", "127.1", []],
+    ["a private range in dotted-quad", "10.0.0.5", []],
+    ["a bare IPv6 loopback literal", "::1", []],
+    ["a bracketed IPv6 loopback literal", "[::1]", []],
+    ["an IPv4-mapped IPv6 spelling of loopback", "::ffff:127.0.0.1", []],
+    ["an IPv4-mapped IPv6 spelling of a private range", "::ffff:192.168.1.10", []],
+    ["fdaa::/16, Fly's internal network", "fdaa:0:1::2", []],
+    ["the unspecified address", "::", []],
+  ];
+
+  // Not an address and not a hostname either: refused rather than handed on as a name.
+  const malformed: [string, string][] = [
+    ["a value carrying a path", "example.com/evil"],
+    ["a value carrying userinfo", "user@example.com"],
+    ["an out-of-range dotted-quad", "256.0.0.1"],
+    ["five dotted parts", "1.2.3.4.5"],
+    ["a truncated hex literal", "0x"],
+    ["an octal part with a non-octal digit", "0199.0.0.1"],
+    ["an unterminated bracket", "[::1"],
+    ["a name with whitespace in it", "exa mple.com"],
+    ["an empty name", ""],
+  ];
+
+  for (const [what, host, allowOrigins] of [...refused, ...malformed.map(([w, h]) => [w, h, []] as [string, string, string[]])]) {
+    test(`refuses ${what} with 0x02 and opens no stream`, async () => {
+      const p = proxy({ allowOrigins });
+      const c = await greeted(p.port);
+      c.send(name(host, 443));
+      expect(await c.read(10)).toEqual(REPLY(0x02));
+      expect(p.opened).toEqual([]);
+    });
+  }
+});
+
 describe("A9 allowed CONNECTs", () => {
   // The target carries the name or literal exactly as matched; an IPv6 literal is bracketed so
   // `tcp:<host>:<port>` stays parseable at the workbench end.
@@ -191,6 +245,11 @@ describe("A9 allowed CONNECTs", () => {
     ["an address just outside 172.16/12", ipv4("172.32.0.1", 443), [], "tcp:172.32.0.1:443"],
     ["an address just outside 100.64/10", ipv4("100.63.255.255", 443), [], "tcp:100.63.255.255:443"],
     ["a public IPv6 literal, bracketed in the target", ipv6("2606:4700::1111", 443), [], "tcp:[2606:4700::1111]:443"],
+    // A literal the ranges do not refuse is still allowed when it arrives in the name field, and
+    // reaches the workbench in the same canonical spelling an ATYP 0x01/0x04 request would.
+    ["a public IPv4 literal sent as a name", name("93.184.216.34", 80), [], "tcp:93.184.216.34:80"],
+    ["a public IPv6 literal sent as a bracketed name", name("[2606:4700::1111]", 443), [], "tcp:[2606:4700::1111]:443"],
+    ["a public IPv4 literal in its short form", name("93.184.55330", 80), [], "tcp:93.184.216.34:80"],
   ];
 
   for (const [what, req, allowOrigins, target] of cases) {
@@ -255,6 +314,48 @@ describe("A9 the stream", () => {
     expect(await c.read(13)).toEqual(new Uint8Array([...REPLY(0x00), 0x16, 0x03, 0x01]));
   });
 
+  test("concatenates several pre-ACK chunks once, in order, behind the reply", async () => {
+    const p = proxy();
+    const c = await greeted(p.port);
+    c.send(name("example.com", 443));
+    const s = await p.next();
+
+    s.stream.onData!(u8(0x16, 0x03));
+    s.stream.onData!(u8(0x01));
+    s.stream.onData!(u8(0x02, 0x03));
+    s.stream.onAck!();
+    expect(await c.read(15)).toEqual(new Uint8Array([...REPLY(0x00), 0x16, 0x03, 0x01, 0x02, 0x03]));
+  });
+
+  // The remote side is whatever holds the org's companion token, and it can send DATA the browser never
+  // asked for. Both windows are driven: before the ACK, where nothing can go out at all, and after it,
+  // where a browser that stops reading is the same unbounded queue.
+  test("answers 0x04 and closes a stream that floods DATA past the cap before its ACK", async () => {
+    const p = proxy({ ackMs: 10_000 });
+    const c = await greeted(p.port);
+    c.send(name("example.com", 443));
+    const s = await p.next();
+
+    const chunk = new Uint8Array(256 * 1024);
+    for (let i = 0; i < 8 && !s.closed; i++) s.stream.onData!(chunk);
+    await until(() => s.closed);
+    expect(await c.read(10)).toEqual(REPLY(0x04));
+  });
+
+  test("closes an open stream when the browser socket stops taking the bytes", async () => {
+    const p = proxy();
+    const c = await greeted(p.port);
+    c.send(name("example.com", 443));
+    const s = await p.next();
+    s.stream.onAck!();
+    expect(await c.read(10)).toEqual(REPLY(0x00));
+
+    c.pause(); // a browser that has stopped reading; the kernel buffers fill and `write` goes partial
+    const chunk = new Uint8Array(256 * 1024);
+    for (let i = 0; i < 256 && !s.closed; i++) s.stream.onData!(chunk);
+    await until(() => s.closed);
+  });
+
   test("answers 0x04 and closes the stream when no ACK arrives in time", async () => {
     const p = proxy({ ackMs: 20 });
     const c = await greeted(p.port);
@@ -297,7 +398,13 @@ describe("A9 --allow-origin parsing", () => {
   });
 
   test("refuses a malformed origin as a usage error", () => {
-    for (const bad of ["", "app.example.com:0", "app.example.com:99999", "app.example.com:http", "[::1", "a b.example"]) {
+    const bads = [
+      "", "app.example.com:0", "app.example.com:99999", "app.example.com:http", "[::1", "a b.example",
+      // HOST[:PORT] and nothing else: a value carrying URL syntax is not silently reduced to its host.
+      "example.com/path", "example.com/", "http://example.com", "user@example.com", "user:pass@example.com",
+      "example.com?q=1", "example.com#frag", "example.com:443/x", "%65xample.com", "exam\tple.com",
+    ];
+    for (const bad of bads) {
       let e: unknown;
       try {
         parseAllowOrigin(bad);
@@ -359,15 +466,18 @@ test("a backed-up relay pauses the real browser socket, and the bytes flow again
 
     const kib = new Uint8Array(1024).fill(7);
     buffered = PAUSE_ABOVE + 1;
-    c.send(kib); // the write the relay notices the queue on, and pauses this socket for
-    await until(() => sent.length === 2);
+    c.send(kib); // the write the relay notices its queue on, and pauses this socket for
+    await Bun.sleep(50);
+    // Whether that write goes out before the pause or waits with the queue is the relay's business, so
+    // this reads the count rather than naming it: measured 2 when the relay sent it, 1 once it held it.
+    const stalled = sent.length;
 
     for (let i = 0; i < 64; i++) c.send(kib);
     await Bun.sleep(50);
-    expect(sent.length).toBe(2); // 64 KiB into a paused socket reached the relay as nothing
+    expect(sent.length).toBe(stalled); // 64 KiB into a paused socket reached the relay as nothing
 
     buffered = 0;
-    await until(() => sent.length > 2);
+    await until(() => sent.length > stalled);
   } finally {
     ac.abort();
     await run;

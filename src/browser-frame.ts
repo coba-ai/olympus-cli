@@ -22,7 +22,9 @@ export const MAX_PAYLOAD = 256 * 1024;
 
 const HEADER = 5;
 const ENC = new TextEncoder();
-const DEC = new TextDecoder();
+// `fatal` so a byte sequence that is not UTF-8 raises instead of becoming replacement characters.
+// `cdpReader` is the only user; a CDP message is JSON and the workbench is the untrusted side (§3).
+const DEC = new TextDecoder("utf-8", { fatal: true });
 const isOp = (n: number): n is Op => n === OPEN || n === DATA || n === CLOSE || n === ACK;
 
 export type Frame = { id: number; op: Op; payload: Uint8Array };
@@ -78,20 +80,30 @@ export type CdpReader = {
    * Whole messages in arrival order; a partial tail is held for the next call. Nothing, once closed.
    * The tail is held BY REFERENCE, so a caller that reuses its buffer must copy before pushing —
    * `browser-relay.ts` already does (its COPY comment), and nothing else calls this.
+   *
+   * THROWS on a prefix declaring more than `max`, and on a completed message that is not valid
+   * UTF-8. Both are the untrusted peer's input (§3); `browser-relay.ts` kills the stream on either.
+   * The tail is in whatever state the throw left it, so a reader that has thrown is not reused.
    */
   push: (bytes: Uint8Array) => string[];
+  /**
+   * WIRE bytes — the 4-byte prefix included — held for a message that has not completed. This is
+   * the only quantity a ceiling may be counted in: it is what arrived, not what a decode produced.
+   */
+  readonly held: number;
   /** Drops the half-assembled tail, so a fragment arriving after it is dropped rather than buffered. */
   close: () => void;
 };
 
-// Nothing bounds how much an open stream can make this hold: the length prefix is trusted, and the
-// workbench is the untrusted side (§3). No cap is in the contract, so none is imposed here;
-// `browser-relay.ts` bounds it per stream instead.
+// `max` is the largest message, in wire bytes, this reader will assemble. A prefix declaring more
+// throws the moment the prefix is whole, so the body is never buffered at all — which is why `held`
+// is always under `max` when `push` returns, and why no caller has to bound the tail itself. The
+// default is unbounded, for a caller reading messages it produced (`test/browser.test.ts`).
 //
 // The held tail is a LIST of chunks, concatenated only when a whole message is there, so each byte
 // is copied once. Holding one buffer and rebuilding it on every push was quadratic: unit 2.1
 // measured ~330 ms to feed 16 MiB in 256 KiB frames that way.
-export function cdpReader(): CdpReader {
+export function cdpReader(max = Infinity): CdpReader {
   let chunks: Uint8Array[] = [];
   let held = 0; // bytes across `chunks`
   let closed = false;
@@ -132,10 +144,21 @@ export function cdpReader(): CdpReader {
       for (;;) {
         if (held < 4) break;
         const len = ((at(0) << 24) | (at(1) << 16) | (at(2) << 8) | at(3)) >>> 0;
+        // Before the body is buffered, not after: refusing on what the prefix declares is what
+        // keeps the tail bounded regardless of how many bytes actually arrive behind it.
+        if (4 + len > max) throw new Error(`a cdp message declaring ${4 + len} bytes; the limit is ${max}`);
         if (held < 4 + len) break;
-        out.push(DEC.decode(take(4 + len).subarray(4)));
+        const body = take(4 + len).subarray(4);
+        try {
+          out.push(DEC.decode(body));
+        } catch {
+          throw new Error(`a cdp message of ${body.length} bytes that is not valid UTF-8`);
+        }
       }
       return out;
+    },
+    get held() {
+      return held;
     },
     close() {
       closed = true;

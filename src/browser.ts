@@ -13,7 +13,7 @@ import { discoverChrome, launchChrome, type Chrome, type ChromeProcess } from ".
 import { createRelay, type CdpChannel, type RelayConnect, type RelayEvent } from "./browser-relay";
 import { parseAllowOrigin, startSocksProxy } from "./browser-socks";
 import { pairBrowser, readBrowserMachine, type BrowserMachine } from "./browser-store";
-import { CliError, usage, type Io } from "./core";
+import { CliError, fail, usage, type Io } from "./core";
 import { clean } from "./format";
 import { checkFlags } from "./tasks";
 
@@ -36,6 +36,9 @@ export type AttachSeams = {
 };
 
 const chromeFailed = (message: string) => new CliError(5, { error: { code: "chrome_failed", message } });
+
+/** CDP commands one workbench stream may buffer while Chromium starts; past it the stream is closed. */
+const QUEUE_MAX = 256;
 
 /**
  * The BROWSER-level CDP endpoint, read from `/json/version` — never a page's. A page endpoint has no
@@ -101,7 +104,13 @@ async function attach(io: Io, json: boolean, o: Attach, signal: AbortSignal, sea
     await hold(io, line, (s) => void (!json && io.err(s + "\n")), o, signal, seams);
     line({ state: "exit", code: 0 });
   } catch (e) {
-    if (e instanceof CliError) line({ state: "exit", code: e.exit });
+    if (!(e instanceof CliError)) throw e;
+    // The reason is printed HERE, before the exit line, rather than by cli.ts's catch after it: a
+    // consumer reading `--json` line by line would otherwise read the exit code before knowing why.
+    // cli.ts's `browser` branch returns the exit code without calling fail() again, which is the only
+    // thing keeping this from printing twice.
+    fail(io, json, e);
+    line({ state: "exit", code: e.exit });
     throw e;
   }
 }
@@ -116,7 +125,7 @@ async function hold(io: Io, line: Line, say: Say, o: Attach, signal: AbortSignal
   if (o.code !== undefined) {
     // Sent verbatim: the server normalises the code itself (`BrowserMachine.claim!` upcases and
     // strips non-letters), so a second normalisation here could only disagree with it.
-    ({ machine } = await pairBrowser(io, o.host, { code: o.code, name: o.name }));
+    ({ machine } = await pairBrowser(io, o.host, { code: o.code, name: o.name }, signal));
     line({ state: "paired", machine_id: machine.machine_id, name: machine.name });
     say(`Paired this computer as ${clean(machine.name)}.`);
   } else {
@@ -173,20 +182,39 @@ async function hold(io: Io, line: Line, say: Say, o: Attach, signal: AbortSignal
     let sock: CdpSocket | undefined;
     const queued: string[] = [];
     let dropped = false;
+    // Everything this stream still holds: the buffer, and the socket if it got one. Called on close and
+    // on overflow, so neither leaves a queue behind.
+    const drop = () => {
+      dropped = true;
+      queued.length = 0;
+      sock?.close();
+    };
     const filter = cdpFilter(
-      (m) => (sock ? sock.send(m) : queued.push(m)),
+      (m) => {
+        if (sock) return sock.send(m);
+        if (dropped) return;
+        // `queued` holds what the filter emits before Chromium's socket exists. At QUEUE_MAX the
+        // stream is closed and the buffer dropped rather than grown; the workbench opens another when
+        // it wants one. Nothing here measures how full it gets — this is a bound, not a tuning. The
+        // relay's own per-stream caps are a different thing, in browser-relay.ts.
+        if (queued.length >= QUEUE_MAX) {
+          drop();
+          return cdp.close();
+        }
+        queued.push(m);
+      },
       (m) => cdp.send(m),
     );
     // Set on the tick the stream is handed over, as `CdpChannel` requires: a command that arrives
     // before Chromium is up waits in `queued` rather than being lost.
     cdp.onMessage = filter.fromWorkbench;
-    cdp.onClose = () => {
-      dropped = true;
-      sock?.close();
-    };
+    cdp.onClose = drop;
     void (async () => {
       try {
         const c = await launch();
+        // The stream went away while Chromium was starting, so no connection is opened for it. Nothing
+        // cancels a connectCdp already in flight; the check below closes the socket it resolves.
+        if (dropped) return;
         const s = await (seams.connectCdp ?? connectBrowserCdp)(c.port);
         if (dropped) return s.close();
         s.onMessage = filter.fromBrowser;

@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
   ACK, cdpReader, chunkPayload, CLOSE, DATA, decodeFrame, encodeCdp, encodeFrame, isLaptopStream, isWorkbenchStream, MAX_PAYLOAD, OPEN,
-  type CdpSend, type Stream, type StreamOpener,
 } from "../src/browser-frame";
 
 const ENC = new TextEncoder();
@@ -134,37 +133,28 @@ describe("A1 cdp length prefix", () => {
     expect(r.push(framed.subarray(6))).toEqual([]);
     expect(r.push(encodeCdp('{"id":10}'))).toEqual([]); // nothing resumes it, and the tail is gone
   });
-});
 
-describe("A1 seam types", () => {
-  test("an opener allocates the even id; a CdpSend length-prefixes onto a reader", () => {
-    const wire: Uint8Array[] = [];
-    let last = 0;
-    const open: StreamOpener = (target) => {
-      const id = (last += 2);
-      wire.push(encodeFrame(id, OPEN, ENC.encode(target)));
-      return {
-        write: (b) => void chunkPayload(b).forEach((c) => wire.push(encodeFrame(id, DATA, c))),
-        close: () => void wire.push(encodeFrame(id, CLOSE)),
-      };
-    };
-    const s: Stream = open("tcp:127.0.0.1:443");
-    const seen: Uint8Array[] = [];
-    s.onData = (b) => void seen.push(b);
-    s.write(bytes(1, 2, 3));
-    s.close();
+  // `held` is what a ceiling may be counted in, and the two ways the untrusted side gets it wrong.
+  test("held is wire bytes; an oversize declaration throws before its body is buffered, and invalid UTF-8 throws", () => {
+    const r = cdpReader(1024);
+    expect(r.held).toBe(0);
+    r.push(encodeCdp('{"id":1}').subarray(0, 7)); // one byte short of whole
+    expect(r.held).toBe(7);
+    expect(r.push(encodeCdp('{"id":1}').subarray(7))).toEqual(['{"id":1}']);
+    expect(r.held).toBe(0);
 
-    const frames = wire.map(decodeFrame);
-    expect(frames.map((f) => f.op)).toEqual([OPEN, DATA, CLOSE]);
-    expect(frames.every((f) => isLaptopStream(f.id))).toBe(true);
-    expect(DEC.decode(frames[0]!.payload)).toBe("tcp:127.0.0.1:443");
-    s.onData(frames[1]!.payload);
-    expect(seen).toEqual([bytes(1, 2, 3)]);
+    // Declared 2048, limit 1024: refused on the prefix alone, with no body behind it at all.
+    const over = new Uint8Array(4);
+    new DataView(over.buffer).setUint32(0, 2048);
+    expect(thrown(() => r.push(over)).message).toContain("the limit is 1024");
+    expect(r.held).toBe(4); // the prefix, and nothing it declared
 
-    const r = cdpReader();
-    const read: string[] = [];
-    const send: CdpSend = (m) => void read.push(...r.push(encodeCdp(m)));
-    send('{"id":1,"method":"Page.navigate"}');
-    expect(read).toEqual(['{"id":1,"method":"Page.navigate"}']);
+    // A completed message whose bytes are not UTF-8. Decoding them yields replacement characters
+    // three bytes each, which is the arithmetic a decode-derived count was fooled by.
+    const bad = cdpReader();
+    const body = new Uint8Array(4 + 8).fill(0xff);
+    new DataView(body.buffer).setUint32(0, 8);
+    expect(thrown(() => bad.push(body)).message).toContain("not valid UTF-8");
+    expect(ENC.encode("\uFFFD").length).toBe(3); // the receipt for "three bytes each"
   });
 });

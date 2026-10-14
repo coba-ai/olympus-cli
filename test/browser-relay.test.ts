@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { ACK, CLOSE, DATA, MAX_PAYLOAD, OPEN, decodeFrame, encodeCdp, encodeFrame } from "../src/browser-frame";
+import { ACK, CLOSE, DATA, MAX_PAYLOAD, OPEN, cdpReader, decodeFrame, encodeCdp, encodeFrame } from "../src/browser-frame";
 import {
   createRelay,
   relayUrl,
@@ -21,6 +21,8 @@ const enc = (s: string) => ENC.encode(s);
 const PAUSE_ABOVE = 4 * 1024 * 1024;
 const RESUME_BELOW = 1024 * 1024;
 const CEILING = 16 * 1024 * 1024;
+const TOTAL_CEILING = 32 * 1024 * 1024;
+const MAX_CDP_STREAMS = 8;
 const STALLED =
   "the organization's agent machine is not answering the relay; it may be on an older image — ask an operator to redeploy it";
 
@@ -472,6 +474,13 @@ test("an ACK on anything but a live laptop stream closes it, or is dropped if th
   expect(a.events.filter((e) => e.state === "closed")).toEqual([]);
 });
 
+/** A §4 inner length prefix declaring `n` payload bytes. */
+const prefix = (n: number) => {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n);
+  return b;
+};
+
 test("closes a cdp stream whose declared length never completes, past the reassembly ceiling", async () => {
   const a = await online();
   a.f.h!.message(encodeFrame(1, OPEN, enc("cdp")));
@@ -482,12 +491,149 @@ test("closes a cdp stream whose declared length never completes, past the reasse
 
   // A prefix claiming 64 MiB, then full-size DATA frames that never get there.
   const chunk = new Uint8Array(MAX_PAYLOAD - 4);
-  const head = new Uint8Array(4);
-  new DataView(head.buffer).setUint32(0, 64 * 1024 * 1024);
-  a.f.h!.message(encodeFrame(1, DATA, new Uint8Array([...head, ...chunk])));
+  a.f.h!.message(encodeFrame(1, DATA, new Uint8Array([...prefix(64 * 1024 * 1024), ...chunk])));
   for (let held = chunk.length; held <= CEILING && !closed; held += chunk.length) a.f.h!.message(encodeFrame(1, DATA, chunk));
 
   expect(closed).toBe(true);
   expect(a.f.frames().at(-1)).toMatchObject({ id: 1, op: CLOSE });
   expect(a.events.at(-1)).toMatchObject({ state: "refused", id: 1, target: "cdp" });
+});
+
+// The ceiling used to be counted by subtracting the byte length of each DECODED message, so bytes
+// that are not UTF-8 — replacement characters re-encode to three bytes each, one per bad byte —
+// paid back more than they cost and accumulated negative credit to spend on an incomplete message.
+// Reproduced at 25 MiB retained on one stream.
+test("malformed UTF-8 buys no credit against the reassembly ceiling", async () => {
+  const a = await online();
+  a.f.h!.message(encodeFrame(1, OPEN, enc("cdp")));
+  const cdp = a.cdps[0]!;
+  let closed = false;
+  cdp.onClose = () => (closed = true);
+
+  // 200 000 bytes of 0xFF, declared and complete: 200 004 bytes in, 600 000 bytes of replacement
+  // characters out.
+  const bad = new Uint8Array([...prefix(200_000), ...new Uint8Array(200_000).fill(0xff)]);
+  let fed = 0;
+  for (let i = 0; i < 50 && !closed; i++) {
+    a.f.h!.message(encodeFrame(1, DATA, bad));
+    fed += bad.length;
+  }
+  // Then an incomplete message, spending whatever credit those bought.
+  const chunk = new Uint8Array(MAX_PAYLOAD);
+  if (!closed) {
+    a.f.h!.message(encodeFrame(1, DATA, prefix(64 * 1024 * 1024)));
+    fed += 4;
+  }
+  for (let i = 0; i < 200 && !closed; i++) {
+    a.f.h!.message(encodeFrame(1, DATA, chunk));
+    fed += chunk.length;
+  }
+
+  expect(closed).toBe(true);
+  expect(fed).toBeLessThanOrEqual(CEILING);
+  expect(a.f.frames().at(-1)).toMatchObject({ id: 1, op: CLOSE });
+  expect(a.events.at(-1)).toMatchObject({ state: "refused", id: 1, target: "cdp" });
+});
+
+test("caps how many cdp streams are live at once, refusing a further OPEN with CLOSE", async () => {
+  const a = await online();
+  for (let i = 0; i < MAX_CDP_STREAMS; i++) a.f.h!.message(encodeFrame(2 * i + 1, OPEN, enc("cdp")));
+  expect(a.cdps.length).toBe(MAX_CDP_STREAMS);
+
+  const over = 2 * MAX_CDP_STREAMS + 1;
+  a.f.h!.message(encodeFrame(over, OPEN, enc("cdp")));
+  expect(a.cdps.length).toBe(MAX_CDP_STREAMS); // refused, not handed on
+  expect(a.f.frames().at(-1)).toMatchObject({ id: over, op: CLOSE });
+  expect(a.events.at(-1)).toMatchObject({ state: "refused", id: over, target: "cdp" });
+
+  // Closing one makes room: the cap is on live streams, not on how many were ever opened.
+  a.f.h!.message(encodeFrame(1, CLOSE));
+  a.f.h!.message(encodeFrame(over, OPEN, enc("cdp")));
+  expect(a.cdps.length).toBe(MAX_CDP_STREAMS + 1);
+  expect(a.events.at(-1)).toMatchObject({ state: "stream", id: over, target: "cdp" });
+});
+
+test("caps cdp reassembly across all streams, not only per stream", async () => {
+  const a = await online();
+  const streams = 4;
+  const closed: number[] = [];
+  for (let i = 0; i < streams; i++) {
+    const id = 2 * i + 1;
+    a.f.h!.message(encodeFrame(id, OPEN, enc("cdp")));
+    a.cdps[i]!.onClose = () => closed.push(id);
+  }
+
+  // Each declares 15 MiB — comfortably under the per-stream ceiling — and never completes it.
+  let fed = 0;
+  for (let i = 0; i < streams; i++) {
+    a.f.h!.message(encodeFrame(2 * i + 1, DATA, prefix(15 * 1024 * 1024)));
+    fed += 4;
+  }
+  const chunk = new Uint8Array(MAX_PAYLOAD);
+  for (let round = 0; round < 50 && !closed.length; round++) {
+    for (let i = 0; i < streams && !closed.length; i++) {
+      a.f.h!.message(encodeFrame(2 * i + 1, DATA, chunk));
+      fed += chunk.length;
+    }
+  }
+
+  expect(closed.length).toBe(1); // the stream the crossing frame arrived on, and only that one
+  // The frame that would have crossed the total is refused rather than buffered, so what the readers
+  // ever held is `fed` minus that frame.
+  expect(fed - MAX_PAYLOAD).toBeLessThanOrEqual(TOTAL_CEILING);
+  expect(a.events.at(-1)).toMatchObject({ state: "refused", id: closed[0]!, target: "cdp" });
+  expect(a.cdps.length).toBe(streams); // the other three are still live
+});
+
+// The existing backpressure tests drive TCP writes of one frame each, which never exercise what
+// fragmenting does once the threshold is crossed mid-write.
+test("A5: stops fragmenting a large CDP response into a socket already over the threshold", async () => {
+  const a = await online();
+  a.f.h!.message(encodeFrame(1, OPEN, enc("cdp")));
+  const cdp = a.cdps[0]!;
+  const big = JSON.stringify({ id: 1, result: { data: "x".repeat(1024 * 1024) } });
+  const parts = Math.ceil(encodeCdp(big).length / MAX_PAYLOAD);
+  expect(parts).toBe(5);
+
+  a.f.buffered = PAUSE_ABOVE + 1;
+  const before = a.f.sent.length;
+  cdp.send(big);
+  expect(a.f.sent.length).toBe(before); // not one fragment into a buffer that is already over
+  expect(a.paused).toEqual([true]); // and the pause is published without waiting for a send
+
+  a.f.buffered = 0;
+  await until(() => a.f.sent.length - before === parts);
+  const frames = a.f.frames().slice(before);
+  expect(frames.map((f) => [f.id, f.op])).toEqual(frames.map(() => [1, DATA]));
+  // In order, and whole: the deferred remainder is the same bytes, not a re-fragmentation.
+  const r = cdpReader();
+  expect(frames.flatMap((f) => r.push(f.payload))).toEqual([big]);
+  expect(a.paused).toEqual([true, false]);
+});
+
+test("A5: a stream registered while the pause is active is paused too — tcp and the cdp seam alike", async () => {
+  const a = await online();
+  const first = a.r.open("tcp:example.com:443");
+  a.f.buffered = PAUSE_ABOVE + 1;
+  first.write(new Uint8Array(1));
+  expect(a.paused).toEqual([true]);
+
+  const seen: string[] = [];
+  const late = a.r.open("tcp:example.com:80");
+  late.pause = () => seen.push("tcp pause");
+  late.resume = () => seen.push("tcp resume");
+
+  // `CdpChannel.pause`/`resume` is the seam for reaching Chromium's socket; nothing in the app sets
+  // it yet (`browser.ts`), so this test is its only caller.
+  a.f.h!.message(encodeFrame(1, OPEN, enc("cdp")));
+  const cdp = a.cdps[0]!;
+  cdp.pause = () => seen.push("cdp pause");
+  cdp.resume = () => seen.push("cdp resume");
+
+  await until(() => seen.length === 2);
+  expect(seen).toEqual(["tcp pause", "cdp pause"]);
+
+  a.f.buffered = 0;
+  await until(() => seen.length === 4);
+  expect(seen).toEqual(["tcp pause", "cdp pause", "tcp resume", "cdp resume"]);
 });

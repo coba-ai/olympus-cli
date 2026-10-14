@@ -198,6 +198,11 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       process.once("SIGINT", abort);
       try {
         await attach(host, signal);
+      } catch (e) {
+        // attach() has already printed this one, ahead of its final `--json` exit line; fail() here
+        // would print it a second time and put the reason after the exit code.
+        if (e instanceof CliError) return e.exit;
+        throw e;
       } finally {
         process.off("SIGINT", abort);
       }

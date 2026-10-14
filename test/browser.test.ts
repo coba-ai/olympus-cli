@@ -184,6 +184,26 @@ test("a pair refusal maps through exitForStatus unchanged: 404 → 3", async () 
   expect(lines()).toEqual([{ state: "exit", code: 3 }]);
 });
 
+test("--json prints the reason before the final exit line", async () => {
+  // One ordered sink: `io.o` and `io.e` are separate arrays, so they cannot show how the two interleave.
+  const seq: string[] = [];
+  const ordered: Io = { ...io, out: (s) => void seq.push(s), err: (s) => void seq.push(s) };
+  expect(await run(["browser", "attach", "--host", fake.url, "--json"], ordered)).toBe(1);
+  expect(seq.map((s) => JSON.parse(s))).toEqual([
+    { error: { code: "usage", message: expect.stringContaining("no paired computer") } },
+    { state: "exit", code: 1 },
+  ]);
+});
+
+test("a token-shaped machine id is refused, never printed in the paired line", async () => {
+  const LEAK = "obm_fake_not_a_real_token"; // obviously fake; this repo is public
+  const relay_url = `${fake.url.replace(/^http/, "ws")}/api/v1/browser/relay`;
+  fake.state.next = { status: 201, body: { data: { token: LEAK, machine_id: LEAK, relay_url } } };
+  expect(await run(["browser", "attach", PAIR_CODE, "--host", fake.url, "--json"], io)).toBe(5);
+  expect(states()).toEqual(["exit"]); // no `paired` line at all
+  expect(out() + io.e.join("")).not.toContain(LEAK);
+});
+
 test("a refused handshake backs off to the cap and exits 5, naming no cause the client cannot know", async () => {
   const relay = newRelay(503);
   await seedMachine(hostOf(relay), relay.token);
@@ -272,6 +292,11 @@ async function attachWithChrome(opts: { streams: number[] }) {
   await until(() => states().includes("online"), "online");
   for (const id of opts.streams) laptop.send(encodeFrame(id, OPEN, ENC.encode("cdp")));
   await until(() => sockets.length === opts.streams.length, "the cdp connections");
+  // Each connection opens with the filter's own setup, and nothing is forwarded until that setup has
+  // succeeded (browser-cdp.ts), so the fake browser answers it the way Chromium would.
+  await until(() => sockets.every((s) => !!s.onMessage && s.sent.length > 0), "the per-connection setup");
+  await Bun.sleep(5);
+  for (const s of sockets) for (const m of s.sent) s.onMessage!(JSON.stringify({ id: JSON.parse(m).id, result: {} }));
   return { relay, laptop, argvs, profiles, sockets, p, killed: () => killed, exitChrome: exit };
 }
 
@@ -305,9 +330,16 @@ test("one filter per cdp connection: a page session on one stream is not a page 
   const h = await attachWithChrome({ streams: [1, 3] });
   const [first, second] = h.sockets as [FakeCdp, FakeCdp];
 
+  // Each socket may already carry the filter's own per-connection setup (browser-cdp.ts); what this
+  // test is about is what the page attach adds, so both streams are measured from where they stand.
+  const [from1, from3] = [first.sent.length, second.sent.length];
   // The browser tells stream 1's filter that S1 is a page session (A8's three setup commands follow).
   first.onMessage!(JSON.stringify({ method: "Target.attachedToTarget", params: { sessionId: "S1", targetInfo: { type: "page" } } }));
-  expect(first.sent.map((m) => JSON.parse(m).method)).toEqual(["Page.enable", "Page.setDownloadBehavior", "Page.setInterceptFileChooserDialog"]);
+  const setup = first.sent.slice(from1).map((m) => JSON.parse(m));
+  expect(setup.map((m) => m.method)).toEqual(["Page.enable", "Page.setDownloadBehavior", "Page.setInterceptFileChooserDialog"]);
+  // The session is usable only once all three have succeeded (browser-cdp.ts's A8 paused attachment),
+  // so the browser answers them the way Chromium would.
+  for (const m of setup) first.onMessage!(JSON.stringify({ id: m.id, result: {}, sessionId: "S1" }));
 
   const navigate = JSON.stringify({ id: 7, method: "Page.navigate", params: { url: "https://example.com/" }, sessionId: "S1" });
   h.laptop.send(encodeFrame(1, DATA, encodeCdp(navigate)));
@@ -316,7 +348,7 @@ test("one filter per cdp connection: a page session on one stream is not a page 
 
   // Stream 1 knows S1 and forwards it verbatim; stream 3's filter never saw that attach.
   expect(first.sent.at(-1)).toBe(navigate);
-  expect(second.sent).toEqual([]);
+  expect(second.sent.slice(from3)).toEqual([]);
   expect(sentOn(h.laptop, 3)).toEqual([{ id: 7, error: { code: -32000, message: expect.stringContaining("never attached to a page target") }, sessionId: "S1" }]);
   // Stream 1 carried the browser's event back and no refusal at all.
   expect(sentOn(h.laptop, 1)).toEqual([{ method: "Target.attachedToTarget", params: { sessionId: "S1", targetInfo: { type: "page" } } }]);
