@@ -74,11 +74,20 @@ export function chromeFlags(o: { profileDir: string; socksPort: number }): strin
     "--no-first-run",
     "--no-default-browser-check",
     // Chromium's own calls home leave through the tunnel, from the organization's IP, because every
-    // connection does (§5.4) and the default rule is allow. MEASURED by unit 2.3 against a fresh,
-    // signed-out, extension-free browser: `www.google.com`, `accounts.google.com` and
-    // `clients2.google.com`. These two are the flags that stop the background fetches and the
-    // component/extension updater (`clients2.google.com`) respectively. Nothing here re-measures what
-    // is left: no test launches a browser, so the ship gate's live drive is the only check.
+    // connection does (§5.4) and the default rule is allow.
+    //
+    // THESE TWO FLAGS DO NOT STOP THAT, and the comment that used to stand here said they did. Run
+    // against Chromium 152.0.7977.82 with a SOCKS server logging every CONNECT, a fresh signed-out
+    // profile on `about:blank` reaches for six hosts — `clients2.google.com:80`,
+    // `redirector.gvt1.com`, `www.google.com`, `accounts.google.com`, `android.clients.google.com`,
+    // `optimizationguide-pa.googleapis.com` — and the list is BYTE-IDENTICAL with the flags and
+    // without them. A live drive against production saw two of those six arrive as `tcp:` streams,
+    // so this is not an artefact of the local harness.
+    //
+    // They stay because they cost nothing and other Chrome builds may honour them, but nothing here
+    // enforces any bound on what a launched browser contacts: the only real control is the tunnel's
+    // own origin policy (§5.5), and its default is allow. A member who needs that bound passes
+    // `--allow-origin`, which refuses all six.
     "--disable-background-networking",
     "--disable-component-update",
     // A start page that needs no network. Chromium's new-tab page would otherwise be the first thing
