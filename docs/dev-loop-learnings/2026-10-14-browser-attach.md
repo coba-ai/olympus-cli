@@ -75,6 +75,34 @@ them.** One passed with the behaviour it tested deleted — verified by deleting
 the "does this test fail if I break the thing" check after any round that changes shared machinery,
 not only when the test is written.
 
+## What the first live drive overturned, same day
+
+Shipped, then driven against production with a hand-written workbench client. Three things only a
+real browser and a real peer could show.
+
+**Two flags claimed to suppress Chromium's calls home, and suppress nothing.** The comment said
+`--disable-background-networking` and `--disable-component-update` stopped the background fetches
+and the component updater. Measured on Chromium 152 with a SOCKS server logging every CONNECT: a
+fresh signed-out profile on `about:blank` reaches six Google hosts, and the list is byte-identical
+with the flags and without them. Production agreed — two of the six arrived as `tcp:` streams. The
+giveaway was in the comment itself: it listed hosts measured from a browser run *without* the
+flags, then asserted what the flags did, which no one ran. **A measurement of the before state is
+not a measurement of the fix**, and putting both in one paragraph hides which half was observed.
+
+**The laptop does not reap a departed workbench's streams.** A second workbench connection reusing
+stream id 1 had it closed immediately — correct behaviour (a duplicate OPEN on a live id kills
+both) applied to a stream that should no longer have been live. Nothing on either side tears down
+a disconnected workbench's streams, so a reconnecting bridge must never restart its id counter.
+No test could have caught this: the suite has one workbench at a time.
+
+**The parts that worked, worked first time** — relay, lazy launch on the first `cdp` OPEN, and the
+`tcp:`/ACK egress path end to end. The ACK, which was the loop's most expensive correction, was
+right.
+
+The shape across all three: the two that broke were both **claims about a peer nobody had** —
+Chromium's behaviour under flags, and a second workbench. Every seam the suite could fake, it
+faked correctly.
+
 ## Practical notes
 
 - Agents working in one shared worktree see each other's half-written files. Scoping the typecheck

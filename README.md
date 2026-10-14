@@ -229,8 +229,10 @@ window. That is the command working, not stalling. When it does launch it gets a
 made per run and removed on exit — signed out, no extensions, no sync, never your own profile — and every
 connection it makes leaves through a loopback SOCKS5 proxy, down the tunnel, and out of **the
 organization's machine**, including Chromium's own startup calls to Google. `--disable-background-networking`
-and `--disable-component-update` are set; whether they suppress all of that traffic is unverified, since no
-test launches a browser. The binary is `$OLYMPUS_CHROME` if set, else the first of `chromium`,
+and `--disable-component-update` are set and, measured against Chromium 152 with a logging SOCKS server,
+**suppress none of it**: a fresh signed-out profile on `about:blank` still reaches six Google hosts, the
+same six with the flags and without them. Pass `--allow-origin` if that traffic must not leave; it refuses
+all six. The binary is `$OLYMPUS_CHROME` if set, else the first of `chromium`,
 `chromium-browser`, `google-chrome`, `google-chrome-stable` on `PATH`, else the two standard macOS
 application paths. Nothing is downloaded, and no browser found is exit 1 — checked before the pairing code
 is spent.
