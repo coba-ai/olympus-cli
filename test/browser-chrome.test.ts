@@ -65,12 +65,13 @@ const BIN = "/fake/bin/chromium";
 async function launch(o: { io?: TestIo; profileDir: string; socksPort?: number; proc?: FakeProc }) {
   const proc = o.proc ?? fakeProc();
   const argv: string[][] = [];
+  const envs: Record<string, string>[] = [];
   const io = o.io ?? makeIo({ OLYMPUS_CHROME: BIN });
   const chrome = launchChrome(io, { socksPort: o.socksPort ?? 1080 }, {
-    spawn: (a) => (argv.push(a), proc),
+    spawn: (a, e) => (argv.push(a), envs.push(e), proc),
     mkProfile: async () => o.profileDir,
   });
-  return { io, proc, argv, chrome };
+  return { io, proc, argv, envs, chrome };
 }
 const port = async (profileDir: string, text: string) => writeFile(join(profileDir, "DevToolsActivePort"), text);
 
@@ -87,11 +88,50 @@ describe("A10 Chromium launch", () => {
       "--no-default-browser-check",
       "--disable-background-networking",
       "--disable-component-update",
+      "--disable-extensions",
+      "--password-store=basic",
+      "about:blank",
+    ]);
+    // The two counter-flags are the last FLAGS; only the positional start page follows them.
+    expect(chromeFlags({ profileDir: "/p", socksPort: 1 }).slice(-3)).toEqual([
+      "--disable-extensions",
+      "--password-store=basic",
       "about:blank",
     ]);
     expect(chromeFlags({ profileDir: "/p", socksPort: 42123 })).toContain(`--proxy-server=${PROXY_SCHEME}://127.0.0.1:42123`);
     // The scheme is 2.3's to change if Chromium pre-resolves names; it is one constant, in one flag.
     expect(PROXY_SCHEME).toBe("socks5");
+  });
+
+  // A launcher on PATH (Arch's /usr/bin/chromium, Debian's /etc/chromium.d/*) injects the member's
+  // own flags into this "throwaway" profile. Measured on Arch: --load-extension with three of their
+  // extensions, --password-store=gnome-libsecret and their OAuth credentials, all in the browser the
+  // organization's agent then drives. What a unit test can hold is only that the two counter-flags
+  // are present and last; defeating a real launcher is checked by reading /proc/<pid>/cmdline, which
+  // nothing here does.
+  test("the launcher counter-flags are present, and last so they beat an injected copy", () => {
+    const f = chromeFlags({ profileDir: "/p", socksPort: 1080 });
+    expect(f).toContain("--disable-extensions");
+    expect(f).toContain("--password-store=basic");
+    // Chromium takes the LAST occurrence, so ours must come after anything a wrapper prepended. The
+    // only position that guarantees it is after every other flag we emit.
+    const store = f.indexOf("--password-store=basic");
+    const exts = f.indexOf("--disable-extensions");
+    expect(Math.min(store, exts)).toBeGreaterThan(f.indexOf("--no-default-browser-check"));
+    expect(f.filter((x) => x.startsWith("--password-store="))).toHaveLength(1);
+  });
+
+  test("spawns with XDG_CONFIG_HOME at the throwaway profile, keeping the rest of the environment", async () => {
+    const profileDir = await tmp("oly-chrome-");
+    await port(profileDir, "9311\n/devtools/browser/4f2e\n");
+    const { envs, chrome } = await launch({ profileDir });
+    await (await chrome).close();
+    // An Arch-style launcher reads $XDG_CONFIG_HOME/chromium-flags.conf; pointing it at the empty
+    // throwaway profile leaves it nothing to find, and the profile is removed on every exit path.
+    expect(envs[0]!.XDG_CONFIG_HOME).toBe(profileDir);
+    // Replacing the environment rather than overlaying it would drop PATH, and the launcher resolves
+    // the real binary through it.
+    expect(envs[0]!.PATH).toBe(process.env.PATH);
   });
 
   test("the profile is the fresh directory it was given, and the browser is the discovered binary", async () => {

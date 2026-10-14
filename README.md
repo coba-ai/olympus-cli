@@ -226,7 +226,7 @@ not touch this file and does not detach; revoke the computer in Settings → Raf
 **No browser opens yet.** Chromium launches on the first CDP stream from the organization's workbench
 bridge, and that bridge does not exist. Today `attach` pairs, connects, reports `online` and opens no
 window. That is the command working, not stalling. When it does launch it gets a throwaway `--user-data-dir`
-made per run and removed on exit — signed out, no extensions, no sync, never your own profile — and every
+made per run and removed on exit — signed out, no sync, never your own profile — and every
 connection it makes leaves through a loopback SOCKS5 proxy, down the tunnel, and out of **the
 organization's machine**, including Chromium's own startup calls to Google. `--disable-background-networking`
 and `--disable-component-update` are set and, measured against Chromium 152 with a logging SOCKS server,
@@ -236,6 +236,16 @@ all six. The binary is `$OLYMPUS_CHROME` if set, else the first of `chromium`,
 `chromium-browser`, `google-chrome`, `google-chrome-stable` on `PATH`, else the two standard macOS
 application paths. Nothing is downloaded, and no browser found is exit 1 — checked before the pairing code
 is spent.
+
+**That binary is frequently a launcher, not the browser**, and a launcher injects your own flags into
+the throwaway profile. Measured on Arch, where `/usr/bin/chromium` reads `~/.config/chromium-flags.conf`:
+the launched browser carried the member's `--load-extension` (three extensions, visible to the agent as
+live targets), `--password-store=gnome-libsecret` and their OAuth client credentials. Debian and Ubuntu
+wrap `chromium` and `google-chrome` the same way via `/etc/chromium.d/*`. `attach` now spawns with
+`XDG_CONFIG_HOME` pointed at the throwaway profile, so an Arch-style launcher finds no conf, and appends
+`--disable-extensions --password-store=basic`, which win as the last occurrence whatever a wrapper added.
+Neither covers every wrapper on its own. If you want certainty, set `OLYMPUS_CHROME` to the real binary
+(`/usr/lib/chromium/chromium` on Arch).
 
 **The browser's local CDP port is unauthenticated.** It is bound to loopback, but Chromium's debugging
 socket carries no credential, so any process running as you can drive that browser past this command's CDP

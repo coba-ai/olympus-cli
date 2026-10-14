@@ -75,7 +75,8 @@ export async function connectBrowserCdp(port: number): Promise<CdpSocket> {
   return sock;
 }
 
-const spawnChrome = (argv: string[]): ChromeProcess => Bun.spawn(argv, { stdio: ["ignore", "ignore", "ignore"] });
+const spawnChrome = (argv: string[], env: Record<string, string>): ChromeProcess =>
+  Bun.spawn(argv, { stdio: ["ignore", "ignore", "ignore"], env });
 
 export type BrowserPlan = (host: string, signal: AbortSignal, seams?: AttachSeams) => Promise<void>;
 
