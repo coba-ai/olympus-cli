@@ -242,7 +242,9 @@ targets without passing the filter at all. Nothing enforces otherwise: the filte
 port. What it does guard is the workbench's side — default-deny by domain (`Page`, `Runtime`, `DOM`, `CSS`,
 `Input`, `Network`, `Fetch`, `Emulation`, `Log`, `Accessibility`, plus a method list for `Target`), on a
 flattened session the filter watched attach to a page target, with a CDP error back on every refusal rather
-than a silent drop; downloads are denied and file choosers cancelled on each page session; navigation and the
+than a silent drop; downloads are denied browser-wide before any workbench command is forwarded, and the
+filter refuses everything if that denial fails to install, while file choosers are cancelled per attached
+page, so a page the filter never sees attach is covered for downloads but not for choosers; navigation and the
 other URL-bearing methods take `http:`, `https:` and `about:blank` only. Allowing a domain admits every
 method in it, the ones the protocol grows next included, and `Runtime.evaluate` is allowed by design, so the
 agent can run arbitrary JavaScript in the pages it drives.
