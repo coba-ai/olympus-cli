@@ -68,7 +68,10 @@ describe("A6 CDP allowlist: what is allowed", () => {
     for (const method of ["Target.getTargets", "Target.setDiscoverTargets", "Target.closeTarget", "Target.activateTarget", "Target.getTargetInfo"])
       expect(refusal({ id: 1, method }, pages)).toBeUndefined();
     expect(refusal({ id: 1, method: "Target.attachToTarget", params: { targetId: "T1", flatten: true } }, pages)).toBeUndefined();
-    expect(refusal({ id: 1, method: "Target.createBrowserContext", params: { disposeOnDetach: true } }, pages)).toBeUndefined();
+    // A plain context: no params at all, the two lifecycle-only forms, and the origins list
+    // present but empty, which grants nothing.
+    for (const params of [undefined, {}, { disposeOnDetach: true }, { originsWithUniversalNetworkAccess: [] }])
+      expect(refusal({ id: 1, method: "Target.createBrowserContext", params }, pages)).toBeUndefined();
   });
 
   test("forwards an allowed command to Chromium byte-for-byte and answers the workbench nothing", () => {
@@ -83,6 +86,19 @@ describe("A6 CDP allowlist: what is allowed", () => {
 describe("A6 CDP allowlist: every refusal", () => {
   test("Target.createBrowserContext with proxyServer", () => {
     refuse({ id: 1, method: "Target.createBrowserContext", params: { proxyServer: "socks5://10.0.0.1:1080" } }, "proxyServer");
+  });
+
+  test("Target.createBrowserContext with proxyBypassList, which routes a host around the tunnel", () => {
+    for (const list of ["<local>", "10.0.0.0/8", "*.member.lan", ""])
+      refuse({ id: 50, method: "Target.createBrowserContext", params: { proxyBypassList: list } }, "proxyBypassList");
+  });
+
+  test("Target.createBrowserContext with a non-empty originsWithUniversalNetworkAccess", () => {
+    for (const origins of [["https://example.test"], ["*"], ["https://a.test", "https://b.test"], "https://example.test", { 0: "https://a.test" }, 1])
+      refuse(
+        { id: 51, method: "Target.createBrowserContext", params: { originsWithUniversalNetworkAccess: origins } },
+        "originsWithUniversalNetworkAccess",
+      );
   });
 
   test("every Browser.* command", () => {

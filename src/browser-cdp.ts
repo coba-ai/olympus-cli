@@ -57,8 +57,8 @@ const DOMAINS = new Set(["Page", "Runtime", "DOM", "CSS", "Input", "Network", "F
 // from inside the page; and `attachToBrowserTarget`, which is a session on the browser target
 // rather than a page. `setRemoteLocations` reaches past page targets too, and so does whatever
 // Target grows next - which is the point of allowlisting the methods instead of the domain.
-// `createBrowserContext` is here because A6 refuses only its `proxyServer` form, and
-// `disposeBrowserContext` is its pair.
+// `createBrowserContext` is here because the rule below refuses the forms of it that widen what
+// the new context may reach, and `disposeBrowserContext` is its pair.
 const TARGET_METHODS = new Set([
   "Target.activateTarget",
   "Target.attachToTarget",
@@ -127,10 +127,28 @@ const RULES: Record<string, Rule> = {
   // sessions exist. CDP's `flatten` defaults to the old nested behaviour, so absent is not true.
   "Target.attachToTarget": (p) => (p.flatten === true ? undefined : "Target.attachToTarget requires flatten: true"),
   "Target.setAutoAttach": (p) => (p.flatten === true ? undefined : "Target.setAutoAttach requires flatten: true"),
-  // A context with its own proxy sends that context's traffic wherever the workbench likes,
-  // outside the SOCKS tunnel every other connection leaves through (§5.4).
-  "Target.createBrowserContext": (p) =>
-    p.proxyServer === undefined ? undefined : "Target.createBrowserContext with proxyServer is refused",
+  // A new context is created with a routing and reach of its own, and three of the four
+  // parameters `browser_protocol.json` gave this method on 2026-10-14 set one wider than the
+  // launched browser's - so all three are refused. Nothing enforces that a parameter added after
+  // that date is found at all; `disposeOnDetach`, the fourth, only says when the context dies.
+  //   proxyServer (A6): that context's traffic leaves wherever the workbench likes, outside the
+  //     SOCKS tunnel every other connection leaves through (§5.4).
+  //   proxyBypassList: the same hole from the other end - a host named here is reached DIRECT from
+  //     the member's machine, which is their LAN, and the launcher's own bypass list is what keeps
+  //     loopback on that path. Whether Chromium honours a bypass list with no proxyServer beside
+  //     it is UNVERIFIED (nothing here launches a browser), so it is refused rather than tested.
+  //   originsWithUniversalNetworkAccess: "a list of origins to grant unlimited cross-origin access
+  //     to" - no proxy involved, the reach widened inside the renderer instead. An empty list
+  //     grants nothing and is allowed; anything else present, array or not, is refused.
+  "Target.createBrowserContext": (p) => {
+    if (p.proxyServer !== undefined) return "Target.createBrowserContext with proxyServer is refused";
+    if (p.proxyBypassList !== undefined)
+      return "Target.createBrowserContext with proxyBypassList is refused: a bypassed host is reached directly, outside the SOCKS tunnel";
+    const origins = p.originsWithUniversalNetworkAccess;
+    if (origins !== undefined && !(Array.isArray(origins) && origins.length === 0))
+      return "Target.createBrowserContext with originsWithUniversalNetworkAccess is refused: it grants those origins unlimited cross-origin access";
+    return undefined;
+  },
   // A8: the filter issues download-deny itself, and the workbench may not undo it. Browser's copy
   // of this method is refused with the rest of that domain.
   "Page.setDownloadBehavior": () => "downloads are denied; Page.setDownloadBehavior is refused",

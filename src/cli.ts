@@ -7,6 +7,7 @@ import {
 } from "./core";
 import { askPlan } from "./ask";
 import { briefingPlan } from "./briefing";
+import { browserPlan } from "./browser";
 import { crmPlan } from "./crm";
 import { dayPlan } from "./days";
 import { sessionsPlan } from "./sessions";
@@ -51,9 +52,12 @@ const USAGE = `usage: olympus <command> [flags]
   event-types   (event names for --event)
   ask AGENT TEXT|- [--session ID] [--timeout SECONDS] [--no-wait]   (exit 1 turn failed, 5 timeout, 6 no agent or session closed)
   sessions [--closed | --all] [--agent SLUG] [--page N]   session get <id> [--after MSG_ID] | session close <id>
+  browser attach [CODE] [--name N] [--allow-origin HOST[:PORT]]...   lend this computer's browser to the org's agent
+    CODE comes from Settings → Rafita; omit it to re-attach this computer. Holds the connection until Ctrl-C.
+    The browser starts when the agent's workbench connects, in a throwaway profile, and all of its traffic leaves through the organization.
   briefing [--day YYYY-MM-DD] [--request]   version | --version
 global flags: --json --host URL --org SLUG -h
-env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG
+env: OLYMPUS_API_KEY OLYMPUS_HOST OLYMPUS_ORG OLYMPUS_CHROME
 exit: 0 ok, 1 usage, 2 auth, 3 not found, 4 forbidden, 5 server/network, 6 invalid or conflict, 130 cancelled
 `;
 
@@ -75,7 +79,7 @@ const OPTIONS = {
   ...Object.fromEntries(("entity pipeline status owner q sort page amount next company new-company person new-person " +
     "person-email lost-reason version new email due phone job-title linkedin-url notes domain website industry city url").split(" ")
     .map((k) => [k, { type: "string" }])),
-  event: { type: "string", multiple: true },
+  event: { type: "string", multiple: true }, "allow-origin": { type: "string", multiple: true },
   session: { type: "string" }, timeout: { type: "string" }, after: { type: "string" }, day: { type: "string" },
   wait: { type: "boolean" }, closed: { type: "boolean" }, all: { type: "boolean" }, request: { type: "boolean" },
   archived: { type: "boolean" }, none: { type: "boolean" }, active: { type: "boolean" }, inactive: { type: "boolean" },
@@ -110,7 +114,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
   let json = argv.includes("--json");
   let host = "";
   let orgFromCreds: string | undefined;
-  // `ask` only: aborted by Ctrl-C (listener around the plan below) or by io.signal; other commands never see it.
+  // `ask` and `browser attach` only: aborted by Ctrl-C (a listener around each) or by io.signal; other commands never see it.
   const ctl = new AbortController();
   const signal = io.signal ? AbortSignal.any([ctl.signal, io.signal]) : ctl.signal;
   if (argv.length === 1 && argv[0] === "--version") { io.out(`olympus ${VERSION}\n`); return 0; }
@@ -181,6 +185,22 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       want(1);
       checkFlags(v, []);
       print(io, json, { data: { version: VERSION } }, () => `olympus ${VERSION}`);
+      return 0;
+    }
+
+    // Pre-authentication, like login: pairing reads no bearer and attaching carries the obm_ machine
+    // token, so the authenticated path below would exit 2 on resolveToken before the command ran.
+    if (cmd === "browser") {
+      const attach = browserPlan(pos, v, io, json);
+      host = resolveHost(v.host, io, await readCreds(io));
+      // Ctrl-C is the normal way to end a long-running attach; `ask` wires it the same way.
+      const abort = () => ctl.abort();
+      process.once("SIGINT", abort);
+      try {
+        await attach(host, signal);
+      } finally {
+        process.off("SIGINT", abort);
+      }
       return 0;
     }
 
