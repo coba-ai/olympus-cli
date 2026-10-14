@@ -41,8 +41,9 @@ export const DEFAULT_HOST = "https://app.tryolympus.ai";
 export type Creds = { host?: string; token?: string; org?: string };
 
 const credsDir = (io: Io) => join(io.home, ".config", "olympus");
-const credsPath = (io: Io) => join(credsDir(io), "credentials.json");
-const ioError = (e: any, path: string) =>
+export const configPath = (io: Io, name: string) => join(credsDir(io), name);
+const credsPath = (io: Io) => configPath(io, "credentials.json");
+export const ioError = (e: any, path: string) =>
   new CliError(1, { error: { code: "credentials_io", message: `${e?.code ?? "EIO"} ${path}` } });
 
 export async function readCreds(io: Io): Promise<Creds> {
@@ -67,15 +68,17 @@ export async function readCreds(io: Io): Promise<Creds> {
   return { host: v.host, token: v.token, org: v.org };
 }
 
-export async function writeCreds(io: Io, c: Creds): Promise<void> {
-  const dir = credsDir(io);
-  const path = credsPath(io);
+// A 0600 file in the 0700 credentials directory, written to a temp file and renamed into place, so a
+// reader never sees a half-written file and never a mode wider than 0600. Shared by writeCreds and the
+// browser machine token file (src/browser-store.ts).
+export async function writeSecretFile(io: Io, name: string, text: string): Promise<void> {
+  const path = configPath(io, name);
   const tmp = `${path}.${process.pid}.tmp`;
   try {
-    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await mkdir(credsDir(io), { recursive: true, mode: 0o700 });
     const fh = await open(tmp, "wx", 0o600);
     try {
-      await fh.writeFile(JSON.stringify(c) + "\n");
+      await fh.writeFile(text);
     } finally {
       await fh.close();
     }
@@ -85,6 +88,8 @@ export async function writeCreds(io: Io, c: Creds): Promise<void> {
     throw ioError(e, path);
   }
 }
+
+export const writeCreds = (io: Io, c: Creds): Promise<void> => writeSecretFile(io, "credentials.json", JSON.stringify(c) + "\n");
 
 export async function deleteCreds(io: Io): Promise<boolean> {
   const path = credsPath(io);

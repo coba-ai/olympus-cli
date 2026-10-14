@@ -7,6 +7,13 @@ export const TOKENS = {
 
 export const DEVICE_CODE = `dev_${randomBytes(16).toString("hex")}`;
 
+// A pairing code is 8 letters shown XXXX-XXXX; the CLI sends what it was given, so the fake matches it verbatim.
+export const PAIR_CODE = "ABCDEFGH";
+// `codes` are claimable once each; `claimed` records what each claim stored, so a test can read back the name
+// the server would have kept. `relayUrl` overrides the relay url in the 201, to drive the client's refusals.
+export type BrowserPairState = { codes: string[]; claimed: { machine_id: string; name: string; token: string }[]; relayUrl?: string };
+export const seedBrowserPair = (codes: string[] = [PAIR_CODE]): BrowserPairState => ({ codes: [...codes], claimed: [] });
+
 type Webhook = Record<string, any>;
 type Item = Record<string, any>;
 // A turn step: state is queued | running | idle | failed (anything else is echoed). The accepted user message joins the thread on the first
@@ -47,6 +54,8 @@ export type FakeState = {
   // page size of GET /sessions (default 20)
   sessionsPer?: number;
   device?: { script: string[]; interval?: number; expires_in?: number; omitComplete?: boolean; codeBody?: unknown };
+  // pending pairing codes for POST /browser/pair; tests reset it with seedBrowserPair()
+  browserPair: BrowserPairState;
 };
 
 const NAMES: Record<string, string> = { acme: "Acme", beta: "Beta" };
@@ -647,7 +656,7 @@ function sessionsApi(state: FakeState, org: string, me: { id: string; name: stri
 
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10), sessions: {}, briefings: {}, turns: [] };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10), sessions: {}, briefings: {}, turns: [], browserPair: seedBrowserPair() };
   state.tasks = seedTasks(state.today);
   state.sessions = seedSessions(new Date().toISOString());
   state.briefings = seedBriefings(state.today);
@@ -706,6 +715,29 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         if (step === "ok") return send(200, { data: { token: TOKENS.owner } });
         if (step === "echo") return err(400, "invalid_grant", `bad device_code ${(body as any)?.device_code}`);
         return err(400, step, step);
+      }
+
+      // Pair is unauthenticated: no bearer is read, so a bad one cannot 401 first. A GET falls through to
+      // the unknown-path 404 below, as it does on the server.
+      if (req.method === "POST" && u.pathname === "/api/v1/browser/pair") {
+        const p = state.browserPair;
+        if (malformed) return badJson();
+        const code = (body as any)?.code;
+        if (typeof code !== "string" || !code) return err(400, "bad_request", "Missing or invalid code.");
+        const i = p.codes.indexOf(code);
+        // One 404 for every refusal: unknown, expired, second-claim, flag off, owner no longer a member.
+        if (i < 0) return notFound();
+        p.codes.splice(i, 1);
+        const raw = (body as any)?.name;
+        const name = typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 80) : "Unnamed computer";
+        // The real token is obm_ + 44 base58 characters; only the prefix is contract, so base36 stands in.
+        const m = { machine_id: rid("bm_", 16), name, token: rid("obm_", 44) };
+        p.claimed.push(m);
+        return send(
+          201,
+          { data: { token: m.token, machine_id: m.machine_id, relay_url: p.relayUrl ?? `${u.origin.replace(/^http/, "ws")}/api/v1/browser/relay` } },
+          { "Cache-Control": "no-store" },
+        );
       }
 
       // Unknown /api/v1/* paths are 404 before auth, with or without a token.
