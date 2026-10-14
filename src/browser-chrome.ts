@@ -57,8 +57,9 @@ export function discoverChrome(io: Io): string {
 /** The argv Chromium is launched with, as a pure function, so the test asserts it string by string. */
 export function chromeFlags(o: { profileDir: string; socksPort: number }): string[] {
   return [
-    // A throwaway profile, never the member's own: signed out, no extensions and no sync hold because
-    // the directory is empty, not because a flag says so.
+    // A throwaway profile, never the member's own. Signed out and no sync hold because the directory
+    // is empty. "No extensions" does NOT follow from an empty directory — a launcher on PATH can
+    // inject `--load-extension` pointing anywhere; see the block below for what enforces it.
     `--user-data-dir=${o.profileDir}`,
     // 0 = pick a free port; Chromium writes the one it bound to DevToolsActivePort.
     "--remote-debugging-port=0",
@@ -90,8 +91,24 @@ export function chromeFlags(o: { profileDir: string; socksPort: number }): strin
     // `--allow-origin`, which refuses all six.
     "--disable-background-networking",
     "--disable-component-update",
+    // THE `chromium` ON PATH IS OFTEN NOT THE BROWSER. On Arch it is a launcher that reads
+    // `$XDG_CONFIG_HOME/chromium-flags.conf` and injects whatever it finds; Debian and Ubuntu wrap
+    // `chromium` and `google-chrome` the same way through `/etc/chromium.d/*`. MEASURED on an Arch
+    // desktop by reading `/proc/<pid>/cmdline` of the browser this function launched: the member's
+    // own `--load-extension=…` (three extensions), `--password-store=gnome-libsecret` and their
+    // OAuth client id and secret were all present, in the profile this file calls throwaway. Two of
+    // those extensions showed up as `service_worker` targets in a live drive, so the organization's
+    // agent was driving a browser carrying them.
+    //
+    // THESE TWO MUST STAY LAST, which is the whole mechanism: Chromium takes the last occurrence of
+    // a switch, so ours beats a copy the wrapper prepended. `launchChrome` additionally points
+    // `XDG_CONFIG_HOME` at the throwaway profile so an Arch launcher finds no conf to read at all;
+    // neither measure is complete on its own, and a wrapper sourcing `/etc` is covered only by these.
+    // `browser-chrome.test.ts` holds the position; nothing holds that a real launcher is defeated.
+    "--disable-extensions",
+    "--password-store=basic",
     // A start page that needs no network. Chromium's new-tab page would otherwise be the first thing
-    // the tunnel is asked to fetch.
+    // the tunnel is asked to fetch. Positional, so it follows the flags.
     "about:blank",
   ];
 }
@@ -99,7 +116,8 @@ export function chromeFlags(o: { profileDir: string; socksPort: number }): strin
 /** Just enough of a spawned process for this module; `Bun.spawn`'s return satisfies it. */
 export type ChromeProcess = { exited: Promise<unknown>; kill: () => void };
 export type ChromeSeams = {
-  spawn: (argv: string[]) => ChromeProcess;
+  /** `env` is the complete environment for the child, not an overlay — it already carries the parent's. */
+  spawn: (argv: string[], env: Record<string, string>) => ChromeProcess;
   /** Defaults to a `mkdtemp` under the system temp dir. The test supplies a directory it writes itself. */
   mkProfile?: () => Promise<string>;
 };
@@ -148,7 +166,14 @@ export async function launchChrome(io: Io, o: { socksPort: number }, seams: Chro
 
   let proc: ChromeProcess;
   try {
-    proc = seams.spawn([bin, ...chromeFlags({ profileDir, socksPort: o.socksPort })]);
+    // `XDG_CONFIG_HOME` at the throwaway profile is what stops a launcher reading the member's
+    // `chromium-flags.conf` (see chromeFlags). The profile is empty and removed on every exit path,
+    // so there is nothing there to find and nothing left behind. Chromium itself does not fall back
+    // to it for the profile location — `--user-data-dir` is explicit.
+    proc = seams.spawn([bin, ...chromeFlags({ profileDir, socksPort: o.socksPort })], {
+      ...(process.env as Record<string, string>),
+      XDG_CONFIG_HOME: profileDir,
+    });
   } catch (e: any) {
     await sweep();
     throw failed(`could not start ${bin}: ${e?.code ?? e?.message ?? "spawn failed"}`);

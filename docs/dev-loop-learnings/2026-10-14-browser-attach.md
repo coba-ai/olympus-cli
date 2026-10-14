@@ -95,6 +95,16 @@ both) applied to a stream that should no longer have been live. Nothing on eithe
 a disconnected workbench's streams, so a reconnecting bridge must never restart its id counter.
 No test could have caught this: the suite has one workbench at a time.
 
+**The `chromium` on PATH was not the browser, and the throwaway profile was not throwaway.** A
+second drive listed two unexplained extension service workers. They were the member's own: Arch's
+`/usr/bin/chromium` is a launcher that injects `$XDG_CONFIG_HOME/chromium-flags.conf`, so the
+profile this repo called "signed out, no extensions, no sync" was launched with their
+`--load-extension`, their `--password-store=gnome-libsecret` and their OAuth credentials. Debian
+and Ubuntu wrap the same way via `/etc/chromium.d/*`. The claim had been reasoned from an empty
+profile directory — true, and irrelevant, because the flags come from outside the directory.
+**"The inputs are clean" is not "the invocation is clean"**, and the only way to tell them apart
+was reading `/proc/<pid>/cmdline` of the process actually running.
+
 **The parts that worked, worked first time** — relay, lazy launch on the first `cdp` OPEN, and the
 `tcp:`/ACK egress path end to end. The ACK, which was the loop's most expensive correction, was
 right.
