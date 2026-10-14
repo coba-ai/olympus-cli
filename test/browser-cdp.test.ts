@@ -68,9 +68,8 @@ describe("A6 CDP allowlist: what is allowed", () => {
     for (const method of ["Target.getTargets", "Target.setDiscoverTargets", "Target.closeTarget", "Target.activateTarget", "Target.getTargetInfo"])
       expect(refusal({ id: 1, method }, pages)).toBeUndefined();
     expect(refusal({ id: 1, method: "Target.attachToTarget", params: { targetId: "T1", flatten: true } }, pages)).toBeUndefined();
-    // A plain context: no params at all, the two lifecycle-only forms, and the origins list
-    // present but empty, which grants nothing.
-    for (const params of [undefined, {}, { disposeOnDetach: true }, { originsWithUniversalNetworkAccess: [] }])
+    // A plain context: no params at all, an empty params object, and the one allowed parameter.
+    for (const params of [undefined, {}, { disposeOnDetach: true }, { disposeOnDetach: false }])
       expect(refusal({ id: 1, method: "Target.createBrowserContext", params }, pages)).toBeUndefined();
   });
 
@@ -93,12 +92,23 @@ describe("A6 CDP allowlist: every refusal", () => {
       refuse({ id: 50, method: "Target.createBrowserContext", params: { proxyBypassList: list } }, "proxyBypassList");
   });
 
-  test("Target.createBrowserContext with a non-empty originsWithUniversalNetworkAccess", () => {
-    for (const origins of [["https://example.test"], ["*"], ["https://a.test", "https://b.test"], "https://example.test", { 0: "https://a.test" }, 1])
+  test("Target.createBrowserContext with originsWithUniversalNetworkAccess, empty list included", () => {
+    for (const origins of [["https://example.test"], ["*"], ["https://a.test", "https://b.test"], "https://example.test", { 0: "https://a.test" }, 1, []])
       refuse(
         { id: 51, method: "Target.createBrowserContext", params: { originsWithUniversalNetworkAccess: origins } },
         "originsWithUniversalNetworkAccess",
       );
+  });
+
+  // The default-deny itself, not just the three parameters that have a rule: this is the half that
+  // keeps the next protocol addition out without anyone editing this file.
+  test("refuses every parameter but disposeOnDetach, named by a rule or not", () => {
+    for (const name of ["noDefaultOverrides", "windowState", "proxyserver", "__proto__", ""])
+      refuse({ id: 52, method: "Target.createBrowserContext", params: { [name]: true } }, `with ${name} is refused: only disposeOnDetach is allowed`);
+
+    // The allowed parameter does not excuse the ones beside it, whichever order they arrive in.
+    refuse({ id: 53, method: "Target.createBrowserContext", params: { disposeOnDetach: true, somethingNew: 1 } }, "somethingNew");
+    refuse({ id: 54, method: "Target.createBrowserContext", params: { proxyServer: "socks5://10.0.0.1:1080", disposeOnDetach: true } }, "proxyServer");
   });
 
   test("every Browser.* command", () => {

@@ -80,6 +80,7 @@ olympus event-types                 # event names accepted by --event ('*' = all
 olympus ask AGENT TEXT|- [--session ID] [--timeout SECONDS] [--no-wait]   # - reads the text from stdin
 olympus sessions [--closed | --all] [--agent SLUG] [--page N]
 olympus session get <id> [--after MSG_ID] | session close <id>
+olympus browser attach [CODE] [--name N] [--allow-origin HOST[:PORT]]...   # lend this computer's browser to the org's agent
 olympus briefing [--day YYYY-MM-DD] [--request]
 olympus version | --version
 ```
@@ -214,6 +215,56 @@ newer ones) and `session close ID` closes a session; its transcript is kept. `br
 briefing for today (`--day` for another date); `--request` asks your agent to write today's. It is exit 6
 until your briefing is set up in the Olympus app.
 
+Lending your browser: `olympus browser attach CODE` pairs this computer with the organization's agent and
+then holds the connection until Ctrl-C (exit 130). The `XXXX-XXXX` code comes from **Settings → Rafita**,
+lasts 10 minutes and is good for one claim; it is sent as shown (the server normalises it). Pairing stores an
+`obm_` machine token at `~/.config/olympus/browser.json` (file 0600, one record per host), and `attach` with
+no CODE reconnects with it — with nothing stored for that host, that is a usage error. `--name` labels the
+computer in the app and is read only when pairing (default: this computer's hostname). `olympus logout` does
+not touch this file and does not detach; revoke the computer in Settings → Rafita.
+
+**No browser opens yet.** Chromium launches on the first CDP stream from the organization's workbench
+bridge, and that bridge does not exist. Today `attach` pairs, connects, reports `online` and opens no
+window. That is the command working, not stalling. When it does launch it gets a throwaway `--user-data-dir`
+made per run and removed on exit — signed out, no extensions, no sync, never your own profile — and every
+connection it makes leaves through a loopback SOCKS5 proxy, down the tunnel, and out of **the
+organization's machine**, including Chromium's own startup calls to Google. `--disable-background-networking`
+and `--disable-component-update` are set; whether they suppress all of that traffic is unverified, since no
+test launches a browser. The binary is `$OLYMPUS_CHROME` if set, else the first of `chromium`,
+`chromium-browser`, `google-chrome`, `google-chrome-stable` on `PATH`, else the two standard macOS
+application paths. Nothing is downloaded, and no browser found is exit 1 — checked before the pairing code
+is spent.
+
+**The browser's local CDP port is unauthenticated.** It is bound to loopback, but Chromium's debugging
+socket carries no credential, so any process running as you can drive that browser past this command's CDP
+filter entirely; `--remote-debugging-port` also serves `/json/new` and `/json/list`, which open and address
+targets without passing the filter at all. Nothing enforces otherwise: the filter guards the relay, not the
+port. What it does guard is the workbench's side — default-deny by domain (`Page`, `Runtime`, `DOM`, `CSS`,
+`Input`, `Network`, `Fetch`, `Emulation`, `Log`, `Accessibility`, plus a method list for `Target`), on a
+flattened session the filter watched attach to a page target, with a CDP error back on every refusal rather
+than a silent drop; downloads are denied and file choosers cancelled on each page session; navigation and the
+other URL-bearing methods take `http:`, `https:` and `about:blank` only. Allowing a domain admits every
+method in it, the ones the protocol grows next included, and `Runtime.evaluate` is allowed by design, so the
+agent can run arbitrary JavaScript in the pages it drives.
+
+`--allow-origin HOST[:PORT]` is repeatable and narrows the default — any public host on 80 and 443 — to
+exactly the hosts given. It matches the name Chromium sends with each connection, and the CLI performs no
+DNS. Private, loopback and link-local **addresses** are always refused, whatever the list says; a *name*
+such as `localhost` or an internal hostname is not resolved here and so is not refused here, and the
+organization's machine resolves it at the far end.
+
+With `--json`, one object per line on stdout as the state changes: `paired`, `connecting`, `online`,
+`stream`, `refused`, `closed`, `stalled`, `backoff`, `backpressure`, and last `{"state":"exit","code":N}`
+carrying the process's exit code, a pair failure included. Human mode prints short status lines to stderr
+instead. Neither ever carries the machine token. Exits: 0 when the browser closes, 130 on Ctrl-C, 1 for usage
+(including a bad `--allow-origin` and no browser on the computer), 3 or 6 for a refused pairing code, 2 when
+the organization revoked this computer, 6 when another connection attached as the same machine, 5 for a
+browser that cannot be started or reached and for a relay the CLI gave up on. **A revoked or unknown token
+is not reported as such.** Measured: Bun's WebSocket client surfaces no HTTP status for a refused upgrade,
+so the CLI cannot tell a revoked token from an unreachable machine. Either one shows as repeated
+reconnection attempts (1 s doubling to 60 s, jittered, ten of them) and then exit 5. Only a close on a live
+connection is specific: revoked is exit 2, replaced is exit 6.
+
 ## Environment
 
 | Variable | Meaning |
@@ -221,9 +272,12 @@ until your briefing is set up in the Olympus app.
 | `OLYMPUS_API_KEY` | token; beats the stored one |
 | `OLYMPUS_HOST` | API host |
 | `OLYMPUS_ORG` | default org |
+| `OLYMPUS_CHROME` | the browser `browser attach` launches; otherwise Chromium or Chrome from `PATH` |
 
 Empty values count as unset. Stored credentials: `~/.config/olympus/credentials.json` (dir 0700, file 0600:
-`host`, `token`, `org`). The stored token is only sent to its stored host.
+`host`, `token`, `org`). The stored token is only sent to its stored host. `browser attach` keeps its `obm_`
+machine token in a separate file, `~/.config/olympus/browser.json` (also 0600), which `olympus logout` leaves
+alone.
 
 - **Host:** `--host` → `OLYMPUS_HOST` → stored host (only when no `OLYMPUS_API_KEY`) → `https://app.tryolympus.ai`. `http://` only for loopback.
 - **Org:** `--org` → `OLYMPUS_ORG` → the token's pin → stored default → the only membership; otherwise exit 1 listing slugs.
@@ -330,11 +384,11 @@ newline in task text never splits a row; nothing is printed for an empty list):
 |---|---|
 | 0 | ok |
 | 1 | usage; also an `ask` whose turn failed (`error.code` `turn_failed`) |
-| 2 | auth (401, or no token) |
+| 2 | auth (401, or no token); also a `browser attach` whose computer was revoked by the organization |
 | 3 | not found (404, non-member, pin mismatch) |
 | 4 | forbidden (403) |
-| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, no time left to send (`not_sent`), a timeout (`timeout`), or an agent machine that is not ready (for `ask`, retry only when the message says "nothing was sent", as `busy` and `not_sent` do before sending; `machine_not_ready` is the server's 503 and says no such thing: without `error.details.session_id` the session was never created, so nothing was sent and you can retry later, and with one read with `session get` first; after `timeout`, `network_error`, a 5xx on the send itself, or `bad_request` while reading, the message may have been sent: read with `session get` before asking again) |
-| 6 | invalid (400, 422), a 409 conflict ("changed since you read it"), "CRM not set up", `no_agent` (the organization has no agent), `session_closed`, `briefing_not_set_up`, and `ask` `agent_mismatch` |
+| 5 | server / network / redirect / 429 / anything unexpected, including "CRM temporarily unavailable (retry after)", "agent machine needs an update", and for `ask` a busy agent that stayed busy, no time left to send (`not_sent`), a timeout (`timeout`), or an agent machine that is not ready (for `ask`, retry only when the message says "nothing was sent", as `busy` and `not_sent` do before sending; `machine_not_ready` is the server's 503 and says no such thing: without `error.details.session_id` the session was never created, so nothing was sent and you can retry later, and with one read with `session get` first; after `timeout`, `network_error`, a 5xx on the send itself, or `bad_request` while reading, the message may have been sent: read with `session get` before asking again), and for `browser attach` a browser that could not be started or reached and a relay it gave up reconnecting to |
+| 6 | invalid (400, 422), a 409 conflict ("changed since you read it"), "CRM not set up", `no_agent` (the organization has no agent), `session_closed`, `briefing_not_set_up`, `ask` `agent_mismatch`, and a `browser attach` replaced by another connection for the same machine |
 | 130 | cancelled (Ctrl-C during login, credentials untouched; a cancelled `day close` prompt, nothing saved; or Ctrl-C during `ask`, which prints the session id when one exists) |
 
 ## `.env` is not loaded by the binary
