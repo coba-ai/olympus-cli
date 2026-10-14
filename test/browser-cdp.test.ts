@@ -489,6 +489,118 @@ describe("A8 browser-wide protection, installed before anything is forwarded", (
   });
 });
 
+// Finding 2, and what the hold above does NOT do: it withholds a new context's id, it does not
+// validate one. That left two routes open - an id the workbench read out of ordinary protocol
+// traffic, and one it simply guessed - and these are both of them, plus the redaction that closes
+// the first at source.
+//
+// The DEFAULT context is covered by the construction-time denial, but this filter never learns its
+// id (Target.getBrowserContexts, which would enumerate it, is not an allowed method), so it is
+// uncovered HERE: its id is redacted out of target infos like any other, and the workbench reaches
+// it the way Target.createTarget already does, by naming no context at all.
+describe("browser contexts: only a covered one may be named, and an uncovered one is never disclosed", () => {
+  /** A Target.getTargets response naming one page target in `browserContextId`. */
+  const targets = (id: number, browserContextId: string) =>
+    JSON.stringify({
+      id,
+      result: { targetInfos: [{ targetId: "T9", type: "page", title: "", url: "about:blank", attached: false, browserContextId }] },
+    });
+
+  // The reviewer's scenario, start to finish: setup acknowledged, C1 created, its denial left
+  // unanswered, then the two things that used to pass - the disclosure and the creation.
+  test("a context whose denial is unanswered is neither disclosed by Target.getTargets nor usable in Target.createTarget", () => {
+    const h = harness().attach();
+    h.send({ id: 80, method: "Target.createBrowserContext", params: {} });
+    h.f.fromBrowser(JSON.stringify({ id: 80, result: { browserContextId: "C1" } }));
+    expect(h.toWorkbench).toEqual([]); // held, as before
+    h.toBrowser.length = 0;
+    // The denial is left unanswered from here on: C1 is pending, and never becomes covered.
+
+    h.send({ id: 81, method: "Target.getTargets" });
+    expect(h.toBrowser.length).toBe(1); // an allowed command, forwarded
+    h.f.fromBrowser(targets(81, "C1"));
+    expect(h.toWorkbench.length).toBe(1);
+    expect(h.toWorkbench[0]).not.toContain("C1"); // the id is gone from the bytes, not just the parse
+    expect(h.last().result.targetInfos[0]).toEqual({ targetId: "T9", type: "page", title: "", url: "about:blank", attached: false });
+    h.toBrowser.length = 0;
+    h.toWorkbench.length = 0;
+
+    h.send({ id: 82, method: "Target.createTarget", params: { url: "about:blank", browserContextId: "C1" } });
+    expect(h.toBrowser).toEqual([]);
+    expect([h.last().id, h.last().error.code]).toEqual([82, REFUSED]);
+    expect(h.last().error.message).toContain("has not denied downloads in");
+  });
+
+  // The two allowlisted methods that carry a browserContextId, per the sweep of
+  // `browser_protocol.json` (1.3) on 2026-10-14.
+  test("refuses a guessed context id on both allowed methods that name one", () => {
+    refuse({ id: 83, method: "Target.createTarget", params: { url: "about:blank", browserContextId: "C-guessed" } }, "has not denied downloads in");
+    refuse({ id: 84, method: "Target.disposeBrowserContext", params: { browserContextId: "C-guessed" } }, "has not denied downloads in");
+  });
+
+  test("refuses a browserContextId that is not a string, and one carried below the top level", () => {
+    for (const browserContextId of [null, 7, true, {}, ["C1"], ""])
+      refuse({ id: 85, method: "Target.createTarget", params: { url: "about:blank", browserContextId } }, "has not denied downloads in");
+    // The whole params object is walked, not the two fields the sweep found, so a context named
+    // by a parameter nobody here has read is refused too.
+    refuse(
+      { id: 86, method: "Target.createTarget", params: { url: "about:blank", somethingNew: [{ deeper: { browserContextId: "C1" } }] } },
+      "has not denied downloads in",
+    );
+  });
+
+  test("allows a covered context by name, discloses its id, and covers that one only", () => {
+    const h = harness().attach();
+    h.send({ id: 87, method: "Target.createBrowserContext", params: {} });
+    const response = JSON.stringify({ id: 87, result: { browserContextId: "C1" } });
+    h.f.fromBrowser(response);
+    h.f.fromBrowser(JSON.stringify({ id: h.ids().at(-1), result: {} })); // the denial for C1 succeeds
+    expect(h.toWorkbench).toEqual([response]);
+    h.toBrowser.length = 0;
+    h.toWorkbench.length = 0;
+
+    for (const cmd of [
+      { id: 88, method: "Target.createTarget", params: { url: "about:blank", browserContextId: "C1" } },
+      { id: 89, method: "Target.disposeBrowserContext", params: { browserContextId: "C1" } },
+    ]) {
+      h.send(cmd);
+      expect(h.toBrowser.length).toBe(1);
+      expect(h.toWorkbench).toEqual([]);
+      h.toBrowser.length = 0;
+    }
+
+    const infos = targets(90, "C1");
+    h.f.fromBrowser(infos);
+    expect(h.toWorkbench).toEqual([infos]); // byte-for-byte: a covered id is not redacted
+    h.toWorkbench.length = 0;
+
+    // Covering C1 covers C1, not "a context exists now": the gate holds ids, not a flag.
+    h.send({ id: 91, method: "Target.createTarget", params: { url: "about:blank", browserContextId: "C2" } });
+    expect(h.toBrowser).toEqual([]);
+    expect(h.last().error.message).toContain("has not denied downloads in");
+  });
+
+  test("redacts an uncovered id from every target-info event, and still acts on the attach", () => {
+    const targetInfo = { targetId: "T5", type: "page", title: "", url: "about:blank", attached: true };
+    const event = (method: string) =>
+      JSON.stringify({ method, params: { sessionId: "S5", targetInfo: { ...targetInfo, browserContextId: "C-unknown" } } });
+
+    for (const method of ["Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"]) {
+      const h = harness();
+      h.f.fromBrowser(event(method));
+      expect(h.toWorkbench.length).toBe(1);
+      expect(h.toWorkbench[0]).not.toContain("C-unknown");
+      expect(h.last().method).toBe(method);
+      expect(h.last().params.targetInfo).toEqual(targetInfo); // the entry arrives, minus the id
+    }
+
+    // Redaction is on the way OUT: the filter reads the attach itself and installs as it always did.
+    const h = harness();
+    h.f.fromBrowser(event("Target.attachedToTarget"));
+    expect(h.issued().map(([m]) => m)).toEqual(["Page.enable", "Page.setDownloadBehavior", "Page.setInterceptFileChooserDialog"]);
+  });
+});
+
 describe("A8 paused attachment: a page runs only after its setup succeeded", () => {
   const paused = (sessionId: string) => attachEvent(sessionId, "page", true);
 

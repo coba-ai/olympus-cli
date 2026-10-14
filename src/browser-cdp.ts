@@ -14,7 +14,9 @@
 // Target.attachedToTarget and Target.detachedFromTarget (session tracking) and
 // Page.fileChooserOpened (A8) - plus one RESPONSE, the answer to a workbench
 // Target.createBrowserContext, which carries the new context's id and is HELD until the download
-// denial for that context is acknowledged, so the workbench is never told an id it could use first.
+// denial for that context is acknowledged. BROWSER CONTEXTS are the one thing read on both sides:
+// a command naming a context this filter has not covered is refused (`refusal` below), and an
+// uncovered context's id is stripped out of whatever would have disclosed it (`disclose` below).
 // Nothing here stops an event from carrying what a refused domain would have
 // produced - some arrive with no domain enabled at all -
 // and nothing needs to: the workbench is the transport, so it already sees every page byte.
@@ -241,6 +243,41 @@ const RULES: Record<string, Rule> = {
   "Page.disable": () => "Page.disable is refused: it may drop the file-chooser interception this filter installed",
 };
 
+/**
+ * Every object inside `value` that carries a `browserContextId` of its own. The caller reads the id
+ * off each one, or deletes it - this only finds them, and serves both directions: the command the
+ * workbench sent and the message Chromium answered with.
+ *
+ * Iterative, not recursive: both sides are untrusted here, and a recursive walk over a deeply
+ * nested message would overflow this process's stack rather than refuse anything.
+ *
+ * It keys on the literal name, and a context named under any other key is neither refused nor
+ * redacted. Swept from `browser_protocol.json` (1.3) on 2026-10-14 (`refusal` and `disclose` below
+ * carry the two lists): every parameter, return and event that names a context spells it
+ * `browserContextId` EXCEPT `Target.getBrowserContexts`, whose `browserContextIds` and
+ * `defaultBrowserContextId` this walk does not find - that method is outside TARGET_METHODS, so
+ * its response only exists if something other than the workbench asked for it, and nothing here
+ * would redact one. Nor does anything enforce that a later protocol keeps to that one spelling.
+ */
+function contextHolders(value: unknown): Params[] {
+  const holders: Params[] = [];
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node === null || typeof node !== "object") continue;
+    if (Array.isArray(node)) {
+      for (const item of node) stack.push(item);
+      continue;
+    }
+    const held = node as Params;
+    // `hasOwn`, not `in`: a workbench can send `__proto__` as a parameter name, and `JSON.parse`
+    // makes that an ordinary own property rather than a prototype - walked like any other value.
+    if (Object.hasOwn(held, "browserContextId")) holders.push(held);
+    for (const v of Object.values(held)) stack.push(v);
+  }
+  return holders;
+}
+
 // A domain name is short, and this one is echoed back in the refusal message; anything longer is
 // not a domain.
 const domainOf = (method: string) => {
@@ -253,11 +290,15 @@ const domainOf = (method: string) => {
  * `unusable` carries the page sessions that attached but are not usable: their setup is still in
  * flight, or Chromium refused it. They are refused with a reason of their own rather than with the
  * never-attached message, which would be the false comment of rule 0 in a protocol field.
+ *
+ * `covered` carries the browser contexts this filter has denied downloads in; naming any other one
+ * is refused. It defaults to empty, so a caller that passes nothing may name no context at all.
  */
 export function refusal(
   cmd: CdpCommand,
   pageSessions: ReadonlySet<string>,
   unusable: ReadonlyMap<string, { why: string }> = new Map(),
+  covered: ReadonlySet<string> = new Set(),
 ): string | undefined {
   if (cmd.id >= SETUP_ID) return `a command id at or above ${SETUP_ID} is reserved for this filter's own commands`;
   const domain = domainOf(cmd.method);
@@ -270,6 +311,31 @@ export function refusal(
 
   const why = RULES[cmd.method]?.(cmd.params ?? {});
   if (why) return why;
+
+  // A context is COVERED once `Browser.setDownloadBehavior` deny for it has been acknowledged, and
+  // the only contexts that happens for are the ones the workbench created through
+  // Target.createBrowserContext on this connection (cdpFilter below is what adds them). Naming any
+  // other one is refused here, which is what closes the two routes that holding the new context's
+  // id did not: an id the workbench guessed, and an id it read back out of ordinary traffic before
+  // `disclose` below started stripping them.
+  //
+  // Swept from `browser_protocol.json` (1.3) on 2026-10-14: of the methods the two allowlists above
+  // admit, exactly two carry a browserContextId - `Target.createTarget` (optional) and
+  // `Target.disposeBrowserContext` (required), both at the top level of params. The other eight in
+  // the protocol that name a context are already outside those allowlists: Browser.setPermission,
+  // grantPermissions, resetPermissions, setDownloadBehavior and cancelDownload (a refused DOMAIN),
+  // Storage.getCookies, setCookies and clearCookies (likewise), and Target.getBrowserContexts,
+  // which would enumerate every context, is not in TARGET_METHODS. The whole params object is
+  // walked rather than those two fields, so a nested or later-added one is refused too - but
+  // NOTHING enforces that the sweep itself stays current, the same hole DOMAINS above admits.
+  //
+  // The DEFAULT context is covered by the construction-time denial, and its id is never learnt
+  // here (getBrowserContexts is refused), so it is not in `covered` and the workbench cannot name
+  // it. What it loses is only the spelling: a command reaches that context by naming no context,
+  // which is what Target.createTarget does when `browserContextId` is omitted.
+  for (const holder of contextHolders(cmd.params))
+    if (typeof holder.browserContextId !== "string" || !covered.has(holder.browserContextId))
+      return "this command names a browser context the filter has not denied downloads in; only a context created through Target.createBrowserContext on this connection may be named";
 
   // §5.2 filters on every flattened sessionId. A command with no sessionId lands on the
   // browser-level session this CLI holds, where no page exists and A8 installs nothing, so only
@@ -311,14 +377,21 @@ type Unusable = { why: string };
  *   - per page session, as before: Page.enable, download deny, chooser interception.
  *
  * What is enforced, exactly: no workbench command is forwarded until the browser-wide denial is
- * acknowledged, no page session is usable until its own three commands are acknowledged, and the id
- * of a context the workbench creates is withheld until that context's own denial is acknowledged.
+ * acknowledged, no page session is usable until its own three commands are acknowledged, and a
+ * browser context is usable and disclosable only once its own denial is acknowledged - the id of a
+ * context the workbench creates is withheld until then (the hold below), a command naming a context
+ * that is not covered is refused (`refusal` above), and an uncovered context's id is stripped out of
+ * the messages that would have disclosed it (`disclose` below).
  * What is NOT: that Chromium's browser-wide denial actually covers every present and future context -
  * the protocol's text says an omitted `browserContextId` means the DEFAULT context, which is why a
  * context the workbench creates gets its own command below, and the rest is UNVERIFIED; and that
  * auto-attach on the browser session reaches every target Chromium can create, which is UNVERIFIED
  * too. A page the filter never sees attach therefore gets the download denial and NOT the
- * file-chooser interception, which is narrower than it was, not closed.
+ * file-chooser interception, which is narrower than it was, not closed. Nor does the context gate
+ * reach a context that already existed when this filter connected: the workbench can neither name
+ * it nor be told its id, but a target living in one still arrives in a target info with every other
+ * field intact, and attaching to it by `targetId` is allowed - what covers that page is the
+ * per-session setup above and the browser-wide denial, not `covered`.
  */
 export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
   const pages = new Set<string>();
@@ -327,6 +400,16 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
   const mine = new Map<number, (m: any) => void>();
   /** Workbench Target.createBrowserContext ids waiting for the response that names the new context. */
   const contexts = new Set<number>();
+  /**
+   * The browser contexts this filter has denied downloads in, each added when Chromium acknowledged
+   * that denial. A context the workbench created is PENDING - absent from here - from the response
+   * that names it until its denial returns; if that denial is refused it is disposed and never
+   * added, and the filter fails closed anyway. Nothing is ever removed, disposal included: a
+   * disposed id left here costs an error from Chromium on the next command, not a protection.
+   * The default context is covered by the construction-time denial and is NOT in here, because its
+   * id is never learnt (see `refusal` above).
+   */
+  const covered = new Set<string>();
   let nextId = SETUP_ID;
   let installed = 0;
   let broken: string | undefined;
@@ -394,6 +477,45 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
     issue(sid, "Page.setInterceptFileChooserDialog", { enabled: true }, settle);
   };
 
+  // The other half of the context gate: a message on its way to the workbench does not hand over
+  // the id of a context that is not covered. Swept from `browser_protocol.json` (1.3) on
+  // 2026-10-14, the messages that can carry one are the responses to Target.getTargets,
+  // Target.getTargetInfo and Target.createBrowserContext, and the events Target.attachedToTarget,
+  // Target.targetCreated and Target.targetInfoChanged - all but createBrowserContext's through a
+  // TargetInfo. (Target.getBrowserContexts would return a whole list of them; it is in neither
+  // allowlist and this filter never issues it, and it spells them differently anyway - see
+  // `contextHolders` above.) This reads the message's shape rather than its method, so a later one
+  // is covered as long as it spells the field the same way - which nothing enforces.
+  //
+  // The ID is REDACTED and the entry kept, rather than the entry dropped: the workbench still has
+  // to learn the target exists to attach to it and drive it, and dropping an attachedToTarget would
+  // leave it waiting on a session this filter had already set up. `browserContextId` is optional on
+  // TargetInfo, so what is left is a message the protocol still describes.
+  //
+  // The string test is not only speed: a message whose bytes do not spell the name holds no such
+  // field, UNLESS whatever serialized it escaped the key - `"\u0062rowserContextId"` parses to the
+  // same name and would read past this test unredacted. What serializes these is Chromium, which
+  // does not; nothing here would notice if it started. It is also why an untouched message is
+  // forwarded byte-for-byte rather than re-serialized.
+  // What is NOT covered either: a message that is not JSON is forwarded unread, as it always was.
+  //
+  // `Target.setDiscoverTargets` (and `Target.getTargets`) take a `filter`, which was left with no
+  // rule and still has none: it chooses WHICH targets the workbench is told about and never what a
+  // target info says, so every id it lets through comes past this function anyway. It is not the
+  // setAutoAttach case either - discovery attaches nothing, pauses nothing, and this filter acts on
+  // no discovery event; its session tracking rides Target.attachedToTarget, which comes from
+  // auto-attach.
+  const disclose = (raw: string, m: any): string => {
+    if (!raw.includes("browserContextId")) return raw;
+    let redacted = false;
+    for (const holder of contextHolders(m)) {
+      if (typeof holder.browserContextId === "string" && covered.has(holder.browserContextId)) continue;
+      delete holder.browserContextId;
+      redacted = true;
+    }
+    return redacted ? JSON.stringify(m) : raw;
+  };
+
   return {
     fromWorkbench(message) {
       let m: any;
@@ -413,7 +535,7 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
       // Anything but a JSON object for params counts as no params, so a rule that reads one sees
       // nothing rather than something it cannot read, and default-deny refuses.
       const params = m.params !== null && typeof m.params === "object" && !Array.isArray(m.params) ? (m.params as Params) : undefined;
-      const why = refusal({ id: m.id, method: m.method, sessionId, params }, pages, unusable);
+      const why = refusal({ id: m.id, method: m.method, sessionId, params }, pages, unusable, covered);
       if (why !== undefined) return toWorkbench(cdpError(m.id, why, sessionId));
       // The response to this one names the new context, which the filter reads on the way back.
       if (m.method === "Target.createBrowserContext") contexts.add(m.id);
@@ -440,18 +562,22 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
           contexts.delete(m.id);
           const browserContextId = m.result?.browserContextId;
           // The response is HELD, not forwarded, until the denial for the new context is
-          // acknowledged: the workbench cannot name a context whose id it has not been told.
-          // Issuing the denial first and forwarding straight away was NOT enough - the workbench's
-          // next command for that context was accepted while the denial was still in flight, so a
-          // target could be created in an uncovered context. Held by this branch and the test
-          // "holds the new context's id until downloads are denied in it".
+          // acknowledged, and the id is added to `covered` in the same step. Issuing the denial
+          // first and forwarding straight away was NOT enough - the workbench's next command for
+          // that context was accepted while the denial was still in flight, so a target could be
+          // created in an uncovered context. Held by this branch and the test "holds the new
+          // context's id until downloads are denied in it".
           //
-          // What is withheld is the ID and nothing else: no command is checked for a
-          // `browserContextId` anywhere in this file, so a workbench that already knows or guesses
-          // one is not stopped by this.
+          // The hold is no longer what protects an uncovered context, because an id can be guessed
+          // and one used to arrive back in a target info: `refusal` above refuses a command naming
+          // an uncovered context and `disclose` above strips an uncovered id out of every message
+          // that would have carried it. This is what tells those two that a context is covered.
           if (typeof browserContextId === "string") {
             issue(undefined, "Browser.setDownloadBehavior", { behavior: "deny", browserContextId }, (r) => {
-              if (!r?.error) return void toWorkbench(message); // covered now: release the id
+              if (!r?.error) {
+                covered.add(browserContextId);
+                return void toWorkbench(disclose(message, m)); // covered now: release the id
+              }
               // Refused, so the context exists and its downloads are not denied. The filter disposes
               // it, answers the workbench's own command with an error instead of the id, and fails
               // closed from here on. Whether the dispose actually happened is NOT checked - its
@@ -494,7 +620,9 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
         // What is enforced here is that the command goes out on the session that asked.
         issue(m.sessionId, "Page.setInterceptFileChooserDialog", { enabled: true, cancel: true });
       }
-      return toWorkbench(message);
+      // Everything above reads the message as Chromium sent it; only what the workbench is handed
+      // is redacted, so the attach this filter just acted on still installs its setup.
+      return toWorkbench(disclose(message, m));
     },
   };
 }
