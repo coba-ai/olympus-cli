@@ -104,6 +104,51 @@ POST /device/token  {device_code}   → 400 {"error":{"code":"authorization_pend
 `verification_uri_complete`, and poll `/device/token` every `interval` seconds (add 5 on
 `slow_down`) until it returns the token, which happens once. Stop at `expires_in`.
 
+## Browser attach
+
+How `olympus browser attach` lends a member's own browser to the organization's agent. Neither call takes an
+`oly_` token: pair is unauthenticated like the device flow, and the relay accepts only the `obm_` machine token
+pair mints. Both answer 404 for an organization that does not have browser attach enabled.
+
+```
+POST /browser/pair   {code, name?}  → 201 {data:{token:"obm_…", machine_id:"bm_…", relay_url:"wss://…/api/v1/browser/relay"}}
+GET  /browser/relay  Authorization: Bearer obm_…  → 101, then a byte pipe to the organization's machine
+```
+
+- `code` is the 8-letter code shown as `XXXX-XXXX` in the app under **Settings → Rafita**, valid 10 minutes and
+  good for one claim. Send it as shown: the server upcases it and drops non-letters. `name` labels the computer
+  (at most 80 characters; blank becomes "Unnamed computer"). 10 pair attempts per 5 minutes per IP.
+- One 404 covers every refusal — unknown, expired or already-claimed code, the feature off for the organization,
+  an owner who is no longer a member — so a client cannot tell them apart. A missing or non-string `code`, or a
+  malformed body, is 400.
+- `token` is returned once, stored server-side as a digest, and is the only credential the relay reads.
+  `relay_url` is on the same host. The CLI keeps it at `~/.config/olympus/browser.json`, mode 0600, and refuses a
+  `relay_url` that is not `wss:` on the host it paired with (`ws:` only for loopback).
+
+**The relay is a pipe, not an API.** The handshake must be HTTP/1.1 with the bearer in the `Authorization`
+header; a session cookie and a `?token=` are never read. After the 101 the server forwards bytes and parses
+nothing: binary frames only (a text frame closes the connection with 1003), each at most 1 MiB. What travels
+inside them — stream multiplexing, CDP and the tunnelled TCP connections — is agreed between the CLI and the
+organization's workbench bridge and is not part of this API. That bridge does not exist yet, so an attached
+browser receives nothing today.
+
+| Answer | Meaning |
+|---|---|
+| 400 | not a valid WebSocket handshake |
+| 401 | missing, malformed, unknown or revoked token, or an owner who is no longer a member |
+| 404 | browser attach is not enabled for this organization |
+| 501 / 502 / 503 | the server cannot hijack the socket / the organization's machine did not answer or is on an older image / it is unavailable or at its connection cap |
+| close 4401 | this computer was revoked |
+| close 4409 | another connection attached as the same machine. One connection per machine, so two clients reconnecting for one machine evict each other indefinitely |
+| close 1003 | the client sent a text frame |
+| close 1006 / 1009 | the pipe dropped (a revoke mid-connection, a heartbeat failure or a deploy, none of which sends a close frame), or a frame or receive queue went over the limit |
+
+A refused upgrade is not reliably distinguishable by status: Bun's WebSocket client, which the CLI uses, reports
+no HTTP status for a non-101, so the CLI treats every refusal as transient — 1 s doubling to 60 s with jitter,
+ten attempts, then it gives up. Back off like that whatever client you write: the relay has no throttle of its
+own and every attempt counts against the member's own 300-requests-per-5-minutes IP budget, shared with their
+browsing, so a tight retry loop can lock them out of the app.
+
 ## Delivering to a webhook
 
 `POST` to the webhook's `url` with:

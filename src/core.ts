@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { clean } from "./format";
 
@@ -41,8 +41,9 @@ export const DEFAULT_HOST = "https://app.tryolympus.ai";
 export type Creds = { host?: string; token?: string; org?: string };
 
 const credsDir = (io: Io) => join(io.home, ".config", "olympus");
-const credsPath = (io: Io) => join(credsDir(io), "credentials.json");
-const ioError = (e: any, path: string) =>
+export const configPath = (io: Io, name: string) => join(credsDir(io), name);
+const credsPath = (io: Io) => configPath(io, "credentials.json");
+export const ioError = (e: any, path: string) =>
   new CliError(1, { error: { code: "credentials_io", message: `${e?.code ?? "EIO"} ${path}` } });
 
 export async function readCreds(io: Io): Promise<Creds> {
@@ -67,24 +68,57 @@ export async function readCreds(io: Io): Promise<Creds> {
   return { host: v.host, token: v.token, org: v.org };
 }
 
-export async function writeCreds(io: Io, c: Creds): Promise<void> {
-  const dir = credsDir(io);
-  const path = credsPath(io);
+// A 0600 file in the 0700 credentials directory, written to a temp file and renamed into place, so a
+// reader never sees a half-written file and never a mode wider than 0600. Shared by writeCreds and the
+// browser machine token file (src/browser-store.ts).
+//
+// `signal` makes the write itself cancellable, which a caller's check before calling cannot be: mkdir,
+// open, write and close are four awaits a Ctrl-C can land in, and the rename after them is the single
+// step that makes the credential real. Checking only before the rename is not enough — the rename is
+// itself an await, and an abort landing inside it installs the credential with nobody left to look
+// (measured). So the signal is read on BOTH sides of the rename, and a write abandoned after it is
+// rolled back to whatever was there before: the prior bytes are re-written, or the path is removed if
+// there were none. A cancelled call therefore leaves the file as it found it.
+// Enforced by browser-store.test.ts "Ctrl-C landing inside the write", "an abort while the write is in
+// flight" and "an abort landing inside the rename restores the previous file".
+// Omitting the signal (writeCreds) keeps the old behaviour: no check, no cancellation.
+// The 130 raised here carries login's wording; a caller with its own (pairBrowser) replaces it.
+export async function writeSecretFile(io: Io, name: string, text: string, signal?: AbortSignal): Promise<void> {
+  const path = configPath(io, name);
   const tmp = `${path}.${process.pid}.tmp`;
+  let abandoned = false;
+  // Read only when there is a signal to roll back for; writeCreds pays nothing for this.
+  const prior = signal ? await readFile(path, "utf8").catch(() => undefined) : undefined;
   try {
-    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await mkdir(credsDir(io), { recursive: true, mode: 0o700 });
     const fh = await open(tmp, "wx", 0o600);
     try {
-      await fh.writeFile(JSON.stringify(c) + "\n");
+      await fh.writeFile(text);
     } finally {
       await fh.close();
     }
-    await rename(tmp, path);
+    abandoned = signal?.aborted === true;
+    if (!abandoned) {
+      await rename(tmp, path);
+      abandoned = signal?.aborted === true;
+      if (abandoned) {
+        // The credential is on disk and the member asked us to stop. Put back what was there.
+        if (prior === undefined) await unlink(path).catch(() => {});
+        else await writeFile(path, prior, { mode: 0o600 });
+      }
+    }
   } catch (e: any) {
     await unlink(tmp).catch(() => {});
     throw ioError(e, path);
   }
+  // Outside the catch, so this is not reported as an IO failure; the temp file goes either way.
+  if (abandoned) {
+    await unlink(tmp).catch(() => {});
+    throw cancelled();
+  }
 }
+
+export const writeCreds = (io: Io, c: Creds): Promise<void> => writeSecretFile(io, "credentials.json", JSON.stringify(c) + "\n");
 
 export async function deleteCreds(io: Io): Promise<boolean> {
   const path = credsPath(io);
