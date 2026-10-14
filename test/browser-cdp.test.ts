@@ -98,6 +98,10 @@ describe("A6 CDP allowlist: every refusal", () => {
     refuse({ id: 4, method: "DOM.setFileInputFiles", sessionId: S, params: { files: ["/home/member/.ssh/id_ed25519"], nodeId: 2 } }, "DOM.setFileInputFiles");
   });
 
+  test("DOM.getFileInfo, which returns the local path of a File the page holds", () => {
+    refuse({ id: 40, method: "DOM.getFileInfo", sessionId: S, params: { objectId: "1.2.3" } }, "DOM.getFileInfo is refused");
+  });
+
   test("Target.sendMessageToTarget, which would carry any command as a string", () => {
     refuse(
       { id: 5, method: "Target.sendMessageToTarget", params: { targetId: "T1", message: '{"id":1,"method":"Browser.close"}' } },
@@ -224,6 +228,34 @@ describe("A7 navigation scheme refusal", () => {
       refuse({ id: 22, method, sessionId, params: {} }, "a navigation needs a url");
       refuse({ id: 23, method, sessionId, params: { url: 7 } }, "a navigation needs a url");
     }
+  });
+});
+
+describe("the same scheme rule on the two url-bearing methods A7 did not cover", () => {
+  const pages = new Set([S]);
+  const options = { disableCache: false, includeCredentials: false };
+
+  test("Network.loadNetworkResource, which fetches a url of its own", () => {
+    for (const url of ["file:///home/member/.ssh/id_ed25519", "data:text/html,<script>1</script>", "chrome://settings/passwords", "javascript:fetch('/x')"])
+      refuse({ id: 41, method: "Network.loadNetworkResource", sessionId: S, params: { url, options } }, "navigation target");
+    refuse({ id: 42, method: "Network.loadNetworkResource", sessionId: S, params: { options } }, "a navigation needs a url");
+    refuse({ id: 43, method: "Network.loadNetworkResource", sessionId: S, params: { url: "://example.test", options } }, "not a url");
+
+    for (const url of ["http://example.test/a.js", "https://example.test/a.js"])
+      expect(refusal({ id: 44, method: "Network.loadNetworkResource", sessionId: S, params: { url, options } }, pages)).toBeUndefined();
+  });
+
+  test("Fetch.continueRequest's url override, where no override is nothing to check", () => {
+    for (const url of ["file:///etc/passwd", "data:text/html,x", "chrome://version", "about:srcdoc", 7])
+      refuse({ id: 45, method: "Fetch.continueRequest", sessionId: S, params: { requestId: "R1", url } }, "navigation");
+
+    for (const params of [
+      { requestId: "R1" }, // the ordinary continue: no override, so no url to check
+      { requestId: "R1", method: "POST", postData: "x" },
+      { requestId: "R1", url: "https://example.test/x" },
+      { requestId: "R1", url: "http://example.test/x" },
+    ])
+      expect(refusal({ id: 46, method: "Fetch.continueRequest", sessionId: S, params }, pages)).toBeUndefined();
   });
 });
 

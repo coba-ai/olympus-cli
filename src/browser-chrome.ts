@@ -20,8 +20,10 @@ import { CliError, realSleep, usage, type Io } from "./core";
 // The SOCKS scheme is one constant because the choice is coupled to unit 2.3's CONNECT matching rules:
 // 2.3 matches its allowlist on the name as sent in CONNECT and does no DNS of its own, so whether
 // Chromium sends a hostname or an address it resolved itself decides whether a hostname allowlist can
-// match at all. Which one `socks5://` does is 2.3's open question and is NOT verified here (nothing in
-// this repo launches a browser). If it resolves locally, this becomes `socks5h` and nothing else moves.
+// match at all. Unit 2.3 MEASURED the answer on Chromium 152.0.7977.82: `socks5://` sends the
+// hostname as ATYP 0x03 DOMAINNAME and resolves nothing locally, so the hostname allowlist matches
+// (`browser-socks.ts`'s header has the drive). `socks5h` is NOT the fallback it was assumed to be —
+// Chromium refuses that scheme with ERR_NO_SUPPORTED_PROXIES and dials no proxy at all.
 export const PROXY_SCHEME = "socks5";
 
 // Assumption 3: no download and no bundled browser. `$OLYMPUS_CHROME` first, then PATH, then the two
@@ -60,6 +62,9 @@ export function chromeFlags(o: { profileDir: string; socksPort: number }): strin
     `--user-data-dir=${o.profileDir}`,
     // 0 = pick a free port; Chromium writes the one it bound to DevToolsActivePort.
     "--remote-debugging-port=0",
+    // A10 asks for that port on loopback. Chromium's default was never verified here (nothing in this
+    // repo launches a browser), so it is stated rather than assumed.
+    "--remote-debugging-address=127.0.0.1",
     // All egress leaves through the tunnel (§5.4): the SOCKS server is unit 2.3's, on loopback.
     `--proxy-server=${PROXY_SCHEME}://127.0.0.1:${o.socksPort}`,
     // Removes the implicit loopback bypass, so a page cannot reach this computer's own services.
@@ -68,6 +73,14 @@ export function chromeFlags(o: { profileDir: string; socksPort: number }): strin
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--no-first-run",
     "--no-default-browser-check",
+    // Chromium's own calls home leave through the tunnel, from the organization's IP, because every
+    // connection does (§5.4) and the default rule is allow. MEASURED by unit 2.3 against a fresh,
+    // signed-out, extension-free browser: `www.google.com`, `accounts.google.com` and
+    // `clients2.google.com`. These two are the flags that stop the background fetches and the
+    // component/extension updater (`clients2.google.com`) respectively. Nothing here re-measures what
+    // is left: no test launches a browser, so the ship gate's live drive is the only check.
+    "--disable-background-networking",
+    "--disable-component-update",
     // A start page that needs no network. Chromium's new-tab page would otherwise be the first thing
     // the tunnel is asked to fetch.
     "about:blank",

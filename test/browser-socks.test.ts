@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { Stream, StreamOpener } from "../src/browser-frame";
+import { ACK, encodeFrame, type Stream, type StreamOpener } from "../src/browser-frame";
+import { createRelay, type RelayHandlers } from "../src/browser-relay";
 import { parseAllowOrigin, startSocksProxy, type SocksOptions, type SocksProxy } from "../src/browser-socks";
-import { CliError } from "../src/core";
+import { CliError, type Io } from "../src/core";
 
 // Driven over a real loopback socket against the real Bun.listen server, with the stream opener
 // injected as a spy: nothing here fakes the protocol, so a parser that mis-reads a byte fails.
@@ -39,7 +40,12 @@ function spy() {
   };
 }
 
-type Client = { send: (bytes: number[]) => void; read: (n: number) => Promise<Uint8Array>; end: () => void };
+type Client = { send: (bytes: number[] | Uint8Array) => void; read: (n: number) => Promise<Uint8Array>; end: () => void };
+
+const until = async (p: () => boolean) => {
+  for (let i = 0; i < 500 && !p(); i++) await Bun.sleep(1);
+  expect(p()).toBe(true);
+};
 
 const started: SocksProxy[] = [];
 const clients: Client[] = [];
@@ -78,7 +84,7 @@ async function connect(port: number): Promise<Client> {
     },
   });
   const client: Client = {
-    send: (bytes) => void sock.write(new Uint8Array(bytes)),
+    send: (bytes) => void sock.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)),
     read: (n) => new Promise<Uint8Array>((resolve) => ((want = { n, resolve }), pump())),
     end: () => sock.end(),
   };
@@ -208,25 +214,49 @@ describe("A9 allowed CONNECTs", () => {
 });
 
 describe("A9 the stream", () => {
-  test("answers 0x00 on the stream's first byte, then pumps both ways", async () => {
+  // THE DEADLOCK TEST. Keying the reply on the stream's first byte passed every test in this file
+  // and could not load one page: unit 2.3 measured real Chromium failing with
+  // ERR_SOCKS_CONNECTION_FAILED, because a TCP connect produces no byte and the browser will not
+  // send its request before the reply. So this asserts that NOTHING flowed on the stream before the
+  // 0x00 went out — an implementation that waits for a byte cannot pass it.
+  test("answers 0x00 on the ACK alone, with no stream bytes at all, and only then passes the request", async () => {
     const p = proxy();
     const c = await greeted(p.port);
     c.send(name("example.com", 443));
     const s = await p.next();
 
-    // No reply yet: §4 has no OPEN acknowledgement, so the first byte is the only sign of a connection.
-    s.stream.onData!(u8(0x16, 0x03, 0x01));
-    expect(await c.read(10)).toEqual(REPLY(0x00));
-    expect(await c.read(3)).toEqual(u8(0x16, 0x03, 0x01));
-
+    // The browser's request is already here, and is held: there is no success reply on the wire yet.
     c.send([0x47, 0x45, 0x54]);
     await Bun.sleep(5);
+    expect(s.written).toEqual([]);
+
+    s.stream.onAck!();
+    expect(await c.read(10)).toEqual(REPLY(0x00));
+    await Bun.sleep(5);
     expect(s.written).toEqual([u8(0x47, 0x45, 0x54)]);
+
+    // And bytes pump both ways from there.
+    s.stream.onData!(u8(0x16, 0x03, 0x01));
+    expect(await c.read(3)).toEqual(u8(0x16, 0x03, 0x01));
+    c.send([0x0d, 0x0a]);
+    await Bun.sleep(5);
+    expect(s.written).toEqual([u8(0x47, 0x45, 0x54), u8(0x0d, 0x0a)]);
     expect(s.closed).toBe(false);
   });
 
-  test("answers 0x04 and closes the stream when no first byte arrives in time", async () => {
-    const p = proxy({ firstByteMs: 20 });
+  test("holds stream bytes that arrive before the ACK until the reply has gone out", async () => {
+    const p = proxy();
+    const c = await greeted(p.port);
+    c.send(name("example.com", 443));
+    const s = await p.next();
+
+    s.stream.onData!(u8(0x16, 0x03, 0x01)); // §4 does not forbid the workbench sending DATA first
+    s.stream.onAck!();
+    expect(await c.read(13)).toEqual(new Uint8Array([...REPLY(0x00), 0x16, 0x03, 0x01]));
+  });
+
+  test("answers 0x04 and closes the stream when no ACK arrives in time", async () => {
+    const p = proxy({ ackMs: 20 });
     const c = await greeted(p.port);
     c.send(name("example.com", 443));
     const s = await p.next();
@@ -234,7 +264,7 @@ describe("A9 the stream", () => {
     expect(s.closed).toBe(true);
   });
 
-  test("answers 0x04 when the stream closes before its first byte", async () => {
+  test("answers 0x04 when the stream closes before its ACK", async () => {
     const p = proxy();
     const c = await greeted(p.port);
     c.send(name("example.com", 443));
@@ -277,6 +307,71 @@ describe("A9 --allow-origin parsing", () => {
       expect([bad, e instanceof CliError && e.exit]).toEqual([bad, 1]);
     }
   });
+});
+
+// A5's pause/resume, end to end. The `Stream` seam is the only path the relay's backpressure has to
+// a browser socket: unit 2.3 reported that with write/close/onData/onClose alone, `onBackpressure`
+// fired and this server went on reading. Driven with the REAL relay client over a fake WebSocket
+// whose `bufferedAmount` the test sets, against a real loopback socket — a callback that fires
+// without reaching `sock.pause()` cannot pass this.
+test("a backed-up relay pauses the real browser socket, and the bytes flow again once it drains", async () => {
+  const PAUSE_ABOVE = 4 * 1024 * 1024; // the relay's own threshold, duplicated so a change is deliberate
+  let buffered = 0;
+  const sent: Uint8Array[] = [];
+  let peer!: RelayHandlers;
+  let up = false;
+  const io: Io = {
+    env: {},
+    home: "/nonexistent",
+    stdin: async () => "",
+    out: () => {},
+    err: () => {},
+    sleep: async () => void (await Bun.sleep(0)), // the drain poll, without the 50 ms wait
+  };
+  const ac = new AbortController();
+  const r = createRelay(io, "http://127.0.0.1:3111", { machine_id: "bm_0123456789abcdef", name: "laptop", token: "obm_t" }, {
+    onCdpStream: () => {},
+    onEvent: (e) => void (e.state === "online" && (up = true)),
+    signal: ac.signal,
+    connect: (_url, _headers, h) => {
+      peer = h;
+      queueMicrotask(() => h.open()); // as Bun's own client does: never from inside the constructor
+      return {
+        get bufferedAmount() {
+          return buffered;
+        },
+        send: (b) => void sent.push(b),
+        close: () => {},
+      };
+    },
+  });
+  const run = r.run();
+
+  try {
+    await until(() => up);
+    const p = startSocksProxy({ open: r.open, ackMs: 10_000 });
+    started.push(p);
+    const c = await greeted(p.port);
+    c.send(name("example.com", 443));
+    await until(() => sent.length === 1); // the OPEN frame, on the first even id
+    peer.message(encodeFrame(2, ACK));
+    expect(await c.read(10)).toEqual(REPLY(0x00));
+
+    const kib = new Uint8Array(1024).fill(7);
+    buffered = PAUSE_ABOVE + 1;
+    c.send(kib); // the write the relay notices the queue on, and pauses this socket for
+    await until(() => sent.length === 2);
+
+    for (let i = 0; i < 64; i++) c.send(kib);
+    await Bun.sleep(50);
+    expect(sent.length).toBe(2); // 64 KiB into a paused socket reached the relay as nothing
+
+    buffered = 0;
+    await until(() => sent.length > 2);
+  } finally {
+    ac.abort();
+    await run;
+  }
 });
 
 test("listens on an ephemeral loopback port, so 2.4 can build --proxy-server=socks5://127.0.0.1:<port>", async () => {

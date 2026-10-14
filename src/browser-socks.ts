@@ -30,7 +30,7 @@ const ATYP_IPV6 = 0x04;
 const NO_ACCEPTABLE_METHODS = 0xff;
 
 // RFC 1928 §6 replies. 0x02 is A9's answer to an address or port the rules refuse; 0x04 is its answer
-// to a `tcp:` stream that never produced a byte; 0x07 and 0x08 fall out of parsing.
+// to a `tcp:` stream that was never ACKed; 0x07 and 0x08 fall out of parsing.
 const SUCCESS = 0x00;
 const NOT_ALLOWED = 0x02;
 const UNREACHABLE = 0x04;
@@ -38,7 +38,7 @@ const BAD_COMMAND = 0x07;
 const BAD_ATYP = 0x08;
 
 const DEFAULT_PORTS = new Set([80, 443]);
-const FIRST_BYTE_MS = 30_000;
+const ACK_MS = 30_000;
 const EMPTY = new Uint8Array(0);
 const DEC = new TextDecoder();
 
@@ -124,8 +124,8 @@ export type SocksOptions = {
   open: StreamOpener;
   /** Raw `--allow-origin` values. Empty is the default: any public host on 80/443. */
   allowOrigins?: string[];
-  /** A9's 30 s wait for the stream's first byte, injectable so a test need not wait it out. */
-  firstByteMs?: number;
+  /** A9's 30 s wait for the stream's ACK, injectable so a test need not wait it out. */
+  ackMs?: number;
 };
 
 type Conn = {
@@ -134,13 +134,16 @@ type Conn = {
   buf: Uint8Array;
   stream: Stream | null;
   timer: ReturnType<typeof setTimeout> | null;
-  /** Stream bytes the client socket could not take yet; sent again from `drain`. */
+  /**
+   * Stream bytes the client socket has not taken: held until the ACK puts the success reply on the
+   * wire ahead of them, or left over from a partial write and sent again from `drain`.
+   */
   pending: Uint8Array;
 };
 
 export function startSocksProxy(o: SocksOptions): SocksProxy {
   const allow = (o.allowOrigins ?? []).map(parseAllowOrigin);
-  const firstByteMs = o.firstByteMs ?? FIRST_BYTE_MS;
+  const ackMs = o.ackMs ?? ACK_MS;
 
   // Public by default on 80/443; any --allow-origin narrows that to exactly the listed set.
   const permitted = (host: string, port: number) =>
@@ -164,7 +167,9 @@ export function startSocksProxy(o: SocksOptions): SocksProxy {
         if (c.phase === "request") request(sock);
       },
       drain(sock) {
-        if (sock.data.pending.length) toClient(sock, EMPTY);
+        // Only once the success reply has gone out: while `connecting`, `pending` is holding stream
+        // bytes that must not reach the browser ahead of it.
+        if (sock.data.phase === "open" && sock.data.pending.length) toClient(sock, EMPTY);
       },
       close(sock) {
         kill(sock);
@@ -269,35 +274,49 @@ export function startSocksProxy(o: SocksOptions): SocksProxy {
     c.phase = "connecting";
     const stream = o.open(target);
     c.stream = stream;
-    stream.onData = (bytes) => {
-      if (c.phase === "connecting") {
-        // A9 holds the reply until the stream's first byte, because §4 has no OPEN acknowledgement and
-        // a byte is the only sign the far end connected at all.
-        //
-        // MEASURED, and the reason this cannot ship as the whole story: that deadlocks every
-        // client-speaks-first protocol, which is all of HTTP and HTTPS. Driven with a faithful
-        // workbench — one that really dialled example.com:80 and pumped both ways — Chromium failed
-        // with ERR_SOCKS_CONNECTION_FAILED: a TCP connect produces no byte, so no 0x00 goes out, so
-        // the browser never sends its request, so the server never speaks. Nothing here can fix it;
-        // §4 needs an OPEN acknowledgement (then the reply keys on the ack, and 0x04 stays the answer
-        // to silence). Reported to the orchestrator as a loop-D/contract concern, not worked around.
-        if (c.timer) clearTimeout(c.timer);
-        c.timer = null;
-        c.phase = "open";
-        sock.write(reply(SUCCESS));
-        if (c.buf.length) {
-          stream.write(c.buf);
-          c.buf = EMPTY;
-        }
+    // The success reply keys on the stream's ACK (§4 op 3), which the workbench sends when its dial
+    // succeeds.
+    //
+    // It keyed on the stream's FIRST BYTE until unit 2.3 MEASURED what that does: a TCP connect
+    // produces no byte, so no 0x00 went out, so the browser never sent its request, so the server
+    // never spoke — every client-speaks-first protocol, which is all of HTTP and HTTPS. Driven with a
+    // faithful workbench that really dialled example.com:80 and pumped both ways, real Chromium
+    // failed every page with ERR_SOCKS_CONNECTION_FAILED. The 0x04 answers below are unchanged: an
+    // ACK that never comes is the same "never answered" as a byte that never came.
+    stream.onAck = () => {
+      if (c.phase !== "connecting") return;
+      if (c.timer) clearTimeout(c.timer);
+      c.timer = null;
+      c.phase = "open";
+      sock.write(reply(SUCCESS));
+      // The browser's own request bytes, held since the CONNECT, go to the stream now...
+      if (c.buf.length) {
+        stream.write(c.buf);
+        c.buf = EMPTY;
       }
-      toClient(sock, bytes);
+      // ...and anything the far end sent before its ACK reached us goes to the browser, behind the reply.
+      if (c.pending.length) toClient(sock, EMPTY);
     };
-    // CLOSE before any byte is the same "never answered" case as the timeout — the workbench refusing
+    stream.onData = (bytes) => {
+      // Stream bytes before the ACK cannot go out: they would land in front of the success reply.
+      // Held for `onAck` to flush. Nothing in §4 stops the workbench sending DATA before its ACK.
+      if (c.phase === "connecting") c.pending = c.pending.length ? concat(c.pending, bytes) : bytes;
+      else toClient(sock, bytes);
+    };
+    // A5: the relay calls these when its own send queue is over the threshold, so the browser gets TCP
+    // backpressure instead of this process buffering the page it is uploading.
+    stream.pause = () => {
+      if (c.phase !== "dead") sock.pause();
+    };
+    stream.resume = () => {
+      if (c.phase !== "dead") sock.resume();
+    };
+    // CLOSE before the ACK is the same "never answered" case as the timeout — the workbench refusing
     // the target under §6.3 looks exactly like this — so it gets the same 0x04.
     stream.onClose = () => (c.phase === "connecting" ? refuse(sock, UNREACHABLE) : kill(sock));
     c.timer = setTimeout(() => {
       if (c.phase === "connecting") refuse(sock, UNREACHABLE);
-    }, firstByteMs);
+    }, ackMs);
     c.timer.unref?.(); // A11: a pending timer must not be what keeps the process alive
   }
 

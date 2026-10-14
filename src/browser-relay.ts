@@ -19,6 +19,7 @@
 // socket that DID open stops. The client keys on whether `open` fired, never on the close code
 // alone — 1002 "Expected 101 status code" is a handshake failure, not a live close.
 import {
+  ACK,
   CLOSE,
   DATA,
   OPEN,
@@ -46,10 +47,14 @@ const BACKOFF_MIN = 1_000;
 const BACKOFF_MAX = 60_000;
 const MAX_ATTEMPTS = 10;
 const STALL_AFTER = 3;
+// A connection shorter than this counts as a failed attempt rather than resetting the count, so a
+// socket that opens and drops at once is bounded by MAX_ATTEMPTS like any other failure.
+const FLAP_UNDER_MS = 5_000;
 
 // A5: pause reading from the local sockets above 4 MiB queued, resume below 1 MiB, so our own writes
 // never reach the hub's 8 MiB receiver limit (§1.4). `bufferedAmount` drains with no event, so while
-// paused it is polled.
+// paused it is polled. Each live stream's `pause`/`resume` is what reaches a local socket; the
+// `onBackpressure` callback only tells the command.
 const PAUSE_ABOVE = 4 * 1024 * 1024;
 const RESUME_BELOW = 1024 * 1024;
 const DRAIN_POLL_MS = 50;
@@ -158,11 +163,19 @@ const STOP: Record<number, { exit: 2 | 5 | 6; code: string; message: string }> =
   },
 };
 
-type Entry = { data: (bytes: Uint8Array) => void; gone: () => void };
+type Entry = {
+  data: (bytes: Uint8Array) => void;
+  gone: () => void;
+  /** Only a laptop-opened `tcp:` stream has these: an ACK to deliver, and a local socket to pause. */
+  ack?: () => void;
+  pause?: () => void;
+  resume?: () => void;
+};
 type Conn = { handle: RelayHandle; streams: Map<number, Entry>; nextEven: number; paused: boolean; closed: boolean };
 
 export function createRelay(io: Io, host: string, machine: BrowserMachine, o: RelayOptions): Relay {
   const sleep = io.sleep ?? realSleep;
+  const now = io.now ?? Date.now;
   const connect = o.connect ?? connectWebSocket;
   const jitter = o.jitter ?? Math.random;
   const url = relayUrl(host);
@@ -184,6 +197,7 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
   function pressure(c: Conn) {
     if (c.paused || c.closed || c.handle.bufferedAmount <= PAUSE_ABOVE) return;
     c.paused = true;
+    for (const e of c.streams.values()) e.pause?.();
     o.onBackpressure?.(true);
     void drain(c);
   }
@@ -191,6 +205,7 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
     while (!c.closed && c.handle.bufferedAmount >= RESUME_BELOW) await sleep(DRAIN_POLL_MS);
     if (!c.paused) return; // teardown got there first and already resumed
     c.paused = false;
+    for (const e of c.streams.values()) e.resume?.();
     o.onBackpressure?.(false);
   }
 
@@ -264,6 +279,13 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
       c.streams.delete(f.id);
       return e.gone();
     }
+    if (f.op === ACK) {
+      // Only a `tcp:` stream we opened has a dial to acknowledge. An ACK on a workbench-opened `cdp`
+      // stream is the untrusted peer sending a frame §4 does not have there, so that stream goes,
+      // the same answer `opened` gives a duplicate OPEN.
+      if (isWorkbenchStream(f.id)) return kill(c, f.id);
+      return e.ack?.();
+    }
     // COPY: `decodeFrame`'s payload is a view into the WebSocket message buffer, and a consumer may
     // hold on to it. Nothing here depends on whether Bun reuses that buffer; the copy makes it moot.
     e.data(f.payload.slice());
@@ -298,7 +320,13 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
         if (c.streams.delete(id)) frame(c, id, CLOSE);
       },
     };
-    c.streams.set(id, { data: (bytes) => s.onData?.(bytes), gone: () => s.onClose?.() });
+    c.streams.set(id, {
+      data: (bytes) => s.onData?.(bytes),
+      gone: () => s.onClose?.(),
+      ack: () => s.onAck?.(),
+      pause: () => s.pause?.(),
+      resume: () => s.resume?.(),
+    });
     frame(c, id, OPEN, ENC.encode(target));
     emit({ state: "stream", id, target });
     return s;
@@ -344,22 +372,26 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
 
   async function run(): Promise<void> {
     const signal = o.signal;
-    let attempts = 0; // consecutive handshakes that never opened
+    let attempts = 0; // consecutive failures: a handshake that never opened, or a connection that flapped
     let delay = BACKOFF_MIN;
     for (;;) {
       if (signal?.aborted) return;
       emit({ state: "connecting", attempt: attempts + 1 });
+      const at = now();
       const end = await session(signal);
       if (signal?.aborted) return;
       if (end.opened) {
         const stop = STOP[end.code];
         if (stop) throw new CliError(stop.exit, { error: { code: stop.code, message: stop.message } });
-        // A connection that opened resets both the count and the delay (Assumption 14). A socket that
-        // opens and drops at once therefore reconnects about every second for as long as it keeps
-        // doing that; nothing bounds it, because nothing distinguishes it from a healthy reconnect.
+        emit({ state: "closed", code: end.code, reason: end.reason });
+      }
+      // A connection that opened AND LASTED resets both the count and the delay (Assumption 14). One
+      // that dropped inside FLAP_UNDER_MS counts as a failed attempt instead: resetting on any open at
+      // all let a socket that opens and drops at once reconnect about every second forever, because
+      // nothing then distinguished it from a healthy reconnect.
+      if (end.opened && now() - at >= FLAP_UNDER_MS) {
         attempts = 0;
         delay = BACKOFF_MIN;
-        emit({ state: "closed", code: end.code, reason: end.reason });
       } else {
         attempts++;
         if (attempts >= MAX_ATTEMPTS)

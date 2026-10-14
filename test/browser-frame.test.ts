@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  cdpReader, chunkPayload, CLOSE, DATA, decodeFrame, encodeCdp, encodeFrame, isLaptopStream, isWorkbenchStream, MAX_PAYLOAD, OPEN,
+  ACK, cdpReader, chunkPayload, CLOSE, DATA, decodeFrame, encodeCdp, encodeFrame, isLaptopStream, isWorkbenchStream, MAX_PAYLOAD, OPEN,
   type CdpSend, type Stream, type StreamOpener,
 } from "../src/browser-frame";
 
@@ -22,8 +22,14 @@ const cdpMessage = (n: number) => {
 };
 
 describe("A1 frame codec", () => {
-  test("ops are pinned 0 OPEN / 1 DATA / 2 CLOSE (binding on the workbench bridge)", () => {
-    expect([OPEN, DATA, CLOSE]).toEqual([0, 1, 2]);
+  test("ops are pinned 0 OPEN / 1 DATA / 2 CLOSE / 3 ACK (binding on the workbench bridge)", () => {
+    expect([OPEN, DATA, CLOSE, ACK]).toEqual([0, 1, 2, 3]);
+  });
+
+  test("an ACK is a bare header: the stream id, op 3, and no payload", () => {
+    expect(encodeFrame(2, ACK)).toEqual(bytes(0, 0, 0, 2, 3));
+    const f = decodeFrame(encodeFrame(2, ACK));
+    expect([f.id, f.op, f.payload.length]).toEqual([2, ACK, 0]);
   });
 
   test("the header is [u32 BE stream id][u8 op], 5 bytes", () => {
@@ -32,11 +38,12 @@ describe("A1 frame codec", () => {
   });
 
   test("round-trips id, op and payload", () => {
-    const cases: [number, 0 | 1 | 2, Uint8Array][] = [
+    const cases: [number, 0 | 1 | 2 | 3, Uint8Array][] = [
       [0, OPEN, ENC.encode("cdp")],
       [1, OPEN, ENC.encode("tcp:127.0.0.1:443")],
       [7, DATA, bytes(0, 255, 128, 0)],
       [0xffffffff, CLOSE, new Uint8Array(0)],
+      [4, ACK, new Uint8Array(0)],
       [2, DATA, new Uint8Array(MAX_PAYLOAD).fill(0x5a)],
     ];
     for (const [id, op, payload] of cases) {
@@ -58,6 +65,13 @@ describe("A1 frame codec", () => {
     expect(MAX_PAYLOAD + 5).toBeLessThan(1024 * 1024);
   });
 
+  // The inbound direction is the one the untrusted peer writes (§3), so it gets the same cap.
+  test("refuses an oversize payload on decode too, exactly where encode refuses it", () => {
+    const over = new Uint8Array(5 + MAX_PAYLOAD + 1);
+    expect(thrown(() => decodeFrame(over)).message).toContain(String(MAX_PAYLOAD + 1));
+    expect(decodeFrame(new Uint8Array(5 + MAX_PAYLOAD)).payload.length).toBe(MAX_PAYLOAD);
+  });
+
   test("a truncated buffer is an error, never a partial frame", () => {
     for (let n = 0; n < 5; n++) expect(thrown(() => decodeFrame(new Uint8Array(n))).message).toContain(`is ${n} bytes`);
     const empty = decodeFrame(bytes(0, 0, 0, 3, 2)); // 5 bytes is whole: a CLOSE with no payload
@@ -65,7 +79,7 @@ describe("A1 frame codec", () => {
   });
 
   test("an op §4 does not define is an error, not silently DATA", () => {
-    for (const op of [3, 255]) expect(thrown(() => decodeFrame(bytes(0, 0, 0, 1, op, 7))).message).toContain(`op ${op}`);
+    for (const op of [4, 255]) expect(thrown(() => decodeFrame(bytes(0, 0, 0, 1, op, 7))).message).toContain(`op ${op}`);
   });
 
   test("odd ids are the workbench's, even ids the laptop's", () => {

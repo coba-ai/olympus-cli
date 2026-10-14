@@ -79,11 +79,14 @@ describe("A10 Chromium launch", () => {
     expect(chromeFlags({ profileDir: "/tmp/olympus-browser-abc", socksPort: 1080 })).toEqual([
       "--user-data-dir=/tmp/olympus-browser-abc",
       "--remote-debugging-port=0",
+      "--remote-debugging-address=127.0.0.1",
       "--proxy-server=socks5://127.0.0.1:1080",
       "--proxy-bypass-list=<-loopback>",
       "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
       "--no-first-run",
       "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-component-update",
       "about:blank",
     ]);
     expect(chromeFlags({ profileDir: "/p", socksPort: 42123 })).toContain(`--proxy-server=${PROXY_SCHEME}://127.0.0.1:42123`);

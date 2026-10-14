@@ -42,6 +42,12 @@ export const SETUP_ID = 1_000_000_000;
 
 // §5.2's allowed domains. Every one is a PAGE domain, reached only through a flattened session;
 // Target is absent because it addresses the browser target, so it is method-allowlisted instead.
+//
+// Allowlisting a DOMAIN admits every method in it, the ones nobody here has read included, and the
+// ones the protocol grows next. The table and rules below close the URL-bearing and disk-reading
+// methods found by reading `browser_protocol.json` on 2026-10-14; NOTHING enforces that a method
+// added after that date is found at all, and method-allowlisting all ten was considered and
+// declined (plan 3.1a). This is a narrower hole than it was, not a closed one.
 const DOMAINS = new Set(["Page", "Runtime", "DOM", "CSS", "Input", "Network", "Fetch", "Emulation", "Log", "Accessibility"]);
 
 // Target, cut to what driving page targets needs. This list alone is what refuses the rest of the
@@ -67,9 +73,10 @@ const TARGET_METHODS = new Set([
   "Target.setDiscoverTargets",
 ]);
 
-// A7 / §5.5. "" is how Target.createTarget asks for a blank page. A private, loopback or
-// link-local HOST is not checked here: every connection leaves through the SOCKS proxy, whose
-// address rules refuse those (A9), and the proxy bypass list keeps loopback on that path.
+// A7 / §5.5, and the one scheme rule for every method that hands Chromium a URL to LOAD. "" is how
+// Target.createTarget asks for a blank page. A private, loopback or link-local HOST is not checked
+// here: every connection leaves through the SOCKS proxy, whose address rules refuse those (A9), and
+// the proxy bypass list keeps loopback on that path.
 function navTarget(url: unknown): string | undefined {
   if (typeof url !== "string") return "a navigation needs a url";
   if (url === "" || url === "about:blank") return undefined;
@@ -83,11 +90,38 @@ function navTarget(url: unknown): string | undefined {
   return `refusing a ${u.protocol} navigation target: only http, https and about:blank`;
 }
 
-// A6's refusals that sit INSIDE an allowed domain, plus the two marked ADDITION, which A6 does not
-// name and A8 needs. The ones outside an allowed domain - every `Browser.*`, `sendMessageToTarget`,
-// `exposeDevToolsProtocol` - need no rule here: the two allowlists above are what refuse them. A
-// rule returns why it refused, or undefined to carry on.
-const RULES: Record<string, (p: Params) => string | undefined> = {
+type Rule = (p: Params) => string | undefined;
+
+// Where a loadable URL lives, per method - a table so the next one is a row, not another branch.
+// `OVERRIDE` marks a URL that REPLACES one the page already asked for, where absent means "leave it
+// alone" and there is nothing to check; `REQUIRED` is a method that does not act without one, so a
+// missing or non-string url is refused the way A7 already refuses it for Page.navigate.
+const REQUIRED = false;
+const OVERRIDE = true;
+const URL_METHODS: [method: string, param: string, override: boolean][] = [
+  ["Page.navigate", "url", REQUIRED], // A7
+  ["Target.createTarget", "url", REQUIRED], // A7
+  // "Fetches the resource and returns the content" - a fetch primitive in its own right, so without
+  // this it is the file:// read that A7's two methods are refused for.
+  ["Network.loadNetworkResource", "url", REQUIRED],
+  // Rewrites an intercepted request's URL "in a way that's not observable by page": the page asks
+  // for one thing and Chromium loads another, scheme included.
+  ["Fetch.continueRequest", "url", OVERRIDE],
+];
+
+const urlRules: Record<string, Rule> = Object.fromEntries(
+  URL_METHODS.map(([method, param, override]): [string, Rule] => [
+    method,
+    (p) => (override && p[param] === undefined ? undefined : navTarget(p[param])),
+  ]),
+);
+
+// A6's refusals that sit INSIDE an allowed domain, plus the URL table above and the three marked
+// ADDITION, which A6 does not name. The ones outside an allowed domain - every `Browser.*`,
+// `sendMessageToTarget`, `exposeDevToolsProtocol` - need no rule here: the two allowlists above are
+// what refuse them. A rule returns why it refused, or undefined to carry on.
+const RULES: Record<string, Rule> = {
+  ...urlRules,
   // A non-flattened attach wraps that session's messages in Target.sendMessageToTarget envelopes,
   // which are not inspected, so it is refused outright rather than filtered: only flattened
   // sessions exist. CDP's `flatten` defaults to the old nested behaviour, so absent is not true.
@@ -97,13 +131,15 @@ const RULES: Record<string, (p: Params) => string | undefined> = {
   // outside the SOCKS tunnel every other connection leaves through (§5.4).
   "Target.createBrowserContext": (p) =>
     p.proxyServer === undefined ? undefined : "Target.createBrowserContext with proxyServer is refused",
-  "Target.createTarget": (p) => navTarget(p.url),
-  "Page.navigate": (p) => navTarget(p.url),
   // A8: the filter issues download-deny itself, and the workbench may not undo it. Browser's copy
   // of this method is refused with the rest of that domain.
   "Page.setDownloadBehavior": () => "downloads are denied; Page.setDownloadBehavior is refused",
   // Writes the member's own files into a file input - the one command that reads their disk.
   "DOM.setFileInputFiles": () => "DOM.setFileInputFiles is refused",
+  // ADDITION. "Returns file information for the given File wrapper" - and the information is
+  // `path`, the local filesystem path. The same leak as the line above, read back rather than
+  // written in, and A6 names only the written-in half.
+  "DOM.getFileInfo": () => "DOM.getFileInfo is refused",
   // The drag payload carries files, which is that same read of the member's disk by another name.
   "Input.dispatchDragEvent": () => "Input.dispatchDragEvent is refused",
   // ADDITION. A8 says the workbench cannot undo chooser interception "because A6 refuses both

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { CLOSE, DATA, MAX_PAYLOAD, OPEN, decodeFrame, encodeCdp, encodeFrame } from "../src/browser-frame";
+import { ACK, CLOSE, DATA, MAX_PAYLOAD, OPEN, decodeFrame, encodeCdp, encodeFrame } from "../src/browser-frame";
 import {
   createRelay,
   relayUrl,
@@ -41,10 +41,18 @@ const machine: BrowserMachine = { machine_id: "bm_0123456789abcdef", name: "lapt
 const host = () => relay.url.replace(/^ws/, "http").replace("/api/v1/browser/relay", "");
 
 // Every sleep is recorded and yields a real tick, so a backoff sequence is asserted in milliseconds
-// and a poll loop (the backpressure drain) cannot starve the test of the event loop.
-function testIo(slept: number[] = []): Io & { slept: number[] } {
-  return { env: {}, home: "/nonexistent", stdin: async () => "", out: () => {}, err: () => {}, slept, sleep: async (ms) => void (slept.push(ms), await Bun.sleep(0)) };
+// and a poll loop (the backpressure drain) cannot starve the test of the event loop. `tick` is how
+// much `io.now` advances per read, which is how long each connection appears to have lasted: 0 (the
+// default) makes every connection an instant drop, and anything over 5 s makes it a healthy one.
+function testIo(slept: number[] = [], tick = 0): Io & { slept: number[] } {
+  let clock = 0;
+  return {
+    env: {}, home: "/nonexistent", stdin: async () => "", out: () => {}, err: () => {}, slept,
+    sleep: async (ms) => void (slept.push(ms), await Bun.sleep(0)),
+    now: () => (clock += tick),
+  };
 }
+const LASTED = 6_000; // over the client's 5 s flap threshold
 
 const until = async (p: () => boolean) => {
   for (let i = 0; i < 500 && !p(); i++) await Bun.sleep(1);
@@ -198,8 +206,8 @@ test("stops on the close codes a live socket can carry: 4401 exit 2, 4409 exit 6
   }
 });
 
-test("backs off on a live 1009 or 1006, resetting the delay each time a socket opens", async () => {
-  const io = testIo();
+test("backs off on a live 1009 or 1006, resetting the delay each time a socket opens and lasts", async () => {
+  const io = testIo([], LASTED);
   const events: RelayEvent[] = [];
   const ac = new AbortController();
   const f = fakeSocket((n, h) => {
@@ -217,12 +225,28 @@ test("backs off on a live 1009 or 1006, resetting the delay each time a socket o
   ]);
 });
 
-test("a connection that opens resets the handshake count, so the cap is consecutive failures only", async () => {
-  const io = testIo();
+test("a connection that opens and lasts resets the handshake count, so the cap is consecutive failures only", async () => {
+  const io = testIo([], LASTED);
   const f = fakeSocket((n, h) => (n === 10 ? (h.open(), h.close(1006, "")) : h.close(1002, "Expected 101 status code")));
   const e = await thrown(createRelay(io, host(), machine, { connect: f.connect, onCdpStream: () => {}, jitter: () => 1 }).run());
   expect(f.attempts).toBe(20); // nine failures, one that opened, then ten more
   expect(e.exit).toBe(5);
+});
+
+// A socket that opened used to reset the count however briefly it lived, so a connection that
+// dropped on arrival reconnected about once a second for as long as it kept doing that.
+test("a connection that opens and drops inside 5 s is a failed attempt, so a flap is bounded by the cap", async () => {
+  const io = testIo(); // the clock never advances: every connection is an instant drop
+  const events: RelayEvent[] = [];
+  const f = fakeSocket((_, h) => (h.open(), h.close(1006, "dropped")));
+  const e = await thrown(
+    createRelay(io, host(), machine, { connect: f.connect, onCdpStream: () => {}, onEvent: (x) => events.push(x), jitter: () => 1 }).run(),
+  );
+  expect(f.attempts).toBe(10);
+  expect(io.slept).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+  expect([e.exit, e.body.error.code]).toEqual([5, "relay_unreachable"]);
+  // Each one still reports its close, because it really did connect.
+  expect(events.filter((x) => x.state === "closed").length).toBe(10);
 });
 
 test("returns rather than throws when the signal aborts, and leaves no socket behind", async () => {
@@ -385,23 +409,67 @@ test("copies a DATA payload before handing it over, and ends every live stream w
 test("pauses the local sockets above 4 MiB queued and resumes below 1 MiB", async () => {
   const a = await online();
   const s = a.r.open("tcp:example.com:443");
+  // The seam's own pause/resume, which is what actually reaches a SOCKS socket; the callback alone
+  // reaches nothing (`test/browser-socks.test.ts` drives a real one).
+  const sock: string[] = [];
+  s.pause = () => sock.push("pause");
+  s.resume = () => sock.push("resume");
 
   a.f.buffered = PAUSE_ABOVE; // exactly at the threshold is not over it
   s.write(new Uint8Array(1));
   expect(a.paused).toEqual([]);
+  expect(sock).toEqual([]);
 
   a.f.buffered = PAUSE_ABOVE + 1;
   s.write(new Uint8Array(1));
   expect(a.paused).toEqual([true]);
+  expect(sock).toEqual(["pause"]);
 
   a.f.buffered = RESUME_BELOW; // still at the resume threshold, so still paused
   await Bun.sleep(5);
   expect(a.paused).toEqual([true]);
+  expect(sock).toEqual(["pause"]);
 
   a.f.buffered = RESUME_BELOW - 1;
   await until(() => a.paused.length === 2);
   expect(a.paused).toEqual([true, false]);
+  expect(sock).toEqual(["pause", "resume"]);
   expect(a.io.slept).toContain(50);
+});
+
+test("delivers an ACK to the tcp stream it names, and nothing else", async () => {
+  const a = await online();
+  const first = a.r.open("tcp:example.com:443");
+  const second = a.r.open("tcp:example.com:80");
+  const acked: string[] = [];
+  first.onAck = () => acked.push("first");
+  second.onAck = () => acked.push("second");
+
+  a.f.h!.message(encodeFrame(4, ACK));
+  expect(acked).toEqual(["second"]);
+  a.f.h!.message(encodeFrame(2, ACK));
+  expect(acked).toEqual(["second", "first"]);
+});
+
+test("an ACK on anything but a live laptop stream closes it, or is dropped if there is nothing to close", async () => {
+  const a = await online();
+  a.f.h!.message(encodeFrame(1, OPEN, enc("cdp")));
+  const cdp = a.cdps[0]!;
+  let closed = false;
+  cdp.onClose = () => (closed = true);
+
+  // A `cdp` stream has no dial to acknowledge, so an ACK there is the untrusted peer sending a frame
+  // §4 does not have on that stream: the stream goes.
+  a.f.h!.message(encodeFrame(1, ACK));
+  expect(closed).toBe(true);
+  expect(a.f.frames().at(-1)).toMatchObject({ id: 1, op: CLOSE });
+
+  // An ACK for an id with no stream is dropped, like a DATA frame on one (A1), and the socket lives.
+  const before = a.f.sent.length;
+  a.f.h!.message(encodeFrame(8, ACK));
+  a.f.h!.message(encodeFrame(1, ACK)); // the one just closed
+  expect(a.f.sent.length).toBe(before);
+  expect(a.events.filter((e) => e.state === "closed")).toEqual([]);
 });
 
 test("closes a cdp stream whose declared length never completes, past the reassembly ceiling", async () => {
