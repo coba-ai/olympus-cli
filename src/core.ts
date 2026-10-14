@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { clean } from "./format";
 
@@ -74,15 +74,21 @@ export async function readCreds(io: Io): Promise<Creds> {
 //
 // `signal` makes the write itself cancellable, which a caller's check before calling cannot be: mkdir,
 // open, write and close are four awaits a Ctrl-C can land in, and the rename after them is the single
-// step that makes the credential real. So the signal is read once more immediately before that rename,
-// and an abandoned write deletes its own temp file — a cancelled call leaves nothing on disk at all.
-// Enforced by browser-store.test.ts "Ctrl-C landing inside the write" and "an abort while the write is
-// in flight". Omitting the signal (writeCreds) keeps the old behaviour: no check, no cancellation.
+// step that makes the credential real. Checking only before the rename is not enough — the rename is
+// itself an await, and an abort landing inside it installs the credential with nobody left to look
+// (measured). So the signal is read on BOTH sides of the rename, and a write abandoned after it is
+// rolled back to whatever was there before: the prior bytes are re-written, or the path is removed if
+// there were none. A cancelled call therefore leaves the file as it found it.
+// Enforced by browser-store.test.ts "Ctrl-C landing inside the write", "an abort while the write is in
+// flight" and "an abort landing inside the rename restores the previous file".
+// Omitting the signal (writeCreds) keeps the old behaviour: no check, no cancellation.
 // The 130 raised here carries login's wording; a caller with its own (pairBrowser) replaces it.
 export async function writeSecretFile(io: Io, name: string, text: string, signal?: AbortSignal): Promise<void> {
   const path = configPath(io, name);
   const tmp = `${path}.${process.pid}.tmp`;
   let abandoned = false;
+  // Read only when there is a signal to roll back for; writeCreds pays nothing for this.
+  const prior = signal ? await readFile(path, "utf8").catch(() => undefined) : undefined;
   try {
     await mkdir(credsDir(io), { recursive: true, mode: 0o700 });
     const fh = await open(tmp, "wx", 0o600);
@@ -92,7 +98,15 @@ export async function writeSecretFile(io: Io, name: string, text: string, signal
       await fh.close();
     }
     abandoned = signal?.aborted === true;
-    if (!abandoned) await rename(tmp, path);
+    if (!abandoned) {
+      await rename(tmp, path);
+      abandoned = signal?.aborted === true;
+      if (abandoned) {
+        // The credential is on disk and the member asked us to stop. Put back what was there.
+        if (prior === undefined) await unlink(path).catch(() => {});
+        else await writeFile(path, prior, { mode: 0o600 });
+      }
+    }
   } catch (e: any) {
     await unlink(tmp).catch(() => {});
     throw ioError(e, path);

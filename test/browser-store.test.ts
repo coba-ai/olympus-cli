@@ -189,6 +189,38 @@ describe("A2 claim and store", () => {
     expect(await readdir(dirOf()).catch(() => [])).toEqual([]);
   });
 
+  // The rename is itself an await, so checking the signal only before it leaves a window where the
+  // credential lands and nobody looks again. Both cases roll back to what was on disk beforehand.
+  //
+  // `writeSecretFile` reads `.aborted` exactly twice — once before the rename, once after — so a signal
+  // that answers false then true places the abort inside the rename deterministically. Racing a real
+  // AbortController against the write instead is what the first version of this test did, and it passed
+  // alone and failed in the file, because the write finishes before a poller can see the temp file.
+  const abortsDuringRename = () => {
+    let reads = 0;
+    return { get aborted() { return ++reads >= 2; } } as AbortSignal;
+  };
+
+  test("an abort landing inside the rename restores the previous file", async () => {
+    const prior = JSON.stringify({ machines: { old: { machine_id: "bm_1", token: "obm_fake_prior", name: "n" } } }) + "\n";
+    await mkdir(dirOf(), { recursive: true });
+    await writeFile(fileOf(), prior);
+
+    const e = await thrown(writeSecretFile(io, "browser.json", JSON.stringify({ machines: {} }) + "\n", abortsDuringRename()));
+
+    expect([e.exit, e.body.error.code]).toEqual([130, "cancelled"]);
+    expect(await text()).toBe(prior); // not the new contents, and not deleted
+    expect((await readdir(dirOf())).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("an abort inside the rename with no previous file leaves nothing behind", async () => {
+    const e = await thrown(writeSecretFile(io, "browser.json", JSON.stringify({ machines: {} }) + "\n", abortsDuringRename()));
+
+    expect([e.exit, e.body.error.code]).toEqual([130, "cancelled"]);
+    expect(await text()).toBeNull();
+    expect(await readdir(dirOf()).catch(() => [])).toEqual([]);
+  });
+
   test("a malformed browser.json fails before the code is spent, with readCreds' shape and no contents", async () => {
     await mkdir(dirOf(), { recursive: true });
     for (const body of [
