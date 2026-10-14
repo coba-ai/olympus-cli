@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkRelayUrl, pairBrowser, readBrowserMachine } from "../src/browser-store";
-import { CliError, fail, type Io } from "../src/core";
+import { CliError, fail, writeSecretFile, type Io } from "../src/core";
 import { PAIR_CODE, seedBrowserPair, startFake } from "./fake-api";
 
 const fake = startFake();
@@ -155,6 +155,38 @@ describe("A2 claim and store", () => {
     no("https://app.example.test", "https://app.example.test/api/v1/browser/relay");
     no("https://app.example.test", undefined);
     no("https://app.example.test", 7);
+  });
+
+  // Ctrl-C after the response is checked but before the credential is real. `pairBrowser`'s own check
+  // cannot cover this: there is no await between it and the write, so a signal that lands later lands
+  // inside `writeSecretFile`'s mkdir/open/write/close.
+  test("Ctrl-C landing inside the write saves no credential and leaves no temp file, though the code is spent", async () => {
+    const ac = new AbortController();
+    let reads = 0;
+    // The SECOND read of `io.home` is `writeSecretFile`'s — `readAll`'s, at the top of pairBrowser, is
+    // the first — so the abort lands after the pre-write check with no timing race. The claim is
+    // asserted to have really happened below, so an abort that landed any earlier (which would stop
+    // the request instead) cannot pass this test.
+    Object.defineProperty(io, "home", { configurable: true, get: () => (++reads === 2 && ac.abort(), dir) });
+
+    const e = await thrown(pairBrowser(io, fake.url, { code: PAIR_CODE }, ac.signal));
+    expect([e.exit, e.body.error.code]).toEqual([130, "cancelled"]);
+    expect(e.message).toContain("nothing was saved");
+    expect(fake.state.browserPair.claimed).toHaveLength(1); // the code was spent: the write really was reached
+    expect(await text()).toBeNull();
+    expect(await readdir(dirOf()).catch(() => [])).toEqual([]); // no `browser.json.<pid>.tmp` either
+  });
+
+  test("an abort while the write is in flight removes the temp file and writes nothing", async () => {
+    const ac = new AbortController();
+    // The call is parked on its first await (mkdir) by the time this line runs, so the abort really is
+    // mid-write rather than before it.
+    const p = writeSecretFile(io, "browser.json", JSON.stringify({ machines: {} }) + "\n", ac.signal);
+    ac.abort();
+    const e = await thrown(p);
+    expect([e.exit, e.body.error.code]).toEqual([130, "cancelled"]);
+    expect(await text()).toBeNull();
+    expect(await readdir(dirOf()).catch(() => [])).toEqual([]);
   });
 
   test("a malformed browser.json fails before the code is spent, with readCreds' shape and no contents", async () => {

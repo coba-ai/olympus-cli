@@ -220,10 +220,11 @@ test("backs off on a live 1009 or 1006, resetting the delay each time a socket o
   await createRelay(io, host(), machine, { connect: f.connect, onCdpStream: () => {}, onEvent: (e) => events.push(e), jitter: () => 1, signal: ac.signal }).run();
   // The fourth close and the abort land together, so that one is not reported: an aborted run says nothing more.
   expect(io.slept).toEqual([1000, 1000, 1000]);
+  // The peer sent "gone" as the reason on each; the event carries this client's word for the code.
   expect(events.filter((e) => e.state === "closed")).toEqual([
-    { state: "closed", code: 1006, reason: "gone" },
-    { state: "closed", code: 1009, reason: "gone" },
-    { state: "closed", code: 1006, reason: "gone" },
+    { state: "closed", code: 1006, reason: "abnormal" },
+    { state: "closed", code: 1009, reason: "too_big" },
+    { state: "closed", code: 1006, reason: "abnormal" },
   ]);
 });
 
@@ -636,4 +637,95 @@ test("A5: a stream registered while the pause is active is paused too — tcp an
   a.f.buffered = 0;
   await until(() => seen.length === 4);
   expect(seen).toEqual(["tcp pause", "cdp pause", "tcp resume", "cdp resume"]);
+});
+
+// A deferred write used to be keyed on the stream ID alone, so the drain it was waiting for could
+// land after the peer had closed that id and opened it again — and the new conversation was handed
+// the old one's bytes. Reproduced with exactly this script.
+test("A5: a reused stream id inherits none of the previous stream's deferred bytes", async () => {
+  const a = await online();
+  a.f.h!.message(encodeFrame(1, OPEN, enc("cdp")));
+  await until(() => a.cdps.length === 1);
+
+  a.f.buffered = PAUSE_ABOVE + 1; // nothing goes out; the response waits on the drain
+  a.cdps[0]!.send(JSON.stringify({ id: 1, result: "OLD RESPONSE" }));
+  const before = a.f.sent.length;
+  expect(a.paused).toEqual([true]);
+
+  a.f.h!.message(encodeFrame(1, CLOSE)); // that conversation ends
+  a.f.h!.message(encodeFrame(1, OPEN, enc("cdp"))); // and the peer opens a new one on the same id
+  await until(() => a.cdps.length === 2);
+
+  a.f.buffered = 0;
+  await until(() => a.paused.length === 2);
+  expect(a.f.frames().slice(before).filter((f) => f.op === DATA)).toEqual([]);
+});
+
+// A5 bounded the SOCKET's buffer and nothing else: every further write on a paused stream added
+// another retained fragment, with no cap and no release until the connection drained.
+test("A5: a stream's deferred writes are bounded, and closing it drops what it still owed", async () => {
+  const a = await online();
+  const s = a.r.open("tcp:example.com:443");
+  const other = a.r.open("tcp:example.com:80");
+  let closed = false;
+  s.onClose = () => (closed = true);
+
+  a.f.buffered = PAUSE_ABOVE + 1; // nothing goes out for as long as this holds
+  const chunk = new Uint8Array(2 * 1024 * 1024);
+  let writes = 0;
+  for (; writes < 8 && !closed; writes++) s.write(chunk);
+
+  // The cap is 8 MiB per stream, so the fifth 2 MiB write is the one too many.
+  expect([closed, writes]).toEqual([true, 5]);
+  expect(a.f.frames().at(-1)).toMatchObject({ id: 2, op: CLOSE });
+  expect(a.events.at(-1)).toMatchObject({ state: "refused", id: 2, reason: "write_queue_full" });
+
+  // A close from our own side drops the queue the same way, well under the cap.
+  other.write(new Uint8Array(MAX_PAYLOAD * 2));
+  other.close();
+
+  a.f.buffered = 0;
+  await until(() => a.paused.length === 2);
+  expect(a.f.frames().filter((f) => f.op === DATA)).toEqual([]); // neither queue ever reached the socket
+});
+
+// ---------------------------------------------------------------- §3: the peer's text is never echoed
+
+// Reproduced before these tests existed: `OPEN("obm_…")` produced a `refused` event carrying that
+// string, and a live close carried the peer's reason the same way — both reach a `--json` line and
+// the member's terminal. The workbench picks both strings, so either is a path for a secret it was
+// handed to come back out of this CLI.
+test("no workbench-chosen text reaches an event or a --json line: not an OPEN target, not a close reason", async () => {
+  const a = await online();
+  const secret = machine.token; // the member's own pairing token, which must never be printed
+
+  a.f.h!.message(encodeFrame(3, OPEN, enc(secret)));
+  a.f.h!.message(encodeFrame(5, OPEN, enc(`tcp:${secret}:443`)));
+  a.f.h!.message(encodeFrame(7, OPEN, enc("cdp")));
+  await until(() => a.cdps.length === 1);
+  a.f.h!.message(encodeFrame(7, DATA, new Uint8Array([...prefix(CEILING + 1), 1]))); // breaks §4's inner framing
+  a.f.h!.close(1006, secret);
+  await until(() => a.events.some((e) => e.state === "closed"));
+
+  // A `--json` line is one event, serialized: what the member sees is exactly this string.
+  const json = a.events.map((e) => JSON.stringify(e)).join("\n");
+  expect(json).not.toContain(secret);
+  expect(json).not.toContain("obm_");
+  expect(a.events.filter((e) => e.state === "refused")).toEqual([
+    { state: "refused", id: 3, target: "other", reason: "not_a_cdp_target" },
+    { state: "refused", id: 5, target: "other", reason: "not_a_cdp_target" },
+    { state: "refused", id: 7, target: "cdp", reason: "cdp_framing" },
+  ]);
+  expect(a.events.filter((e) => e.state === "closed")).toEqual([{ state: "closed", code: 1006, reason: "abnormal" }]);
+});
+
+test("nor to the error a give-up throws, whose every word this CLI chose", async () => {
+  const io = testIo(); // the clock never advances, so each connection is a flap and the cap is reached
+  const events: RelayEvent[] = [];
+  const f = fakeSocket((_, h) => (h.open(), h.close(1002, machine.token)));
+  const e = await thrown(
+    createRelay(io, host(), machine, { connect: f.connect, onCdpStream: () => {}, onEvent: (x) => events.push(x), jitter: () => 1 }).run(),
+  );
+  expect(`${e} ${e.message ?? ""} ${JSON.stringify(e.body)} ${JSON.stringify(events)}`).not.toContain("obm_");
+  expect(events.filter((x) => x.state === "closed").length).toBe(10);
 });

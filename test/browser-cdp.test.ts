@@ -175,6 +175,23 @@ describe("A6 CDP allowlist: every refusal", () => {
       );
   });
 
+  // The parameter three boolean checks cannot see. Target.setAutoAttach's full list in
+  // `browser_protocol.json` (1.3) is autoAttach, waitForDebuggerOnStart, flatten and `filter`, and
+  // TargetFilter's own text says the first matching entry decides inclusion while an entry with no
+  // `type` "matches any type" - so `filter: [{exclude: true}]` leaves all three booleans true and
+  // auto-attaches nothing at all. Hence the inversion: anything but the three is refused.
+  test("refuses every setAutoAttach parameter but the three it enforces, filter included", () => {
+    const enforced = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
+    for (const filter of [[{ exclude: true }], [{ type: "page", exclude: true }], [{}], []])
+      refuse({ id: 62, method: "Target.setAutoAttach", params: { ...enforced, filter } }, "with filter is refused");
+
+    for (const name of ["windowOpen", "targetId", "__proto__", ""])
+      refuse(
+        { id: 63, method: "Target.setAutoAttach", params: { ...enforced, [name]: true } },
+        `with ${name} is refused: only autoAttach, waitForDebuggerOnStart and flatten are allowed`,
+      );
+  });
+
   test("a command whose id is in the range the filter reserves for its own commands", () => {
     for (const id of [SETUP_ID, SETUP_ID + 1, Number.MAX_SAFE_INTEGER])
       refuse({ id, method: "Page.reload", sessionId: S }, "is reserved for this filter's own commands");
@@ -434,7 +451,7 @@ describe("A8 browser-wide protection, installed before anything is forwarded", (
   // does not reach a context the workbench creates later. UNVERIFIED against a running Chromium
   // (nothing in this repo launches one), which is why the context gets its own command rather than
   // a comment reasoning that it inherits one.
-  test("denies downloads in a context the workbench creates, before the workbench learns its id", () => {
+  test("holds the new context's id until downloads are denied in it, then releases the response", () => {
     const h = harness().attach();
     h.send({ id: 70, method: "Target.createBrowserContext", params: { disposeOnDetach: true } });
     expect(h.toBrowser.length).toBe(1); // forwarded
@@ -443,14 +460,27 @@ describe("A8 browser-wide protection, installed before anything is forwarded", (
     const response = JSON.stringify({ id: 70, result: { browserContextId: "C1" } });
     h.f.fromBrowser(response);
     expect(h.issued()).toEqual([["Browser.setDownloadBehavior", undefined, { behavior: "deny", browserContextId: "C1" }]]);
-    expect(h.toWorkbench).toEqual([response]); // and the workbench still gets its answer
+    // Sending the denial is not enough on its own: forwarding the response here would let the
+    // workbench open a target in C1 while the denial is still in flight. So the id is held.
+    expect(h.toWorkbench).toEqual([]);
+
+    h.f.fromBrowser(JSON.stringify({ id: h.ids().at(-1), result: {} }));
+    expect(h.toWorkbench).toEqual([response]); // released byte-for-byte, now that C1 is covered
   });
 
-  test("fails closed when that context denial is refused", () => {
+  test("disposes the context and fails the command when that denial is refused, then fails closed", () => {
     const h = harness().attach();
     h.send({ id: 71, method: "Target.createBrowserContext", params: {} });
     h.f.fromBrowser(JSON.stringify({ id: 71, result: { browserContextId: "C1" } }));
-    h.f.fromBrowser(JSON.stringify({ id: h.ids().at(-1), error: { code: -32000, message: "no such context" } }));
+    const denial = h.ids().at(-1);
+    h.toBrowser.length = 0;
+    h.f.fromBrowser(JSON.stringify({ id: denial, error: { code: -32000, message: "no such context" } }));
+
+    // The workbench is answered on its own id, with an error and never the result that names C1.
+    expect(h.toWorkbench.length).toBe(1);
+    expect([h.last().id, h.last().error.code, h.last().result]).toEqual([71, REFUSED, undefined]);
+    expect(h.last().error.message).toContain("no such context");
+    expect(h.issued()).toEqual([["Target.disposeBrowserContext", undefined, { browserContextId: "C1" }]]);
     h.toBrowser.length = 0;
 
     h.send({ id: 72, method: "Page.navigate", sessionId: S, params: { url: "https://example.test/" } });
@@ -489,10 +519,14 @@ describe("A8 paused attachment: a page runs only after its setup succeeded", () 
     h.f.fromBrowser(JSON.stringify({ id: ids[0], result: {}, sessionId: S }));
     h.f.fromBrowser(JSON.stringify({ id: ids[1], error: { code: -32000, message: "chooser interception unavailable" }, sessionId: S }));
     h.f.fromBrowser(JSON.stringify({ id: ids[2], result: {}, sessionId: S }));
+
+    // "never resumed" is asserted BEFORE the log is cleared: clearing first would hide a resume the
+    // third answer had already triggered, which is the one thing this test is named for.
+    expect(h.issued().map(([m]) => m)).toEqual(["Page.enable", "Page.setDownloadBehavior", "Page.setInterceptFileChooserDialog"]);
     h.toBrowser.length = 0;
 
     h.send({ id: 1, method: "Page.reload", sessionId: S });
-    expect(h.toBrowser).toEqual([]); // nothing forwarded, and no Runtime.runIfWaitingForDebugger either
+    expect(h.toBrowser).toEqual([]); // and nothing of the workbench's is forwarded either
     expect(h.last().error.message).toContain("chooser interception unavailable");
   });
 

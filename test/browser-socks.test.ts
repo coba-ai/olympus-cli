@@ -42,6 +42,12 @@ function spy() {
 
 type Client = {
   send: (bytes: number[] | Uint8Array) => void;
+  /**
+   * `send` with the socket's own answer: the number of bytes it took. Bun buffers nothing on a short
+   * write, so fewer bytes than offered means the kernel's buffers filled because the far end stopped
+   * reading this socket — the one effect of the proxy's `sock.pause()` visible from this end.
+   */
+  write: (bytes: Uint8Array) => number;
   read: (n: number) => Promise<Uint8Array>;
   /** Stops taking bytes off the socket, which is how a slow browser is driven here. */
   pause: () => void;
@@ -51,6 +57,22 @@ type Client = {
 const until = async (p: () => boolean) => {
   for (let i = 0; i < 500 && !p(); i++) await Bun.sleep(1);
   expect(p()).toBe(true);
+};
+
+/**
+ * Writes `chunk` over and over until one write is SHORT (`"short"` — the far end has stopped reading
+ * and the buffers behind it are full) or until one goes out WHOLE again (`"whole"`). It yields between
+ * writes, which is what makes the two distinguishable: a proxy that is still reading drains the socket
+ * in those gaps and every write stays whole however many are offered. A short write drops its
+ * remainder, which no caller here cares about — nothing parses these bytes.
+ */
+const writeUntil = async (c: Client, chunk: Uint8Array, want: "short" | "whole", tries = 256) => {
+  for (let i = 0; i < tries; i++) {
+    const n = c.write(chunk);
+    if (want === "short" ? n < chunk.length : n === chunk.length) return true;
+    await Bun.sleep(1);
+  }
+  return false;
 };
 
 const started: SocksProxy[] = [];
@@ -91,6 +113,7 @@ async function connect(port: number): Promise<Client> {
   });
   const client: Client = {
     send: (bytes) => void sock.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)),
+    write: (bytes) => sock.write(bytes),
     read: (n) => new Promise<Uint8Array>((resolve) => ((want = { n, resolve }), pump())),
     pause: () => sock.pause(),
     end: () => sock.end(),
@@ -421,6 +444,14 @@ describe("A9 --allow-origin parsing", () => {
 // fired and this server went on reading. Driven with the REAL relay client over a fake WebSocket
 // whose `bufferedAmount` the test sets, against a real loopback socket — a callback that fires
 // without reaching `sock.pause()` cannot pass this.
+//
+// What it asserts is the SOCKET, not the relay's frame count. Counting frames was this test until the
+// relay began deferring writes while its queue is over the threshold: a flat count then says only that
+// the relay held the bytes, which it does whether or not the pause ever reached the socket, so the
+// test passed with `sock.pause()` removed. A client can observe a paused socket exactly one way — its
+// own writes stop being taken once the buffers behind a reader that went away fill up — and that is
+// what `writeUntil` reads here. It survives any further change to how the relay queues, which is not
+// this test's subject.
 test("a backed-up relay pauses the real browser socket, and the bytes flow again once it drains", async () => {
   const PAUSE_ABOVE = 4 * 1024 * 1024; // the relay's own threshold, duplicated so a change is deliberate
   let buffered = 0;
@@ -464,20 +495,26 @@ test("a backed-up relay pauses the real browser socket, and the bytes flow again
     peer.message(encodeFrame(2, ACK));
     expect(await c.read(10)).toEqual(REPLY(0x00));
 
-    const kib = new Uint8Array(1024).fill(7);
+    const chunk = new Uint8Array(256 * 1024).fill(7);
     buffered = PAUSE_ABOVE + 1;
-    c.send(kib); // the write the relay notices its queue on, and pauses this socket for
+    c.send(chunk); // the write the relay notices its queue on, and pauses this socket for
     await Bun.sleep(50);
-    // Whether that write goes out before the pause or waits with the queue is the relay's business, so
-    // this reads the count rather than naming it: measured 2 when the relay sent it, 1 once it held it.
+    // How much of that write the proxy read before the pause landed, and whether the relay sent it or
+    // held it, are both the relay's business — so this records the count rather than naming it, and
+    // only ever compares it with itself below.
     const stalled = sent.length;
 
-    for (let i = 0; i < 64; i++) c.send(kib);
-    await Bun.sleep(50);
-    expect(sent.length).toBe(stalled); // 64 KiB into a paused socket reached the relay as nothing
+    // The proxy has stopped reading this socket, so the bytes pile up in the kernel until it refuses
+    // them. Measured by deleting `sock.pause()` from the proxy and running this: short after 2.5 MiB
+    // offered with it, never short in the whole 64 MiB without it — while the frame count this test
+    // used to assert on stayed flat either way.
+    expect(await writeUntil(c, chunk, "short")).toBe(true);
 
     buffered = 0;
+    // Resumed: the backlog the kernel was holding reaches the relay, and the socket takes writes whole
+    // again. Both halves, because a socket that never resumed would pass the first on its own.
     await until(() => sent.length > stalled);
+    expect(await writeUntil(c, chunk, "whole")).toBe(true);
   } finally {
     ac.abort();
     await run;

@@ -123,6 +123,15 @@ export async function pairBrowser(
   // pairing the member cancelled must leave no credential on disk. The code itself is spent either way
   // — nothing on this side can unspend it.
   if (signal?.aborted) throw cancelled();
-  await writeSecretFile(io, FILE, JSON.stringify({ machines: { ...existing, [host]: machine } }) + "\n");
+  try {
+    // The signal goes in as well, because this check cannot cover the write: `writeSecretFile` awaits
+    // mkdir, open, write and close before its rename, and reads the signal again just before it.
+    await writeSecretFile(io, FILE, JSON.stringify({ machines: { ...existing, [host]: machine } }) + "\n", signal);
+  } catch (e) {
+    // Only the cancellation is rewritten — it arrives carrying login's message — and an IO failure
+    // that happens to coincide with a Ctrl-C still reports itself.
+    if (e instanceof CliError && e.exit === 130) throw cancelled();
+    throw e;
+  }
   return { machine, relayUrl };
 }

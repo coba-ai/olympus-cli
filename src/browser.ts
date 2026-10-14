@@ -37,7 +37,10 @@ export type AttachSeams = {
 
 const chromeFailed = (message: string) => new CliError(5, { error: { code: "chrome_failed", message } });
 
-/** CDP commands one workbench stream may buffer while Chromium starts; past it the stream is closed. */
+/**
+ * CDP messages one stream's FILTER may buffer while Chromium starts — its own setup commands, not the
+ * workbench's, which the filter refuses until that setup succeeds. Past it the stream is closed.
+ */
 const QUEUE_MAX = 256;
 
 /**
@@ -205,8 +208,12 @@ async function hold(io: Io, line: Line, say: Say, o: Attach, signal: AbortSignal
       },
       (m) => cdp.send(m),
     );
-    // Set on the tick the stream is handed over, as `CdpChannel` requires: a command that arrives
-    // before Chromium is up waits in `queued` rather than being lost.
+    // Set on the tick the stream is handed over, as `CdpChannel` requires. A command arriving before
+    // Chromium is up does NOT wait in `queued`: the filter answers it with a -32000 error back to the
+    // workbench until the setup it emits on construction has succeeded, and with no browser socket yet
+    // that setup is itself what `queued` is holding, so nothing can have answered it. Measured by
+    // driving `cdpFilter` with no browser attached — browser-cdp.ts's gate is what does this, and
+    // nothing in this file would stop a future filter from queueing instead.
     cdp.onMessage = filter.fromWorkbench;
     cdp.onClose = drop;
     void (async () => {

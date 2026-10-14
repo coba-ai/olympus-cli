@@ -60,6 +60,17 @@ const PAUSE_ABOVE = 4 * 1024 * 1024;
 const RESUME_BELOW = 1024 * 1024;
 const DRAIN_POLL_MS = 50;
 
+// A5 bounds what the SOCKET holds; this bounds what is waiting for it. Without it every further
+// write on a paused stream queued another fragment — and with it the buffer it is a view of — with
+// no cap at all. 8 MiB per stream is a choice, not a measurement: two of PAUSE_ABOVE, so one large
+// CDP response can sit behind another that is still going out, and well under what the per-stream
+// reassembly ceiling already allows in the other direction. At it the stream is KILLED: CLOSE to
+// the peer, `onClose` to the consumer, and a `write_queue_full` event. The alternative — dropping
+// fragments and carrying on — would corrupt the length-prefixed message stream the next bytes
+// belong to, which is a worse failure than a stream that ends.
+const MAX_DEFERRED = 8 * 1024 * 1024;
+const EMPTY_PART = new Uint8Array(0);
+
 // The length prefix inside a `cdp` stream is attacker-controlled (§3: the workbench side is the
 // untrusted one), so every `cdp` stream's reader is given this as its `max`: a prefix declaring more
 // is refused before its body is buffered, and the reader's tail is therefore always under it. The
@@ -120,13 +131,43 @@ export type CdpChannel = {
   resume?: () => void;
 };
 
-/** One line of `--json` per state change (Assumption 11), rendered by the command. Never carries the token. */
+/** What a stream is for, in this file's words — never the peer's bytes. `other` is anything else. */
+export type StreamKind = "cdp" | "tcp" | "other";
+/** Why an OPEN or a write was refused, in this file's words. A closed set, and the whole set. */
+export type RefusedReason =
+  | "even_stream_id"
+  | "stream_id_in_use"
+  | "not_a_cdp_target"
+  | "too_many_cdp_streams"
+  | "cdp_reassembly_total"
+  | "cdp_framing"
+  | "write_queue_full";
+/** How a live socket closed, in this file's words: `CLOSE_KIND` keyed on the code, never the peer's reason string. */
+export type CloseKind = "normal" | "going_away" | "protocol" | "unsupported" | "no_status" | "abnormal" | "policy" | "too_big" | "server_error" | "other";
+
+/**
+ * One line of `--json` per state change (Assumption 11), rendered by the command.
+ *
+ * NOTHING THE PEER SENT IS ECHOED HERE, and that is the point of the three unions above. The
+ * workbench is the untrusted side (§3) and it chooses both the OPEN target and the close reason, so
+ * quoting either is a path from a frame it composed to the member's terminal and to a `--json`
+ * line — a token handed to a workbench that then put it in an OPEN target came back out that way
+ * before this round. The peer's target bytes are compared with `cdp` and then dropped; its close
+ * reason is dropped for the code's own word; a thrown error's message never reaches an event.
+ * `target` on a `stream` event is either that same `cdp` literal or the dial string this CLI's own
+ * SOCKS proxy built — never bytes off the wire.
+ *
+ * What enforces it: the literal unions above (a quoted string does not type-check as one), and
+ * `test/browser-relay.test.ts` "no workbench-chosen text reaches an event or a --json line …",
+ * which drives the member's token through an OPEN target and a close reason and looks for it in
+ * every event, every serialized `--json` line and the thrown error.
+ */
 export type RelayEvent =
   | { state: "connecting"; attempt: number }
   | { state: "online" }
   | { state: "stream"; id: number; target: string }
-  | { state: "refused"; id: number; target: string; reason: string }
-  | { state: "closed"; code: number; reason: string }
+  | { state: "refused"; id: number; target: StreamKind; reason: RefusedReason }
+  | { state: "closed"; code: number; reason: CloseKind }
   | { state: "stalled"; attempts: number; message: string }
   | { state: "backoff"; ms: number; attempts: number };
 
@@ -165,6 +206,23 @@ const connectWebSocket: RelayConnect = (url, headers, h) => {
   return ws;
 };
 
+// The close codes §1.5 and RFC 6455 define, in this file's words. The socket also carries a reason
+// STRING, and it is deliberately dropped rather than reported (RelayEvent): the peer writes it. A
+// code with no entry here is `other` — the number is still in the event, and it is the number the
+// policy below keys on anyway.
+const CLOSE_KIND: Record<number, CloseKind> = {
+  1000: "normal",
+  1001: "going_away",
+  1002: "protocol",
+  1003: "unsupported",
+  1005: "no_status",
+  1006: "abnormal",
+  1008: "policy",
+  1009: "too_big",
+  1011: "server_error",
+};
+const closeKind = (code: number): CloseKind => CLOSE_KIND[code] ?? "other";
+
 // §1.5's close codes that stop, on a socket that opened. Everything else backs off, including 1009
 // and the 1006 of a dropped pipe (a deploy, a heartbeat failure, a revoked token mid-pipe).
 const STOP: Record<number, { exit: 2 | 5 | 6; code: string; message: string }> = {
@@ -188,15 +246,28 @@ const STOP: Record<number, { exit: 2 | 5 | 6; code: string; message: string }> =
   },
 };
 
+/** A5: one stream's deferred fragments, in order. Consumed by the `at` index, never shifted; `bytes` is what is still owed. */
+type Queue = { parts: Uint8Array[]; at: number; bytes: number; pumping: boolean };
 type Entry = {
+  /** What this stream is for, for an event. Derived here, never from the peer's bytes beyond `=== "cdp"`. */
+  kind: StreamKind;
   data: (bytes: Uint8Array) => void;
   gone: () => void;
   /** Only a laptop-opened `tcp:` stream has this: a dial to acknowledge. */
   ack?: () => void;
   pause?: () => void;
   resume?: () => void;
-  /** A5: the fragments of this stream's writes still waiting on a drain, in order. */
-  tail?: Promise<void>;
+  /** A5: the fragments of this stream's writes still waiting on a drain. Dropped the moment the stream is. */
+  queue?: Queue;
+  /** Resolves when this stream is dropped, so a deferred write stops waiting on the connection's drain with it. */
+  ended: Promise<void>;
+  end: () => void;
+};
+/** An `Entry` with its `ended`/`end` pair wired; every stream is built through here. */
+const newEntry = (e: Omit<Entry, "ended" | "end">): Entry => {
+  let end!: () => void;
+  const ended = new Promise<void>((resolve) => (end = resolve));
+  return { ...e, ended, end };
 };
 type Conn = {
   handle: RelayHandle;
@@ -229,51 +300,78 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
   const frame = (c: Conn, id: number, op: Op, payload?: Uint8Array) => sendRaw(c, encodeFrame(id, op, payload));
 
   // A5: one write's DATA frames, in order. Synchronous while the socket's buffer is under the
-  // threshold; the first fragment that finds it OVER stops there and the rest of the write waits on
-  // the drain, so a large CDP response no longer pours every remaining fragment into a full buffer.
-  // Later writes on the same stream chain behind that tail, which is what keeps them in order.
-  // A `close` does NOT chain: it deletes the id, so whatever fragments were still deferred are
-  // dropped and the CLOSE goes out at once.
+  // threshold; the first fragment that finds it OVER stops there and the rest of the write is
+  // queued on the stream, so a large CDP response no longer pours every remaining fragment into a
+  // full buffer. Later writes go behind what the stream already owes, which keeps them in order.
+  //
+  // A CLOSE — ours or the peer's — DROPS what the stream still owes rather than flushing it:
+  // `drop` empties the queue on the spot and the CLOSE goes out at once. Chosen deliberately this
+  // round, over flushing first, because flushing hands a peer that is not draining a way to keep
+  // this process holding its bytes for as long as it likes — which is the bound MAX_DEFERRED
+  // exists for — and the far end of a closed stream has nobody left to read what arrives. The cost
+  // is real: a consumer that writes and then closes at once loses the tail of that write whenever
+  // the socket is over A5's threshold. Pinned by `test/browser-relay.test.ts` "A5: a stream's
+  // deferred writes are bounded, and closing it drops what it still owed" for a close from this
+  // side, and "A5: a reused stream id inherits none of the previous stream's deferred bytes" for
+  // the peer's CLOSE — one `drop` serves both.
   const stream = (c: Conn, id: number, bytes: Uint8Array) => {
     const e = c.streams.get(id);
     if (!e) return;
     const parts = chunkPayload(bytes);
-    if (e.tail) return chain(c, e, id, parts, 0);
-    const next = burst(c, id, parts, 0);
+    if (!parts.length) return;
+    if (e.queue) return enqueue(c, id, e, parts, 0);
+    const next = burst(c, id, e, parts, 0);
     if (next >= parts.length) return;
     pressure(c); // published here, not on the next tick, so crossing the threshold always says so
-    chain(c, e, id, parts, next);
+    enqueue(c, id, e, parts, next);
   };
-  /** Queues `parts` behind what this stream still owes, and clears the tail once it owes nothing — a stream that hit the threshold once is synchronous again afterwards. */
-  const chain = (c: Conn, e: Entry, id: number, parts: Uint8Array[], from: number) => {
-    const tail = (e.tail ?? Promise.resolve()).then(() => deferred(c, id, parts, from));
-    e.tail = tail;
-    const settle = () => {
-      if (e.tail === tail) e.tail = undefined;
-    };
-    void tail.then(settle, settle);
-  };
+  /** Queues what the socket would not take, and starts the pump unless one is already running for this stream. */
+  function enqueue(c: Conn, id: number, e: Entry, parts: Uint8Array[], from: number) {
+    const q = (e.queue ??= { parts: [], at: 0, bytes: 0, pumping: false });
+    for (let i = from; i < parts.length; i++) {
+      q.parts.push(parts[i]!);
+      q.bytes += parts[i]!.length;
+    }
+    if (q.bytes > MAX_DEFERRED) {
+      kill(c, id); // which clears the queue; nothing of it goes out
+      return emit({ state: "refused", id, target: e.kind, reason: "write_queue_full" });
+    }
+    if (q.pumping) return;
+    q.pumping = true;
+    void pump(c, id, e, q);
+  }
   /** Sends parts from `from` until the buffer goes over the threshold or the stream goes; returns where it stopped. */
-  function burst(c: Conn, id: number, parts: Uint8Array[], from: number): number {
+  function burst(c: Conn, id: number, e: Entry, parts: Uint8Array[], from: number): number {
     let i = from;
     for (; i < parts.length; i++) {
-      if (c.closed || !c.streams.has(id)) return parts.length;
+      // The ENTRY, not the id: an id the peer closed and reopened is a different stream, and the
+      // bytes this write belongs to are not its to receive.
+      if (c.closed || c.streams.get(id) !== e) return parts.length;
       if (c.handle.bufferedAmount > PAUSE_ABOVE) break;
       frame(c, id, DATA, parts[i]!);
     }
     return i;
   }
-  async function deferred(c: Conn, id: number, parts: Uint8Array[], from: number): Promise<void> {
-    let i = from;
-    while (i < parts.length) {
-      if (c.closed || !c.streams.has(id)) return;
-      i = burst(c, id, parts, i);
-      if (i >= parts.length) return;
+  /** Drains one stream's queue into the socket, waiting on the connection's drain between bursts. */
+  async function pump(c: Conn, id: number, e: Entry, q: Queue): Promise<void> {
+    while (q.at < q.parts.length) {
+      if (c.closed || c.streams.get(id) !== e) return; // the entry, as in `burst`
+      while (q.at < q.parts.length && c.handle.bufferedAmount <= PAUSE_ABOVE) {
+        const part = q.parts[q.at]!;
+        q.parts[q.at++] = EMPTY_PART; // released as it goes out, so the queue holds only what it still owes
+        q.bytes -= part.length;
+        frame(c, id, DATA, part);
+        if (c.closed || c.streams.get(id) !== e) return;
+      }
+      if (q.at >= q.parts.length) break;
       pressure(c);
       // `c.drained` is null between the poll finishing and the pause being lifted, and null when the
-      // buffer is over the threshold with no pause published (a closed connection). Poll, not spin.
-      await (c.drained ?? sleep(DRAIN_POLL_MS));
+      // buffer is over the threshold with no pause published (a closed connection). Poll, not spin —
+      // and `e.ended` ends the wait the moment the stream is dropped, rather than one poll later.
+      await Promise.race([c.drained ?? sleep(DRAIN_POLL_MS), e.ended]);
     }
+    q.pumping = false;
+    if (e.queue === q) e.queue = undefined; // owes nothing: synchronous again until the next crossing
   }
 
   function pressure(c: Conn) {
@@ -302,15 +400,28 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
     });
   };
 
+  /**
+   * Takes a stream off the connection: its deferred fragments go on this tick, and anything waiting
+   * on a drain for it stops waiting. `only` makes it a no-op unless that exact entry still holds
+   * the id — a `Stream` or `CdpChannel` handed out earlier must not close the stream that reused
+   * its number. Returns the entry, or undefined if the id was already free.
+   */
+  const drop = (c: Conn, id: number, only?: Entry): Entry | undefined => {
+    const e = c.streams.get(id);
+    if (!e || (only && e !== only)) return undefined;
+    c.streams.delete(id);
+    e.queue = undefined;
+    e.end();
+    return e;
+  };
   /** Ends a stream from our side: CLOSE to the peer, and the consumer is told, because it did not ask for this. */
   const kill = (c: Conn, id: number) => {
-    const e = c.streams.get(id);
+    const e = drop(c, id);
     if (!e) return;
-    c.streams.delete(id);
     frame(c, id, CLOSE);
     e.gone();
   };
-  const refuse = (c: Conn, id: number, target: string, reason: string) => {
+  const refuse = (c: Conn, id: number, target: StreamKind, reason: RefusedReason) => {
     frame(c, id, CLOSE);
     emit({ state: "refused", id, target, reason });
   };
@@ -318,16 +429,18 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
   // A5/§5.6: the only thing the workbench may open is a `cdp` stream, on an odd id, that is not
   // already live. Everything else is answered with CLOSE and never reaches Chromium.
   function opened(c: Conn, id: number, payload: Uint8Array) {
+    // The peer's bytes, compared and then dropped: `kind` is one of two words chosen here, and the
+    // decoded string reaches no event, no log line and no error (see RelayEvent).
     const target = DEC.decode(payload);
-    if (!isWorkbenchStream(id)) return refuse(c, id, target, "an even stream id is the laptop's to open");
+    const kind: StreamKind = target === "cdp" ? "cdp" : "other";
+    if (!isWorkbenchStream(id)) return refuse(c, id, kind, "even_stream_id");
     if (c.streams.has(id)) {
       // The peer's view of this id and ours have diverged, so the live stream goes too; `kill` sends the CLOSE.
       kill(c, id);
-      return emit({ state: "refused", id, target, reason: "that stream id is already open" });
+      return emit({ state: "refused", id, target: kind, reason: "stream_id_in_use" });
     }
-    if (target !== "cdp") return refuse(c, id, target, "the workbench may open `cdp` streams only");
-    if (c.cdps.size >= MAX_CDP_STREAMS)
-      return refuse(c, id, target, `${MAX_CDP_STREAMS} cdp streams are already open`);
+    if (target !== "cdp") return refuse(c, id, kind, "not_a_cdp_target");
+    if (c.cdps.size >= MAX_CDP_STREAMS) return refuse(c, id, "cdp", "too_many_cdp_streams");
 
     // The per-stream ceiling is the reader's own `max`, so it refuses an oversize declaration before
     // buffering the body and its tail stays under the number without anything here counting bytes.
@@ -337,33 +450,39 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
       c.cdps.delete(reader);
       reader.close();
     };
+    // Both halves key on `entry`, not on `id`: the peer may close this stream and open another on
+    // the same number, and a channel handed out for the first one has no business writing to or
+    // closing the second (`test/browser-relay.test.ts` "A5: a reused stream id inherits none …").
     const cdp: CdpChannel = {
       send: (message) => {
-        if (c.streams.has(id)) stream(c, id, encodeCdp(message));
+        if (c.streams.get(id) === entry) stream(c, id, encodeCdp(message));
       },
       close: () => {
-        if (!c.streams.delete(id)) return;
+        if (!drop(c, id, entry)) return;
         release();
         frame(c, id, CLOSE);
       },
     };
-    const entry: Entry = {
+    const entry: Entry = newEntry({
+      kind: "cdp",
       data(bytes) {
         // Wire bytes only, summed over every live reader, and checked before this frame is buffered.
         let total = bytes.length;
         for (const r of c.cdps) total += r.held;
         if (total > CDP_REASSEMBLY_TOTAL) {
           kill(c, id);
-          return emit({ state: "refused", id, target, reason: `cdp reassembly over ${CDP_REASSEMBLY_TOTAL} bytes across all streams` });
+          return emit({ state: "refused", id, target: "cdp", reason: "cdp_reassembly_total" });
         }
         let messages: string[];
         try {
           messages = reader.push(bytes);
-        } catch (e) {
+        } catch {
           // A declared length over the ceiling, or bytes that are not UTF-8: either way the peer is
           // not speaking §4's inner framing, so the stream goes rather than the frame being dropped.
+          // The thrown message is built from our own numbers, but it is dropped all the same — the
+          // event says which rule was broken and nothing about what arrived.
           kill(c, id);
-          return emit({ state: "refused", id, target, reason: (e as Error).message });
+          return emit({ state: "refused", id, target: "cdp", reason: "cdp_framing" });
         }
         for (const m of messages) cdp.onMessage?.(m);
       },
@@ -373,9 +492,9 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
       },
       pause: () => cdp.pause?.(),
       resume: () => cdp.resume?.(),
-    };
+    });
     c.streams.set(id, entry);
-    emit({ state: "stream", id, target });
+    emit({ state: "stream", id, target: "cdp" }); // the literal we compared to, not the bytes we compared
     o.onCdpStream(cdp);
     joinPause(c, entry);
   }
@@ -391,7 +510,7 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
     const e = c.streams.get(f.id);
     if (!e) return; // A1: a fragment on a closed stream is dropped, not buffered
     if (f.op === CLOSE) {
-      c.streams.delete(f.id);
+      drop(c, f.id);
       return e.gone();
     }
     if (f.op === ACK) {
@@ -410,7 +529,11 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
     c.closed = true;
     const entries = [...c.streams.values()];
     c.streams.clear();
-    for (const e of entries) e.gone();
+    for (const e of entries) {
+      e.queue = undefined; // the socket is gone; what it owed goes with it
+      e.end();
+      e.gone();
+    }
     if (!c.paused) return;
     c.paused = false;
     o.onBackpressure?.(false);
@@ -427,23 +550,28 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
     }
     const id = c.nextEven;
     c.nextEven += 2;
+    // Keyed on `entry` like the cdp channel's two halves, for the same reason — though an even id
+    // is never reused on one connection (`nextEven` only climbs), so here it is uniformity, not a
+    // bug being fixed.
     const s: Stream = {
       write: (bytes) => {
-        if (c.streams.has(id)) stream(c, id, bytes);
+        if (c.streams.get(id) === entry) stream(c, id, bytes);
       },
       close: () => {
-        if (c.streams.delete(id)) frame(c, id, CLOSE);
+        if (drop(c, id, entry)) frame(c, id, CLOSE);
       },
     };
-    const entry: Entry = {
+    const entry: Entry = newEntry({
+      kind: target.startsWith("tcp:") ? "tcp" : "other",
       data: (bytes) => s.onData?.(bytes),
       gone: () => s.onClose?.(),
       ack: () => s.onAck?.(),
       pause: () => s.pause?.(),
       resume: () => s.resume?.(),
-    };
+    });
     c.streams.set(id, entry);
     frame(c, id, OPEN, ENC.encode(target));
+    // `target` here is the dial string the SOCKS proxy built for us, not anything the peer sent.
     emit({ state: "stream", id, target });
     joinPause(c, entry);
     return s;
@@ -500,7 +628,8 @@ export function createRelay(io: Io, host: string, machine: BrowserMachine, o: Re
       if (end.opened) {
         const stop = STOP[end.code];
         if (stop) throw new CliError(stop.exit, { error: { code: stop.code, message: stop.message } });
-        emit({ state: "closed", code: end.code, reason: end.reason });
+        // The code, and this file's word for it. `end.reason` is the peer's string and stops here.
+        emit({ state: "closed", code: end.code, reason: closeKind(end.code) });
       }
       // A connection that opened AND LASTED resets both the count and the delay (Assumption 14). One
       // that dropped inside FLAP_UNDER_MS counts as a failed attempt instead: resetting on any open at

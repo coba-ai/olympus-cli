@@ -71,9 +71,18 @@ export async function readCreds(io: Io): Promise<Creds> {
 // A 0600 file in the 0700 credentials directory, written to a temp file and renamed into place, so a
 // reader never sees a half-written file and never a mode wider than 0600. Shared by writeCreds and the
 // browser machine token file (src/browser-store.ts).
-export async function writeSecretFile(io: Io, name: string, text: string): Promise<void> {
+//
+// `signal` makes the write itself cancellable, which a caller's check before calling cannot be: mkdir,
+// open, write and close are four awaits a Ctrl-C can land in, and the rename after them is the single
+// step that makes the credential real. So the signal is read once more immediately before that rename,
+// and an abandoned write deletes its own temp file — a cancelled call leaves nothing on disk at all.
+// Enforced by browser-store.test.ts "Ctrl-C landing inside the write" and "an abort while the write is
+// in flight". Omitting the signal (writeCreds) keeps the old behaviour: no check, no cancellation.
+// The 130 raised here carries login's wording; a caller with its own (pairBrowser) replaces it.
+export async function writeSecretFile(io: Io, name: string, text: string, signal?: AbortSignal): Promise<void> {
   const path = configPath(io, name);
   const tmp = `${path}.${process.pid}.tmp`;
+  let abandoned = false;
   try {
     await mkdir(credsDir(io), { recursive: true, mode: 0o700 });
     const fh = await open(tmp, "wx", 0o600);
@@ -82,10 +91,16 @@ export async function writeSecretFile(io: Io, name: string, text: string): Promi
     } finally {
       await fh.close();
     }
-    await rename(tmp, path);
+    abandoned = signal?.aborted === true;
+    if (!abandoned) await rename(tmp, path);
   } catch (e: any) {
     await unlink(tmp).catch(() => {});
     throw ioError(e, path);
+  }
+  // Outside the catch, so this is not reported as an IO failure; the temp file goes either way.
+  if (abandoned) {
+    await unlink(tmp).catch(() => {});
+    throw cancelled();
   }
 }
 

@@ -157,4 +157,37 @@ describe("A1 cdp length prefix", () => {
     expect(thrown(() => bad.push(body)).message).toContain("not valid UTF-8");
     expect(ENC.encode("\uFFFD").length).toBe(3); // the receipt for "three bytes each"
   });
+
+  // The byte budgets alone do not bound the OBJECTS the tail is held in: one retained typed array
+  // and one list entry per arriving fragment let a peer sending one-byte DATA payloads hold
+  // millions of both while `held` stayed well inside its ceiling. Small fragments are coalesced
+  // into blocks now, so the object count is budgeted by the same bytes.
+  test("many tiny fragments are coalesced, so the tail's block count stays bounded", () => {
+    const r = cdpReader(1024 * 1024);
+    const message = cdpMessage(256 * 1024 - 4);
+    const framed = encodeCdp(message); // 256 KiB on the wire
+    for (let i = 0; i < framed.length - 1; i++) r.push(framed.subarray(i, i + 1));
+
+    expect(r.held).toBe(framed.length - 1);
+    // 262 143 one-byte fragments. All-small input fills its blocks end to end, so the bound is one
+    // block per 64 KiB held plus the one being filled — four here, not a quarter of a million.
+    expect(r.buffers).toBeLessThanOrEqual(1 + r.held / (64 * 1024));
+    expect(r.buffers).toBeGreaterThan(0);
+
+    // And they still reassemble byte-identically, consumed by index rather than by shifting.
+    expect(r.push(framed.subarray(framed.length - 1))).toEqual([message]);
+    expect([r.held, r.buffers]).toEqual([0, 0]);
+  });
+
+  test("a fragment of a block or more is its own block, so a big one is still held by reference", () => {
+    const r = cdpReader();
+    r.push(new Uint8Array(4)); // a prefix declaring 0 bytes completes at once; nothing is held
+    expect(r.buffers).toBe(0);
+    const big = encodeCdp(cdpMessage(512 * 1024));
+    r.push(big.subarray(0, 128 * 1024));
+    r.push(big.subarray(128 * 1024, 128 * 1024 + 10));
+    expect(r.buffers).toBe(2); // the big one, then the block the ten bytes went into
+    r.close();
+    expect([r.held, r.buffers]).toEqual([0, 0]);
+  });
 });

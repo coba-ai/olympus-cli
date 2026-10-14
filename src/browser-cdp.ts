@@ -13,9 +13,10 @@
 // workbench unread, except three events this filter acts on along the way:
 // Target.attachedToTarget and Target.detachedFromTarget (session tracking) and
 // Page.fileChooserOpened (A8) - plus one RESPONSE, the answer to a workbench
-// Target.createBrowserContext, which carries the new context's id and is read so the filter can
-// deny downloads in it before the workbench knows that id. Nothing here stops an event from
-// carrying what a refused domain would have produced - some arrive with no domain enabled at all -
+// Target.createBrowserContext, which carries the new context's id and is HELD until the download
+// denial for that context is acknowledged, so the workbench is never told an id it could use first.
+// Nothing here stops an event from carrying what a refused domain would have
+// produced - some arrive with no domain enabled at all -
 // and nothing needs to: the workbench is the transport, so it already sees every page byte.
 import type { CdpSend } from "./browser-frame";
 
@@ -122,6 +123,23 @@ const urlRules: Record<string, Rule> = Object.fromEntries(
   ]),
 );
 
+// Target.setAutoAttach's FULL parameter list, read from `browser_protocol.json` (1.3) on
+// 2026-10-14: `autoAttach` and `waitForDebuggerOnStart`, both required booleans, plus the optional
+// `flatten` and `filter` - four, and no more. These three are the ones the rule below enforces by
+// value; `filter` is refused by the same inversion that refuses whatever the protocol grows next.
+const AUTO_ATTACH_PARAMS = new Set(["autoAttach", "waitForDebuggerOnStart", "flatten"]);
+
+// `filter` keeps a message of its own because it is the parameter that turns three true booleans
+// into no auto-attach at all. TargetFilter's own text: "the first entry that matches determines if
+// the target is included or not", and a FilterEntry with no `type` "matches any type" - so
+// `filter: [{exclude: true}]` excludes EVERY target.
+const AUTO_ATTACH_REFUSALS = new Map<string, string>([
+  [
+    "filter",
+    "Target.setAutoAttach with filter is refused: an entry with no type matches every target, so [{exclude: true}] is the filter's own paused auto-attach switched off by another name",
+  ],
+]);
+
 // The three createBrowserContext parameters read on 2026-10-14 that widen a context's reach, each
 // with the reason it does. This table buys a better message, never an allowance: the rule below
 // refuses a parameter whether it is named here or not.
@@ -149,19 +167,32 @@ const RULES: Record<string, Rule> = {
   "Target.attachToTarget": (p) => (p.flatten === true ? undefined : "Target.attachToTarget requires flatten: true"),
   // The filter installs a paused auto-attach of its own on the browser session (cdpFilter below),
   // and a sessionless workbench setAutoAttach lands on that same session: `autoAttach: false` would
-  // switch it off and `waitForDebuggerOnStart: false` would let a new target run before the filter
-  // has seen it attach. So the workbench may re-state this command and may not weaken it - which
-  // also means it cannot auto-attach a sub-target un-paused. What enforces the pause is this rule
-  // plus the filter's own command; nothing in Chromium does, and `Target.autoAttachRelated`, the
-  // other way to set it, is kept out by TARGET_METHODS above rather than by a rule here.
-  "Target.setAutoAttach": (p) =>
-    p.flatten !== true
-      ? "Target.setAutoAttach requires flatten: true"
-      : p.autoAttach !== true
-        ? "Target.setAutoAttach requires autoAttach: true: the filter's own auto-attach may not be switched off"
-        : p.waitForDebuggerOnStart !== true
-          ? "Target.setAutoAttach requires waitForDebuggerOnStart: true: a target must not run before the filter has seen it attach"
-          : undefined,
+  // switch it off, `waitForDebuggerOnStart: false` would let a new target run before the filter has
+  // seen it attach, and `filter` would drop the targets it applies to while all three booleans read
+  // true. So this method is allowlisted by PARAMETER the way createBrowserContext below is: the
+  // three AUTO_ATTACH_PARAMS must each be `true`, and EVERY other parameter is refused by presence,
+  // including the ones nobody here has read and the ones the protocol grows next.
+  //
+  // So the workbench may re-state this command and may not weaken it - which also means it cannot
+  // auto-attach a sub-target un-paused. What enforces that is this function plus the filter's own
+  // command on construction, and the tests "Target.setAutoAttach that would weaken the filter's own
+  // paused auto-attach" and "refuses every setAutoAttach parameter but the three it enforces,
+  // filter included"; nothing in Chromium does. `Target.autoAttachRelated`, the other way to set it
+  // - and it carries `filter` too - is kept out by TARGET_METHODS above rather than by a rule here.
+  "Target.setAutoAttach": (p) => {
+    if (p.flatten !== true) return "Target.setAutoAttach requires flatten: true";
+    if (p.autoAttach !== true) return "Target.setAutoAttach requires autoAttach: true: the filter's own auto-attach may not be switched off";
+    if (p.waitForDebuggerOnStart !== true)
+      return "Target.setAutoAttach requires waitForDebuggerOnStart: true: a target must not run before the filter has seen it attach";
+    // A Set and a Map, not objects, for the reason spelled out on createBrowserContext below: a
+    // workbench can send `__proto__` as a parameter name.
+    const name = Object.keys(p).find((k) => !AUTO_ATTACH_PARAMS.has(k));
+    if (name === undefined) return undefined;
+    return (
+      AUTO_ATTACH_REFUSALS.get(name) ??
+      `Target.setAutoAttach with ${name} is refused: only autoAttach, waitForDebuggerOnStart and flatten are allowed`
+    );
+  },
   // A new context is created with a routing and reach of its own, so this method is allowlisted by
   // PARAMETER the way the rest of the file is allowlisted by method: `disposeOnDetach`, which only
   // says when the context dies, is the one that passes, and EVERY other parameter is refused by
@@ -280,8 +311,9 @@ type Unusable = { why: string };
  *   - per page session, as before: Page.enable, download deny, chooser interception.
  *
  * What is enforced, exactly: no workbench command is forwarded until the browser-wide denial is
- * acknowledged, and no page session is usable until its own three commands are acknowledged. What
- * is NOT: that Chromium's browser-wide denial actually covers every present and future context -
+ * acknowledged, no page session is usable until its own three commands are acknowledged, and the id
+ * of a context the workbench creates is withheld until that context's own denial is acknowledged.
+ * What is NOT: that Chromium's browser-wide denial actually covers every present and future context -
  * the protocol's text says an omitted `browserContextId` means the DEFAULT context, which is why a
  * context the workbench creates gets its own command below, and the rest is UNVERIFIED; and that
  * auto-attach on the browser session reaches every target Chromium can create, which is UNVERIFIED
@@ -407,13 +439,36 @@ export function cdpFilter(toBrowser: CdpSend, toWorkbench: CdpSend): CdpFilter {
         if (contexts.has(m.id)) {
           contexts.delete(m.id);
           const browserContextId = m.result?.browserContextId;
-          // Issued BEFORE the response is forwarded, so it is on the wire ahead of anything the
-          // workbench can send about a context whose id it does not have yet. A refusal fails the
-          // whole filter closed rather than leaving one context downloading.
-          if (typeof browserContextId === "string")
-            issue(undefined, "Browser.setDownloadBehavior", { behavior: "deny", browserContextId }, (r) =>
-              r?.error ? fail(`the download denial for browser context ${browserContextId}`, r) : undefined,
-            );
+          // The response is HELD, not forwarded, until the denial for the new context is
+          // acknowledged: the workbench cannot name a context whose id it has not been told.
+          // Issuing the denial first and forwarding straight away was NOT enough - the workbench's
+          // next command for that context was accepted while the denial was still in flight, so a
+          // target could be created in an uncovered context. Held by this branch and the test
+          // "holds the new context's id until downloads are denied in it".
+          //
+          // What is withheld is the ID and nothing else: no command is checked for a
+          // `browserContextId` anywhere in this file, so a workbench that already knows or guesses
+          // one is not stopped by this.
+          if (typeof browserContextId === "string") {
+            issue(undefined, "Browser.setDownloadBehavior", { behavior: "deny", browserContextId }, (r) => {
+              if (!r?.error) return void toWorkbench(message); // covered now: release the id
+              // Refused, so the context exists and its downloads are not denied. The filter disposes
+              // it, answers the workbench's own command with an error instead of the id, and fails
+              // closed from here on. Whether the dispose actually happened is NOT checked - its
+              // answer is dropped like every other command of the filter's. Enforced by "disposes
+              // the context and fails the command when that denial is refused, then fails closed".
+              fail(`the download denial for browser context ${browserContextId}`, r);
+              issue(undefined, "Target.disposeBrowserContext", { browserContextId });
+              toWorkbench(
+                cdpError(
+                  m.id,
+                  `downloads could not be denied in the new browser context (${said(r)}); it was sent Target.disposeBrowserContext, whose answer this filter does not check, and nothing is forwarded from here on`,
+                  typeof m.sessionId === "string" ? m.sessionId : undefined,
+                ),
+              );
+            });
+            return;
+          }
         }
       }
       const sid = m?.params?.sessionId;
