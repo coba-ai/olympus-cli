@@ -120,12 +120,16 @@ olympus day close --shipped "…" --draft                                       
 ```sh
 olympus agents list                    # profile name, display name, active|paused
 olympus webhook list
-olympus webhook create --name N --agent zeus --instructions-file prompt.md   # prints the signing secret ONCE
-olympus webhook update <id> --instructions-file prompt.md
+olympus webhook create --name N --agent zeus --instructions-file prompt.md --mode inbox --signature github --provider-secret-file secret.txt
+olympus webhook update <id> --signature-file scheme.json
 olympus webhook delete <id> --yes
 ```
 
-Reading one webhook and all webhook writes need the `operator` role (exit 4 otherwise). Store the secret from `create` immediately; it cannot be read again.
+Reading one webhook and all webhook writes need the `operator` role (exit 4 otherwise). `--signature` is a preset name (`olympus`, `svix`, `standard-webhooks`, `github`, `stripe`, `linear`, `calcom`, `circleback`, `gitlab-token`) and `--signature-file` is a JSON custom scheme; pass one of them, not both. `--provider-secret-file` is a path or `-` for stdin. Never pass the provider secret as an argument, and never print it. An empty file is exit 1.
+
+`create` prints the signing secret once only when the response's `secret` is not null (the `olympus` preset). Other presets return `null`: the provider's secret is the one you passed from the file. Store an `olympus` secret immediately; it cannot be read again.
+
+`approval` is `pending`, `approved` or `rejected`. Piped stdout stays the old field list: it does not include `approval`, `approved_at`, `created_via`, `mode`, `signature`, `secret_set`, or any other field the server adds. Those fields are in `--json` and on a terminal. Pending says `an owner must approve this in Olympus → Webhooks`. Rejected says `an owner rejected this; fix it and update to resubmit`. That sentence is on stdout at a terminal, in `--json` as a top-level `hint`, and on stderr when piped or when `--json` is set. A person's create is approved as made; an agent's create stays pending until an owner approves it in Olympus → Webhooks.
 
 ## CRM
 

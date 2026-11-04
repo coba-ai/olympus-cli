@@ -34,7 +34,9 @@ olympus login --with-token          # read a token from stdin instead
 olympus logout | whoami | org list | org use <slug> | agents list
 olympus webhook list | get <id> | delete <id> --yes
 olympus webhook create --name N --agent PROFILE (--instructions T | --instructions-file PATH|-) [--full-tools]
+                       [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
 olympus webhook update <id> [--name] [--agent] [--instructions|--instructions-file] [--[no-]full-tools]
+                       [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
 olympus people                      # members, then agents (ids, kind, email, paused)
 olympus tags                        # the organization's tags, most used first
 olympus tasks | task list [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today] [--tag T]... [--backlog]
@@ -86,8 +88,10 @@ olympus version | --version
 ```
 
 Global flags: `--json`, `--host URL`, `--org SLUG`, `-h/--help`. No flag takes a token.
-`webhook create` prints the signing `secret` once (both modes); `update` sends only the fields given;
+`webhook create` and `update` take `--mode run|inbox`, `--signature` (a preset name: `olympus`, `svix`, `standard-webhooks`, `github`, `stripe`, `linear`, `calcom`, `circleback`, `gitlab-token`) or `--signature-file` (a JSON custom scheme; not both), and `--provider-secret-file PATH|-`. The provider secret is read from that file or from stdin, one trailing newline stripped, and is never a command-line argument and never printed. An empty file is a usage error.
+`webhook create` prints the signing `secret` once, in text and `--json`, only when the response's `secret` is not null (the `olympus` preset). Other presets return none: you supply the provider's secret instead. `update` sends only the fields given.
 `delete` never prompts and requires `--yes`.
+When `approval` is `pending`, a terminal says `an owner must approve this in Olympus → Webhooks` on stdout, and `--json` puts that sentence in a top-level `hint`. When it is `rejected`, the sentence is `an owner rejected this; fix it and update to resubmit`. Piped stdout does not include the hint or the newer fields (`approval`, `approved_at`, `created_via`, `mode`, `signature`, `secret_set`, or anything else the server adds); the hint goes to stderr instead, including under `--json`.
 Roles are `operator` and `teammate`; a teammate cannot `webhook get` (exit 4) or write.
 
 Tasks: any member, teammate included, can read and write them. Every `task` subcommand (and `tasks`) takes
@@ -302,7 +306,7 @@ Human mode depends on where stdout goes. On a terminal you get headers, aligned 
 times ("3h ago"; a time in the future reads `+5m`, `+3h` or `+8d`, and beyond 30 days it is the ISO date, while piped and `--json` output are unaffected), a `*` on the default org in `org list`, and full-sentence confirmations; control
 characters in server text are stripped from stdout on a terminal and server text in error messages is cleaned on stderr too (except with `--json`, where stderr is the error body as sent). Piped or redirected, you get plain tab-separated lines that
 scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
-emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms. `--json` prints the API body as-is (the one exception: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent), one compact line
+emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms, only when the response's `secret` is not null. `--json` prints the API body as-is (two exceptions: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent; a webhook whose `approval` is `pending` or `rejected` adds a top-level `hint` with the sentence to show a person, and prints that same sentence on stderr), one compact line
 (`org list` → `{data:[…]}`, `org use` → `{data:{org}}`, `delete` → `{data:{id,deleted:true}}`,
 `logout` → `{data:{deleted}}`, `task delete` and `subscription delete` → `{data:{id,deleted:true}}`; `task delegate`, `task breakdown`, `day …` → the response body; `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
 usage errors are `{"error":{"code":"usage",…}}`. A token is never printed.

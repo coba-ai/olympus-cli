@@ -611,3 +611,226 @@ test("R8 terminal control sequences from the server never reach a tty", async ()
   fake.state.next = { status: 200, body: { data: [] } };
   noCtl((await rich(["agents", "list", "--org", "acme"], { env: owner })).out);
 });
+
+const PENDING = "an owner must approve this in Olympus → Webhooks";
+const REJECTED = "an owner rejected this; fix it and update to resubmit";
+
+test("webhook mode, signature and provider secret", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "oly-wh-"));
+  const secretPath = join(dir, "secret.txt");
+  const schemePath = join(dir, "scheme.json");
+  const providerSecret = "provider-secret-value-xyz";
+  await writeFile(secretPath, providerSecret + "\n");
+  const scheme = { kind: "hmac", header: "x-signature", encoding: "hex", prefix: "sha256=", signed: "body" };
+  await writeFile(schemePath, JSON.stringify(scheme) + "\n");
+
+  const created = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--mode", "inbox", "--signature", "github", "--provider-secret-file", secretPath, "--json"], { env: owner });
+  expect(created.code).toBe(0);
+  const body = JSON.parse(created.out);
+  expect(body.secret).toBeNull();
+  expect(body.data).toMatchObject({ mode: "inbox", signature: "github", approval: "approved", created_via: "api_person" });
+  expect(body.data.approved_at).toBeString();
+  expect(body.data.provider_secret).toBeUndefined();
+  expect(created.out).not.toContain("shown once");
+  expect(created.out).not.toContain(providerSecret);
+  expect(created.err).not.toContain(providerSecret);
+  expect(last().body).toMatchObject({ mode: "inbox", signature: "github", provider_secret: providerSecret });
+  const id = body.data.id;
+  const again = await cli(["webhook", "get", id, "--json"], { env: owner });
+  expect(JSON.stringify(again)).not.toContain(providerSecret);
+  expect(JSON.parse(again.out).data.provider_secret).toBeUndefined();
+
+  const text = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature", "stripe"], { env: owner });
+  expect(text.code).toBe(0);
+  expect(text.out).not.toContain("shown once");
+  expect(text.out).not.toContain("approval");
+  expect(text.out).not.toContain("stripe");
+  expect(text.err).toBe("");
+  const shown = await rich(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature", "stripe"], { env: owner });
+  expect(shown.out).toContain("stripe");
+  expect(shown.out).toContain("approved");
+  expect(shown.err).toBe("");
+
+  const oly = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature", "olympus"], { env: owner });
+  expect(oly.out).toMatch(/secret \(shown once\): whsec_[0-9a-f]+/);
+
+  const fromStdin = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature", "linear", "--provider-secret-file", "-"], { env: owner, stdin: providerSecret + "\n\n" });
+  expect(fromStdin.code).toBe(0);
+  expect((last().body as any).provider_secret).toBe(providerSecret + "\n");
+  expect(fromStdin.out).not.toContain(providerSecret);
+  expect(fromStdin.err).not.toContain(providerSecret);
+
+  const custom = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--mode", "run", "--signature-file", schemePath, "--json"], { env: owner });
+  expect(custom.code).toBe(0);
+  expect((last().body as any).signature).toEqual(scheme);
+  expect(JSON.parse(custom.out).data.signature).toEqual(scheme);
+  expect(JSON.parse(custom.out).secret).toBeNull();
+  const tokenScheme = { kind: "token", header: "authorization" };
+  await writeFile(schemePath, JSON.stringify(tokenScheme));
+  const token = await cli(["webhook", "update", id, "--signature-file", schemePath, "--json"], { env: owner });
+  expect(token.code).toBe(0);
+  expect((last().body as any).signature).toEqual(tokenScheme);
+  expect(JSON.parse(token.out).data.signature).toEqual(tokenScheme);
+  const prefixed = { kind: "token", header: "authorization", prefix: "Bearer " };
+  await writeFile(schemePath, JSON.stringify(prefixed));
+  const withPrefix = await cli(["webhook", "update", id, "--signature-file", schemePath, "--json"], { env: owner });
+  expect(withPrefix.code).toBe(0);
+  expect((last().body as any).signature).toEqual(prefixed);
+  expect(JSON.parse(withPrefix.out).data.signature).toEqual(prefixed);
+  const maxPrefix = { kind: "token", header: "x-webhook-token", prefix: "x".repeat(32) };
+  await writeFile(schemePath, JSON.stringify(maxPrefix));
+  const atMax = await cli(["webhook", "update", id, "--signature-file", schemePath, "--json"], { env: owner });
+  expect(atMax.code).toBe(0);
+  expect((last().body as any).signature).toEqual(maxPrefix);
+
+  const patched = await cli(["webhook", "update", id, "--mode", "run", "--json"], { env: owner });
+  expect(patched.code).toBe(0);
+  expect(last().body).toEqual({ mode: "run" });
+  expect(JSON.parse(patched.out).data.mode).toBe("run");
+
+  fake.state.requests.length = 0;
+  const bad = [
+    ["--signature", "github", "--signature-file", schemePath],
+    ["--signature", "GitHub"],
+    ["--signature", "nope"],
+    ["--mode", "both"],
+    ["--provider-secret-file", join(dir, "missing")],
+  ];
+  for (const flags of bad) {
+    const r = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", ...flags], { env: owner });
+    expect(r.code).toBe(1);
+  }
+  await writeFile(secretPath, "");
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--provider-secret-file", secretPath], { env: owner })).code).toBe(1);
+  await writeFile(secretPath, "\n");
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--provider-secret-file", secretPath], { env: owner })).code).toBe(1);
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--provider-secret-file", "-"], { env: owner, stdin: "\n" })).code).toBe(1);
+  await writeFile(schemePath, "{");
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature-file", schemePath], { env: owner })).code).toBe(1);
+  await writeFile(schemePath, JSON.stringify({ kind: "token", header: "cookie" }));
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature-file", schemePath], { env: owner })).code).toBe(1);
+  await writeFile(schemePath, JSON.stringify({ kind: "token", header: "authorization", prefix: 1 }));
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature-file", schemePath], { env: owner })).code).toBe(1);
+  await writeFile(schemePath, JSON.stringify({ kind: "token", header: "authorization", prefix: "x".repeat(33) }));
+  expect((await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--signature-file", schemePath], { env: owner })).code).toBe(1);
+  expect((await cli(["webhook", "list", "--mode", "inbox"], { env: owner })).code).toBe(1);
+  expect(reqs()).toHaveLength(0);
+
+  const argvSecret = "argv-secret-should-not-leak";
+  for (const args of [
+    ["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--provider-secret", argvSecret],
+    ["webhook", "update", id, "--provider-secret=" + argvSecret],
+  ]) {
+    const r = await cli(args, { env: owner });
+    expect(r.code).toBe(1);
+    expect(r.out).not.toContain(argvSecret);
+    expect(r.err).not.toContain(argvSecret);
+    expect(r.err).toContain("provider-secret-file");
+  }
+  expect(reqs()).toHaveLength(0);
+});
+
+test("piped webhook stdout stays byte-identical when the server adds fields", async () => {
+  const u = fake.url;
+  const data = {
+    id: "wh_keep", name: "n", agent: "hermes", full_tools: false,
+    url: `${u}/hooks/wh_keep`, last_delivery_at: null, last_delivery_status: null,
+    created_at: "2026-10-02T10:00:00Z", instructions: "do it",
+    approval: "approved", approved_at: "2026-10-02T10:00:00Z", created_via: "api_person",
+    mode: "inbox", signature: "github", secret_set: true, future_field: "nope",
+  };
+  const golden = `id: wh_keep\nname: n\nagent: hermes\nfull_tools: false\nurl: ${u}/hooks/wh_keep\nlast_delivery_at: null\nlast_delivery_status: null\ncreated_at: 2026-10-02T10:00:00Z\ninstructions: do it\n`;
+  fake.state.next = { status: 201, body: { data, secret: "whsec_abcdef" } };
+  const created = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "do it", "--org", "acme"], { env: owner });
+  expect(created.code).toBe(0);
+  expect(created.err).toBe("");
+  expect(created.out).toBe(golden + "secret (shown once): whsec_abcdef\n");
+  fake.state.next = { status: 200, body: { data } };
+  const got = await cli(["webhook", "get", "wh_keep", "--org", "acme"], { env: owner });
+  expect(got.err).toBe("");
+  expect(got.out).toBe(golden);
+  fake.state.next = { status: 200, body: { data: [data, { ...data, id: "wh_keep2", name: "m" }] } };
+  const listed = await cli(["webhook", "list", "--org", "acme"], { env: owner });
+  expect(listed.err).toBe("");
+  expect(listed.out).toBe("wh_keep\tn\thermes\t-\t-\nwh_keep2\tm\thermes\t-\t-\n");
+  fake.state.next = { status: 200, body: { data } };
+  const j = await cli(["webhook", "get", "wh_keep", "--org", "acme", "--json"], { env: owner });
+  expect(j.err).toBe("");
+  expect(JSON.parse(j.out).hint).toBeUndefined();
+  expect(JSON.parse(j.out).data).toMatchObject({ approval: "approved", approved_at: "2026-10-02T10:00:00Z", created_via: "api_person", mode: "inbox", signature: "github", secret_set: true, future_field: "nope" });
+  fake.state.next = { status: 200, body: { data } };
+  const tty = await rich(["webhook", "get", "wh_keep", "--org", "acme"], { env: owner });
+  expect(tty.err).toBe("");
+  expect(tty.out).toContain("inbox");
+  expect(tty.out).toContain("github");
+  expect(tty.out).toMatch(/secret set\s+true/);
+  expect(tty.out).toContain("approved");
+  expect(tty.out).toContain("api_person");
+  expect(tty.out).toContain("future_field");
+  expect(tty.out).toContain("nope");
+  expect(tty.out.indexOf("future_field")).toBeLessThan(tty.out.indexOf("instructions:"));
+});
+
+test("webhook pending and rejected hints, text and json", async () => {
+  const pending = () => { fake.state.next = { status: 201, body: { data: { id: "wh_p", name: "n", agent: "hermes", full_tools: false, approval: "pending", approved_at: null, created_via: "agent_turn" }, secret: null } }; };
+  pending();
+  const j = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--org", "acme", "--json"], { env: owner });
+  expect(j.code).toBe(0);
+  const parsed = JSON.parse(j.out);
+  expect(parsed.data.approval).toBe("pending");
+  expect(parsed.data.created_via).toBe("agent_turn");
+  expect(parsed.hint).toBe(PENDING);
+  expect(j.err).toBe(PENDING + "\n");
+  expect(j.out).not.toContain("shown once");
+  pending();
+  const piped = await cli(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--org", "acme"], { env: owner });
+  expect(piped.out).toBe("id: wh_p\nname: n\nagent: hermes\nfull_tools: false\n");
+  expect(piped.out).not.toContain(PENDING);
+  expect(piped.err).toBe(PENDING + "\n");
+  expect(piped.out).not.toContain("shown once");
+  fake.state.next = { status: 201, body: { data: { id: "wh_p", name: "n", approval: "pending", created_via: "agent_turn" }, secret: "whsec_should_still_show" } };
+  const tty = await rich(["webhook", "create", "--name", "n", "--agent", "hermes", "--instructions", "i", "--org", "acme"], { env: owner });
+  expect(tty.out).toContain("approval       pending");
+  expect(tty.out).toContain("agent_turn");
+  expect(tty.out).toContain(PENDING);
+  expect(tty.out).toContain("shown once");
+  expect(tty.err).toBe("");
+
+  const rejectedGet = `id: wh_r\nname: deploys\nagent: hermes\nfull_tools: true\nurl: ${fake.url}/hooks/wh_r\nlast_delivery_at: 2026-10-10T11:00:00Z\nlast_delivery_status: 202\ncreated_at: 2026-10-06T09:12:00Z\ninstructions: When a deploy finishes,\npost a summary.\n`;
+  await withBeta([
+    seeded("wh_r", { approval: "rejected", approved_at: "2026-10-01T00:00:00Z", created_via: "agent_turn", mode: "inbox", signature: "github", secret_set: false }),
+    seeded("wh_ok", { approval: "approved", approved_at: "2026-10-02T00:00:00Z", created_via: "api_person" }),
+  ], async () => {
+    const h = await cli(["webhook", "get", "wh_r", "--org", "beta"], { env: multi });
+    expect(h.out).toBe(rejectedGet);
+    expect(h.err).toBe(REJECTED + "\n");
+    const jr = await cli(["webhook", "get", "wh_r", "--org", "beta", "--json"], { env: multi });
+    expect(JSON.parse(jr.out).data.approval).toBe("rejected");
+    expect(JSON.parse(jr.out).data.signature).toBe("github");
+    expect(JSON.parse(jr.out).hint).toBe(REJECTED);
+    expect(jr.err).toBe(REJECTED + "\n");
+    const tg = await rich(["webhook", "get", "wh_r", "--org", "beta"], { env: multi });
+    expect(tg.out).toContain("rejected");
+    expect(tg.out).toContain("github");
+    expect(tg.out).toContain("agent_turn");
+    expect(tg.out).toMatch(/secret set\s+false/);
+    expect(tg.out).toContain(REJECTED);
+    expect(tg.err).toBe("");
+    const list = await rich(["webhook", "list", "--org", "beta"], { env: multi });
+    expect(list.out).toContain("APPROVAL");
+    expect(list.out).toContain("rejected");
+    expect(list.out).toContain("approved");
+    expect(list.out).toContain(REJECTED);
+    expect(list.out.match(new RegExp(REJECTED, "g"))).toHaveLength(1);
+    expect(list.err).toBe("");
+    const plain = await cli(["webhook", "list", "--org", "beta"], { env: multi });
+    expect(plain.out).toBe("wh_r\tdeploys\thermes\tfull-tools\t202\nwh_ok\tdeploys\thermes\tfull-tools\t202\n");
+    expect(plain.err).toBe(REJECTED + "\n");
+    const u = await cli(["webhook", "update", "wh_r", "--name", "x", "--org", "beta"], { env: multi });
+    expect(u.code).toBe(0);
+    expect(u.out).toContain("name: x");
+    expect(u.out).not.toContain("approval");
+    expect(u.out).not.toContain(REJECTED);
+    expect(u.err).toBe(REJECTED + "\n");
+  });
+});

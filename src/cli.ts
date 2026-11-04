@@ -20,7 +20,9 @@ const USAGE = `usage: olympus <command> [flags]
   logout | whoami | org list | org use <slug> | agents list
   webhook list | get <id> | delete <id> --yes
   webhook create --name N --agent PROFILE (--instructions T | --instructions-file PATH|-) [--full-tools]
+      [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
   webhook update <id> [--name N] [--agent P] [--instructions T | --instructions-file PATH|-] [--[no-]full-tools]
+      [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
   people | tasks [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today] [--tag T]... [--backlog]   (alias: task list)
   tags   (org tags, most used first)
   task get <id> | add TEXT | update <id> | done <id> | undone <id> | today <id> | star <id> | delete <id> --yes
@@ -79,6 +81,7 @@ const OPTIONS = {
   ...Object.fromEntries(("entity pipeline status owner q sort page amount next company new-company person new-person " +
     "person-email lost-reason version new email due phone job-title linkedin-url notes domain website industry city url").split(" ")
     .map((k) => [k, { type: "string" }])),
+  mode: { type: "string" }, signature: { type: "string" }, "signature-file": { type: "string" }, "provider-secret-file": { type: "string" },
   event: { type: "string", multiple: true }, "allow-origin": { type: "string", multiple: true },
   session: { type: "string" }, timeout: { type: "string" }, after: { type: "string" }, day: { type: "string" },
   wait: { type: "boolean" }, closed: { type: "boolean" }, all: { type: "boolean" }, request: { type: "boolean" },
@@ -92,14 +95,113 @@ const SOURCE: Record<OrgSource, string> = {
   flag: "--org", env: "OLYMPUS_ORG", pin: "token pin", stored: "saved by olympus org use", only: "only membership",
 };
 const SIGNING = 'See "Delivering to a webhook" in docs/API.md: https://github.com/coba-ai/olympus-cli/blob/main/docs/API.md#delivering-to-a-webhook';
-const KNOWN = new Set(["id", "name", "agent", "full_tools", "url", "last_delivery_at", "last_delivery_status", "created_at", "instructions"]);
+const KNOWN = new Set(["id", "name", "agent", "full_tools", "url", "last_delivery_at", "last_delivery_status", "created_at", "instructions", "mode", "signature", "secret_set", "approval", "approved_at", "created_via", "provider_secret"]);
+// Piped text prints only these, in the order the server sent them. A field the server adds cannot change that stdout.
+const PIPED_KEYS = new Set(["id", "name", "agent", "full_tools", "url", "last_delivery_at", "last_delivery_status", "created_at", "instructions"]);
+const PRESETS = ["olympus", "svix", "standard-webhooks", "github", "stripe", "linear", "calcom", "circleback", "gitlab-token"];
+const PENDING_HINT = "an owner must approve this in Olympus → Webhooks";
+const REJECTED_HINT = "an owner rejected this; fix it and update to resubmit";
+// Same names the companion's parseSignature rejects, except `authorization`: a token scheme names that header, and the platform reads the inbound Authorization value under another name.
+const DENIED_HEADERS = new Set(["cookie", "proxy-authorization", "host", "connection", "keep-alive", "content-length", "transfer-encoding", "te", "trailer", "upgrade", "expect", "via", "forwarded", "x-real-ip", "version"]);
 
-// Rich webhook block: known keys in a fixed order, then unknown ones, then instructions as an indented section.
+function refuseSecretOnArgv(argv: string[]): void {
+  for (const a of argv) {
+    if (a === "--provider-secret" || a.startsWith("--provider-secret="))
+      throw usage("pass the provider secret with --provider-secret-file PATH|- (never on the command line)");
+  }
+}
+
+function stripOneTrailingNewline(s: string): string {
+  if (s.endsWith("\r\n")) return s.slice(0, -2);
+  if (s.endsWith("\n")) return s.slice(0, -1);
+  return s;
+}
+
+function validHeaderName(value: unknown): value is string {
+  return typeof value === "string" && value === value.toLowerCase() && /^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(value) &&
+    !DENIED_HEADERS.has(value) && !value.startsWith("x-forwarded-") && !value.startsWith("fly-") && !value.startsWith("x-olympus-");
+}
+
+// Preset names stay on --signature. A file is only a custom object, checked the same way the platform parses one.
+function customSignature(input: unknown): Record<string, unknown> {
+  if (typeof input === "string") throw usage("a signature file must be a custom scheme object; pass a preset with --signature");
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw usage("signature file must be a JSON object");
+  const value = input as Record<string, unknown>;
+  if (value.kind === "token") {
+    if (Object.keys(value).some((k) => k !== "kind" && k !== "header" && k !== "prefix") || !validHeaderName(value.header))
+      throw usage("token signature needs {kind:\"token\", header} with a lowercase header name");
+    if (value.prefix !== undefined && (typeof value.prefix !== "string" || value.prefix.length > 32 || !/^[\x20-\x7e]*$/.test(value.prefix)))
+      throw usage("token signature prefix must be a string of at most 32 printable ASCII characters");
+    return { kind: "token", header: value.header, ...(value.prefix === undefined ? {} : { prefix: value.prefix }) };
+  }
+  if (value.kind !== "hmac") throw usage("signature kind must be hmac or token");
+  const allowed = ["kind", "header", "encoding", "prefix", "signed", "timestamp_header", "id_header", "tolerance_s"];
+  if (Object.keys(value).some((k) => !allowed.includes(k))) throw usage("signature object has an unknown field");
+  if (!validHeaderName(value.header)) throw usage("signature header must be a lowercase header name");
+  if (value.encoding !== "hex" && value.encoding !== "base64") throw usage("signature encoding must be hex or base64");
+  if (value.signed !== "body" && value.signed !== "ts.body" && value.signed !== "id.ts.body")
+    throw usage("signature signed must be body, ts.body or id.ts.body");
+  if (value.prefix !== undefined && typeof value.prefix !== "string") throw usage("signature prefix must be a string");
+  if (value.signed !== "body" && !validHeaderName(value.timestamp_header)) throw usage("signature timestamp_header must be a lowercase header name");
+  if (value.signed === "id.ts.body" && !validHeaderName(value.id_header)) throw usage("signature id_header must be a lowercase header name");
+  if (value.signed === "body" && (value.timestamp_header !== undefined || value.id_header !== undefined))
+    throw usage("a body signature does not take timestamp_header or id_header");
+  if (value.signed === "ts.body" && value.id_header !== undefined) throw usage("a ts.body signature does not take id_header");
+  if (value.tolerance_s !== undefined && (!Number.isSafeInteger(value.tolerance_s) || (value.tolerance_s as number) < 0))
+    throw usage("signature tolerance_s must be a non-negative integer");
+  return {
+    kind: "hmac", header: value.header, encoding: value.encoding,
+    ...(value.prefix === undefined ? {} : { prefix: value.prefix }), signed: value.signed,
+    ...(value.timestamp_header === undefined ? {} : { timestamp_header: value.timestamp_header }),
+    ...(value.id_header === undefined ? {} : { id_header: value.id_header }),
+    ...(value.tolerance_s === undefined ? {} : { tolerance_s: value.tolerance_s }),
+  };
+}
+
+function approvalHints(body: any): string[] {
+  const data = body?.data;
+  const rows = Array.isArray(data) ? data : data && typeof data === "object" ? [data] : [];
+  const states = new Set(rows.map((w) => w?.approval));
+  const hints: string[] = [];
+  if (states.has("pending")) hints.push(PENDING_HINT);
+  if (states.has("rejected")) hints.push(REJECTED_HINT);
+  return hints;
+}
+
+// Drop a provider secret if a server ever echoes one. No such key leaves the same body, so --json stays byte-identical.
+function withoutProviderSecret(body: any): any {
+  if (!body || typeof body !== "object") return body;
+  const has = (w: any) => !!w && typeof w === "object" && !Array.isArray(w) && Object.prototype.hasOwnProperty.call(w, "provider_secret");
+  const drop = (w: any) => { const { provider_secret, ...rest } = w; return rest; };
+  const leaked = has(body) || (Array.isArray(body.data) ? body.data.some(has) : has(body.data));
+  if (!leaked) return body;
+  const data = Array.isArray(body.data) ? body.data.map((w: any) => has(w) ? drop(w) : w) : has(body.data) ? drop(body.data) : body.data;
+  const { provider_secret, ...rest } = body;
+  return body.data === undefined ? rest : { ...rest, data };
+}
+
+// TTY text puts the hint on stdout. Piped text leaves stdout alone and prints the hint on stderr. --json carries `hint` and also prints it on stderr.
+function emitWebhook(io: Io, json: boolean, body: any, human: () => string, rich?: () => string): void {
+  const shown = withoutProviderSecret(body);
+  const hints = approvalHints(shown);
+  const hintText = hints.join("\n");
+  if (hintText && (json || !io.tty)) io.err(hintText + "\n");
+  const onStdout = hintText && !json && io.tty ? `\n${hintText}` : "";
+  print(io, json, hintText ? { ...shown, hint: hintText } : shown, () => human() + onStdout, rich ? () => rich() + onStdout : undefined);
+}
+
+// TTY block: known keys in a fixed order, then any key the server added, then instructions. Piped text does not use this.
 function webhookBlock(w: any, now: number): string {
   const pairs: [string, string | null | undefined][] = [];
   const has = (k: string) => w[k] !== undefined;
   for (const k of ["id", "name", "agent"]) if (has(k)) pairs.push([k, clean(w[k])]);
   if (has("full_tools")) pairs.push(["full tools", w.full_tools ? "yes" : "no"]);
+  if (has("mode")) pairs.push(["mode", clean(w.mode)]);
+  if (has("signature")) pairs.push(["signature", w.signature !== null && typeof w.signature === "object" ? JSON.stringify(w.signature) : clean(w.signature)]);
+  if (has("secret_set")) pairs.push(["secret set", w.secret_set == null ? null : clean(w.secret_set)]);
+  if (has("approval")) pairs.push(["approval", clean(w.approval)]);
+  if (has("approved_at")) pairs.push(["approved at", w.approved_at == null ? null : when(w.approved_at, now)]);
+  if (has("created_via")) pairs.push(["created via", w.created_via == null ? null : clean(w.created_via)]);
   if (has("url")) pairs.push(["url", clean(w.url)]);
   const [st, at] = [w.last_delivery_status ?? null, w.last_delivery_at ?? null];
   pairs.push(["last delivery", delivery(st, null, now) + (st !== null && at ? ", " + when(at, now) : "")]);
@@ -120,6 +222,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
   if (argv.length === 1 && argv[0] === "--version") { io.out(`olympus ${VERSION}\n`); return 0; }
   let byId = false; // webhook <verb> <id>: a 404 may be the webhook, not the org, so no stored-org hint
   try {
+    refuseSecretOnArgv(argv);
     let parsed;
     try {
       parsed = parseArgs({ args: argv, options: OPTIONS, strict: true, allowPositionals: true, allowNegative: true });
@@ -132,7 +235,11 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     if (!(pos[0] === "crm" && pos[1] === "pipeline"))
       for (const k of ["stage", "currency"] as const) if (v[k]) (v as Record<string, unknown>)[k] = v[k]!.at(-1);
     // These commands validate no flags of their own: only global + legacy flags are theirs; the modules check the rest.
-    if (["login", "logout", "whoami", "org", "agents", "webhook"].includes(pos[0] ?? "")) {
+    const head = pos[0] ?? "";
+    if (head === "webhook") {
+      const writing = pos[1] === "create" || pos[1] === "update";
+      checkFlags(v, writing ? [...LEGACY, "mode", "signature", "signature-file", "provider-secret-file"] : LEGACY);
+    } else if (["login", "logout", "whoami", "org", "agents"].includes(head)) {
       checkFlags(v, LEGACY);
     }
     if (v.help) { io.out(USAGE); return 0; }
@@ -284,9 +391,12 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       };
     } else if (cmd === "webhook") {
       const wh = async (org: () => Promise<string>, id?: string) => `/orgs/${seg(await org())}/webhooks${id === undefined ? "" : `/${seg(id)}`}`;
-      const row = (w: any) => `${w.id}\t${w.name}\t${w.agent}\t${w.full_tools ? "full-tools" : "-"}\t${w.last_delivery_status ?? "-"}`;
       const rich = (w: any) => webhookBlock(w, now());
-      const detail = (w: any) => Object.entries(w).map(([k, x]) => `${k}: ${x}`).join("\n");
+      const detail = (w: any) => Object.entries(w).filter(([k]) => PIPED_KEYS.has(k)).map(([k, x]) => `${k}: ${x !== null && typeof x === "object" ? JSON.stringify(x) : x}`).join("\n");
+      const readPath = async (path: string, label: string) => {
+        if (path === "-") return io.stdin();
+        try { return await Bun.file(path).text(); } catch { throw usage(`cannot read ${label} file: ${path}`); }
+      };
       const instr = async () => {
         const [t, f] = [v.instructions, v["instructions-file"]];
         if (t !== undefined && f !== undefined) throw usage("give only one of --instructions / --instructions-file");
@@ -294,40 +404,76 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
         if (f === "-") return io.stdin();
         try { return await Bun.file(f).text(); } catch { throw usage(`cannot read instructions file: ${f}`); }
       };
+      // Create and update only. Reads happen before any request; a usage error leaves the server untouched.
+      const writeOpts = async () => {
+        if (v.mode !== undefined && v.mode !== "run" && v.mode !== "inbox") throw usage("--mode must be run or inbox");
+        const [sig, sigFile] = [v.signature, v["signature-file"]];
+        if (sig !== undefined && sigFile !== undefined) throw usage("give only one of --signature / --signature-file");
+        if (sig !== undefined && !PRESETS.includes(sig)) throw usage(`--signature must be one of: ${PRESETS.join(", ")}`);
+        if (v["instructions-file"] === "-" && v["provider-secret-file"] === "-")
+          throw usage("stdin can only supply one of --instructions-file / --provider-secret-file");
+        let signature: string | Record<string, unknown> | undefined = sig;
+        if (sigFile !== undefined) {
+          if (sigFile === "-") throw usage("--signature-file reads a path, not stdin");
+          let parsed: unknown;
+          try { parsed = JSON.parse(await readPath(sigFile, "signature")); } catch (e) { if (e instanceof CliError) throw e; throw usage("signature file is not valid JSON"); }
+          signature = customSignature(parsed);
+        }
+        let providerSecret: string | undefined;
+        const secretFile = v["provider-secret-file"];
+        if (secretFile !== undefined) {
+          if (secretFile === "") throw usage("--provider-secret-file needs a path or -");
+          providerSecret = stripOneTrailingNewline(await readPath(secretFile, "provider secret"));
+          if (providerSecret === "") throw usage("provider secret file is empty");
+        }
+        return {
+          ...(v.mode !== undefined && { mode: v.mode }),
+          ...(signature !== undefined && { signature }),
+          ...(providerSecret !== undefined && { provider_secret: providerSecret }),
+        };
+      };
+      const secretLine = (b: any) => (b.secret == null ? "" : `\nsecret (shown once): ${b.secret}`);
+      const secretRich = (b: any) => (b.secret == null ? "" : `\n\nSigning secret (shown once — store it now; it cannot be read again):\n  ${clean(b.secret)}\n${SIGNING}`);
       if (sub === "list") {
         want(2);
         plan = async (call, org) => {
           const slug = await org();
           const b = await call("GET", await wh(async () => slug));
-          print(io, json, b, () => b.data.map(row).join("\n"), () => b.data.length
-            ? table(["ID", "NAME", "AGENT", "TOOLS", "LAST DELIVERY"], b.data.map((w: any) => [w.id, w.name, w.agent, w.full_tools ? "full" : "-", delivery(w.last_delivery_status, w.last_delivery_at, now())]))
-            : `No webhooks in ${clean(slug)} yet. Create one:\n  olympus webhook create --name NAME --agent PROFILE --instructions TEXT`);
+          const rows: any[] = b.data;
+          const showApproval = rows.some((w) => w.approval !== undefined);
+          const line = (w: any) => [w.id, w.name, w.agent, w.full_tools ? "full-tools" : "-", w.last_delivery_status ?? "-"].join("\t");
+          const none = `No webhooks in ${clean(slug)} yet. Create one:\n  olympus webhook create --name NAME --agent PROFILE --instructions TEXT`;
+          emitWebhook(io, json, b, () => rows.length ? rows.map(line).join("\n") : "", () => rows.length
+            ? table(["ID", "NAME", "AGENT", "TOOLS", "LAST DELIVERY", ...(showApproval ? ["APPROVAL"] : [])], rows.map((w) => [w.id, w.name, w.agent, w.full_tools ? "full" : "-", delivery(w.last_delivery_status, w.last_delivery_at, now()), ...(showApproval ? [w.approval ?? null] : [])]))
+            : none);
         };
       } else if (sub === "get") {
         want(3);
         seg(arg!);
-        plan = async (call, org) => { const b = await call("GET", await wh(org, arg)); print(io, json, b, () => detail(b.data), () => rich(b.data)); };
+        plan = async (call, org) => { const b = await call("GET", await wh(org, arg)); emitWebhook(io, json, b, () => detail(b.data), () => rich(b.data)); };
       } else if (sub === "create") {
         want(2);
         if (!v.name || !v.agent) throw usage("webhook create needs --name and --agent");
         const instructions = await instr();
         if (instructions === undefined) throw usage("webhook create needs --instructions or --instructions-file");
-        const body = { name: v.name, agent: v.agent, instructions, ...(v["full-tools"] === undefined ? {} : { full_tools: v["full-tools"] }) };
+        const extra = await writeOpts();
+        const body = { name: v.name, agent: v.agent, instructions, ...(v["full-tools"] === undefined ? {} : { full_tools: v["full-tools"] }), ...extra };
         plan = async (call, org) => {
           const b = await call("POST", await wh(org), body);
-          print(io, json, b, () => `${detail(b.data)}\nsecret (shown once): ${b.secret}`, () =>
-            `${rich(b.data)}\n\nSigning secret (shown once — store it now; it cannot be read again):\n  ${clean(b.secret)}\n${SIGNING}`);
+          emitWebhook(io, json, b, () => detail(b.data) + secretLine(b), () => rich(b.data) + secretRich(b));
         };
       } else if (sub === "update") {
         want(3);
         seg(arg!);
         const instructions = await instr();
+        const extra = await writeOpts();
         const body = {
           ...(v.name !== undefined && { name: v.name }), ...(v.agent !== undefined && { agent: v.agent }),
           ...(instructions !== undefined && { instructions }), ...(v["full-tools"] !== undefined && { full_tools: v["full-tools"] }),
+          ...extra,
         };
         if (!Object.keys(body).length) throw usage("webhook update needs at least one field to change");
-        plan = async (call, org) => { const b = await call("PATCH", await wh(org, arg), body); print(io, json, b, () => detail(b.data), () => `Updated webhook ${clean(arg)}.\n\n${rich(b.data)}`); };
+        plan = async (call, org) => { const b = await call("PATCH", await wh(org, arg), body); emitWebhook(io, json, b, () => detail(b.data), () => `Updated webhook ${clean(arg)}.\n\n${rich(b.data)}`); };
       } else if (sub === "delete") {
         want(3);
         seg(arg!);
