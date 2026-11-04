@@ -50,10 +50,10 @@ Limit: 60 requests per minute per token.
 GET    /me                          → {data:{user:{email}, memberships:[{org:{slug,name}, role}], token:{name, last4, organization}}}
 GET    /orgs/:org/agents            → {data:[{profile_name, name, paused, primary?, role_line?, created_at?}]}
 
-GET    /orgs/:org/webhooks          → {data:[{id, name, agent, full_tools, url, last_delivery_at, last_delivery_status, created_at}]}
-GET    /orgs/:org/webhooks/:id      → {data:{…, instructions}}
-POST   /orgs/:org/webhooks          {name, agent, instructions, full_tools?}  → 201 {data:{…}, secret}
-PATCH  /orgs/:org/webhooks/:id      {name?, agent?, instructions?, full_tools?} → {data:{…}}
+GET    /orgs/:org/webhooks          → {data:[{id, name, agent, full_tools, url, last_delivery_at, last_delivery_status, created_at, approval, approved_at, created_via}]}
+GET    /orgs/:org/webhooks/:id      → {data:{…, instructions, mode, signature, secret_set}}
+POST   /orgs/:org/webhooks          {name, agent, instructions, full_tools?, mode?, signature?, provider_secret?}  → 201 {data:{…}, secret}
+PATCH  /orgs/:org/webhooks/:id      {name?, agent?, instructions?, full_tools?, mode?, signature?, provider_secret?} → {data:{…}}
 DELETE /orgs/:org/webhooks/:id      → 204
 
 GET    /orgs/:org/people            → {data:[{id, name, kind:"user"|"agent", email?, paused?, me}]}
@@ -88,7 +88,11 @@ GET    /orgs/:org/event_types                            → {data:["task.create
   reading one webhook (its instructions) and every write need `operator`.
 - `agent` is an agent's `profile_name`. `full_tools` defaults to `false`.
 - `primary`, `role_line` and `created_at` on agents are newer servers only; an absent field means unknown.
-- The webhook `secret` is returned once, on create, and cannot be read again.
+- `mode` is `run` or `inbox`. Omit it and the server chooses: `inbox` for an agent-turn token, `run` for a person.
+- `signature` is a preset name or a custom scheme object (see [Delivering to a webhook](#delivering-to-a-webhook)). `provider_secret` is write-only: it is never returned, and it is not a field you put on the command line of the CLI.
+- `approval` is `pending`, `approved` or `rejected`. `approved_at` is when an owner last approved it, or null. `created_via` is `console`, `api_person` or `agent_turn`, or null on a webhook created before this existed.
+- List items carry `approval`, `approved_at` and `created_via`. Reading one webhook also returns `mode`, `signature`, `secret_set` and `instructions`.
+- Create returns `secret` once. It is the generated signing secret for the `olympus` preset, and `null` for every other signature (you set `provider_secret` instead). It cannot be read again.
 
 ## Device login
 
@@ -151,12 +155,25 @@ browsing, so a tight retry loop can lock them out of the app.
 
 ## Delivering to a webhook
 
-`POST` to the webhook's `url` with:
+`POST` the raw body to the webhook's `url`. How you sign it is the webhook's `signature`: a preset name, or a custom scheme object. Header names below are matched case-insensitively; when you send a custom scheme, write them in lowercase.
 
-- `Content-Type: application/json`
-- `X-Webhook-Timestamp`: current unix time in seconds; more than 300 seconds off is rejected.
-- `X-Webhook-Signature-V2`: hex HMAC-SHA256 of `<timestamp>.<raw body>`, keyed with the secret.
-- `X-Request-ID`: unique per event. To retry, sign again with a fresh timestamp and resend the same id.
+A delivery to a webhook whose `approval` is `pending` or `rejected` is refused with HTTP 423 and does not run. A webhook a person creates or edits is `approved` immediately. One an agent creates, and an agent's later edit of the instructions, agent, tools, mode, signature or provider secret, stays `pending` until an owner approves it under **Olympus → Webhooks**. Rejecting a webhook that has never been approved deletes it; rejecting one that was approved stops it and keeps the URL. Fix the webhook and update it to submit it again. While ten webhooks are already pending, another agent create is refused.
+
+### Presets
+
+| Preset | Header | Format | What is signed |
+|---|---|---|---|
+| `olympus` | `X-Webhook-Signature-V2`, timestamp in `X-Webhook-Timestamp` | hex HMAC-SHA256 | `<unix seconds>.<raw body>` |
+| `svix` | `svix-signature`, id `svix-id`, timestamp `svix-timestamp` | one or more `v1,<base64>`, separated by spaces | `<id>.<timestamp>.<raw body>` |
+| `standard-webhooks` | `webhook-signature`, id `webhook-id`, timestamp `webhook-timestamp` | same as `svix` | same as `svix` |
+| `github` | `X-Hub-Signature-256` | `sha256=` + hex HMAC-SHA256 | raw body |
+| `stripe` | `Stripe-Signature` | `t=<unix seconds>,v1=<hex>` (further `v1` values may follow) | `<unix seconds>.<raw body>` |
+| `linear` | `Linear-Signature` | hex HMAC-SHA256 | raw body |
+| `calcom` | `X-Cal-Signature-256` | hex HMAC-SHA256, no prefix | raw body |
+| `circleback` | `X-Signature` | hex HMAC-SHA256, with or without a `sha256=` prefix | raw body |
+| `gitlab-token` | `X-Gitlab-Token` | the header value equals the secret | nothing; the token is compared, not an HMAC |
+
+The `olympus` secret is generated for you and returned once on create (`X-Request-ID` is the event id; to retry, sign again with a fresh timestamp and resend the same id). Every other preset returns `secret: null`. You set the provider's secret as `provider_secret`. `svix` and `standard-webhooks` take a `whsec_` secret (the key is the base64 after that prefix, or the raw string when it does not start with `whsec_`). Every other non-olympus preset uses the raw secret string, including Stripe's `whsec_…`. A timestamp more than 300 seconds off is rejected. A non-olympus webhook with no secret set rejects the delivery.
 
 ```sh
 TS=$(date +%s)
@@ -169,6 +186,46 @@ curl -X POST "$WEBHOOK_URL" \
   -H "X-Request-ID: $(uuidgen)" \
   --data "$BODY"
 ```
+
+That example is the `olympus` preset. For any other preset, sign the way the table says and send the provider's headers.
+
+### Custom schemes
+
+`signature` may be an object instead of a preset name. `kind` is `hmac` or `token`. Header names are lowercase. These names are rejected: `cookie`, `proxy-authorization`, `host`, `connection`, `keep-alive`, `content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `expect`, `via`, `forwarded`, `x-real-ip`, `version`, and any name starting with `x-forwarded-`, `fly-` or `x-olympus-`.
+
+HMAC. `encoding` is `hex` or `base64`. `signed` is `body` (the raw body), `ts.body` (`<timestamp>.<raw body>`, and `timestamp_header` is required) or `id.ts.body` (`<id>.<timestamp>.<raw body>`, and both `id_header` and `timestamp_header` are required). `prefix` is optional text removed from the front of the header value before comparing. `tolerance_s` defaults to 300.
+
+```json
+{"kind":"hmac","header":"x-signature","encoding":"hex","prefix":"sha256=","signed":"body"}
+```
+
+```json
+{"kind":"hmac","header":"x-signature","encoding":"base64","signed":"ts.body","timestamp_header":"x-timestamp","tolerance_s":300}
+```
+
+```json
+{"kind":"hmac","header":"x-signature","encoding":"hex","signed":"id.ts.body","timestamp_header":"x-timestamp","id_header":"x-request-id"}
+```
+
+Token. The header value is compared to `provider_secret`. Nothing is hashed. `prefix` is optional: a string of at most 32 printable ASCII characters, and it may end in a space. When it is set, the header value must start with that prefix and the remainder is compared to `provider_secret`.
+
+```json
+{"kind":"token","header":"x-webhook-token"}
+```
+
+```json
+{"kind":"token","header":"authorization","prefix":"Bearer "}
+```
+
+`authorization` is allowed as that header. The platform reads the inbound `Authorization` value (for example `Bearer …`) for a token or custom scheme that names it.
+
+### Approval
+
+`approval` on each webhook is `pending`, `approved` or `rejected`.
+
+- `pending` — an owner must approve it in **Olympus → Webhooks** before a delivery is accepted. The CLI prints `an owner must approve this in Olympus → Webhooks` on stdout at a terminal, and on stderr when stdout is piped or `--json` is set (`--json` also returns it as `hint`).
+- `approved` — deliveries are checked against the signature and then run or stored, following `mode`.
+- `rejected` — an owner rejected it. The CLI prints `an owner rejected this; fix it and update to resubmit` on stdout at a terminal, and on stderr when stdout is piped or `--json` is set. A later update submits it for approval again.
 
 ## Tasks
 

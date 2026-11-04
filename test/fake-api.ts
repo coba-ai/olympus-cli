@@ -67,6 +67,7 @@ const AGENTS = [
 // ApiBase's wording, byte for byte (BaseController at 439af0d6)
 const NOT_FOUND = "Not found";
 const MAX_INSTRUCTIONS = 8000;
+const WEBHOOK_PRESETS = new Set(["olympus", "svix", "standard-webhooks", "github", "stripe", "linear", "calcom", "circleback", "gitlab-token"]);
 const WHO: Record<string, { email: string; roles: Record<string, string>; pin: string | null }> = {
   [TOKENS.owner]: { email: "owner@acme.test", roles: { acme: "operator" }, pin: null },
   [TOKENS.teammate]: { email: "mate@acme.test", roles: { acme: "teammate" }, pin: null },
@@ -796,7 +797,9 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();
       if (sub === "people" || sub === "tasks" || sub === "tags" || sub === "days") return tasksRoute();
       const list = state.webhooks[org!] ?? (state.webhooks[org!] = []);
-      const strip = ({ instructions, ...rest }: Webhook) => rest;
+      // provider_secret is accepted and never stored or returned. instructions stay off the list.
+      const publish = ({ provider_secret, ...rest }: Webhook) => rest;
+      const strip = ({ instructions, provider_secret, ...rest }: Webhook) => rest;
 
       if (!id && req.method === "GET") return send(200, { data: list.map(strip) });
       if (!id && req.method === "POST") {
@@ -810,17 +813,22 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         if (ie) f.instructions = ie;
         if (Object.keys(f).length) return invalid(f);
         const wid = `wh_${n++}`;
+        const createdAt = new Date().toISOString();
         const w: Webhook = {
           id: wid, name: b.name.trim(), agent: b.agent, full_tools: b.full_tools ?? false,
           url: `${server.url}hooks/${wid}`, last_delivery_at: null, last_delivery_status: null,
-          created_at: new Date().toISOString(), instructions: b.instructions,
+          created_at: createdAt, approval: "approved", approved_at: createdAt, created_via: "api_person",
         };
+        if (b.mode !== undefined) w.mode = b.mode;
+        if (b.signature !== undefined) w.signature = b.signature;
+        w.instructions = b.instructions;
         list.push(w);
-        return send(201, { data: strip(w), secret: `whsec_${randomBytes(8).toString("hex")}` }, { "Cache-Control": "no-store" });
+        const olympus = b.signature === undefined || b.signature === "olympus";
+        return send(201, { data: strip(w), secret: olympus ? `whsec_${randomBytes(8).toString("hex")}` : null }, { "Cache-Control": "no-store" });
       }
       const w = list.find((x) => x.id === id);
       if (!w) return notFound();
-      if (req.method === "GET") return operator ? send(200, { data: w }, { "Cache-Control": "no-store" }) : forbidden();
+      if (req.method === "GET") return operator ? send(200, { data: publish(w) }, { "Cache-Control": "no-store" }) : forbidden();
       if (req.method === "DELETE") {
         if (!operator) return forbidden();
         list.splice(list.indexOf(w), 1);
@@ -840,6 +848,9 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         if (Object.keys(f).length) return invalid(f);
         for (const k of ["name", "agent", "full_tools"]) if (k in b) w[k] = k === "name" ? b[k].trim() : b[k];
         if (b.instructions != null) w.instructions = b.instructions;
+        if ("mode" in b) w.mode = b.mode;
+        if ("signature" in b) w.signature = b.signature;
+        delete w.provider_secret;
         return send(200, { data: strip(w) });
       }
       return notFound();
@@ -1087,6 +1098,13 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         const f: Record<string, string[]> = {};
         for (const k of ["name", "agent", "instructions"]) if (b[k] != null && typeof b[k] !== "string") f[k] = ["must be a string"];
         if ("full_tools" in b && typeof b.full_tools !== "boolean") f.full_tools = ["must be true or false"];
+        if ("mode" in b && b.mode !== "run" && b.mode !== "inbox") f.mode = ["must be run or inbox"];
+        if ("signature" in b) {
+          const s = b.signature;
+          if (typeof s === "string") { if (!WEBHOOK_PRESETS.has(s)) f.signature = ["is not a known preset"]; }
+          else if (s == null || typeof s !== "object" || Array.isArray(s)) f.signature = ["must be a preset name or an object"];
+        }
+        if ("provider_secret" in b && b.provider_secret != null && typeof b.provider_secret !== "string") f.provider_secret = ["must be a string"];
         return Object.keys(f).length ? f : null;
       }
       // OrgWebhook validations: name length 1..80 after strip; agent must exist, and must not be paused.
