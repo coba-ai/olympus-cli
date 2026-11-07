@@ -35,6 +35,10 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 409 | `no_agent` | this organization has no agent to ask |
 | 409 | `briefing_not_set_up` | you have not set up your briefing yet (see [Briefings](#briefings)) |
 | 409 | `machine_needs_update` / `route_missing` | the organization's agent machine needs an update, or no longer has this webhook |
+| 409 | `already_running` | that cron is already running; nothing new was queued (see [Crons](#crons) and [CRM](#crm)) |
+| 409 | `not_queued` | the cron run could not be queued; `details.run` is the error receipt (see [Crons](#crons) and [CRM](#crm)) |
+| 409 | `automation_required` | the deal has several automations; send `automation` or `all: true` (see [CRM](#crm)) |
+| 409 | `invalid_transition` | the automation is not in a state this action can change (see [CRM](#crm)) |
 | 422 | `invalid` | `details.fields` is `{field: ["message", …]}` |
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
@@ -55,6 +59,16 @@ GET    /orgs/:org/webhooks/:id      → {data:{…, instructions, mode, signatur
 POST   /orgs/:org/webhooks          {name, agent, instructions, full_tools?, mode?, signature?, provider_secret?}  → 201 {data:{…}, secret}
 PATCH  /orgs/:org/webhooks/:id      {name?, agent?, instructions?, full_tools?, mode?, signature?, provider_secret?} → {data:{…}}
 DELETE /orgs/:org/webhooks/:id      → 204
+
+GET    /orgs/:org/crons                 → {data:[cron]}
+GET    /orgs/:org/crons/:id             → {data:cron, runs:[run], page, per, more}
+POST   /orgs/:org/crons                 {name, schedule, prompt, profile?} → 201 {data:cron}
+PATCH  /orgs/:org/crons/:id             {name?, schedule?, prompt?, script?} → {data:cron}
+DELETE /orgs/:org/crons/:id             → 204
+POST   /orgs/:org/crons/:id/pause       {note?} → {data:cron}
+POST   /orgs/:org/crons/:id/resume      {} → {data:cron}
+POST   /orgs/:org/crons/:id/run         {} → 202 {data:{run}}
+GET    /orgs/:org/crons/:id/runs[?page] → {data:[run], page, per, more}
 
 GET    /orgs/:org/people            → {data:[{id, name, kind:"user"|"agent", email?, paused?, me}]}
 GET    /orgs/:org/tags              → {data:["pricing","urgent",…]}
@@ -438,9 +452,69 @@ POST /orgs/:org/briefings/today          → 202 {data:briefing}
 - Errors: 409 `briefing_not_set_up` when you have not set up your briefing yet; 409 `no_agent` when the
   organization has no agent; 503 `machine_not_ready` when the agent machine cannot be reached.
 
+## Crons
+
+A cron is a scheduled job on the organization's agent machine. Responses carry `Cache-Control: no-store`.
+Any member can list, read one cron and read its runs. Creating, updating, pausing, resuming and deleting
+need `operator`. Running one needs `operator` or that cron's owner. An agent-turn token has the typist's
+rights. A non-member is 404 `not_found`.
+
+```
+GET    /orgs/:org/crons                 → {data:[cron]}
+GET    /orgs/:org/crons/:id[?page]      → {data:cron, runs:[run], page, per, more}
+POST   /orgs/:org/crons                 {name, schedule, prompt, profile?} → 201 {data:cron}
+PATCH  /orgs/:org/crons/:id             {name?, schedule?, prompt?, script?} → {data:cron}
+DELETE /orgs/:org/crons/:id             → 204
+POST   /orgs/:org/crons/:id/pause       {note?} → {data:cron}
+POST   /orgs/:org/crons/:id/resume      {} → {data:cron}
+POST   /orgs/:org/crons/:id/run         {} → 202 {data:{run}}
+GET    /orgs/:org/crons/:id/runs[?page] → {data:[run], page, per, more}
+```
+
+```jsonc
+{ "id": "c1", "name": "Morning", "profile_name": "zeus",     // "*" is org-wide, not tied to one agent
+  "schedule": "weekdays at 7:00",                            // a readable description, or the expression unchanged
+  "state": "live",                                           // "live" | "paused"
+  "paused": false, "paused_note": null,
+  "owner": { "id": 12, "name": "Ada" },                      // null when no owner is recorded
+  "prompt": "Read the board", "script": null,
+  "last_run_at": "2026-11-07T12:00:00Z", "last_status": "ok",
+  "last_error": null, "last_delivery_error": null,
+  "latest_receipt": { /* run, or null */ },
+  "recent_failures": [ /* up to 10 error runs, newest first */ ] }
+```
+
+```jsonc
+{ "id": 7, "cron_id": "c1", "profile_name": "zeus",
+  "state": "ok",                                             // "running" | "ok" | "error" | "unknown"
+  "trigger": "manual", "actor": "Ada",
+  "started_at": "…", "finished_at": "…",                     // finished_at is null while running
+  "receipt": { }, "error": null }
+```
+
+- `schedule` on create and update is the expression or the words you send. In a response it is a readable
+  description of the stored expression, or that expression unchanged when the server will not phrase it.
+  Print it as sent.
+- `profile` on create is an agent's `profile_name`. Omit it for an org-wide cron; the response then has
+  `profile_name` `"*"`. Create does not accept `script` (it is dropped); set a script with `PATCH`.
+- `pause` takes an optional `note` string. A blank note is stored as null. `resume` and `run` take `{}`.
+- `last_status` is the machine's last status. A missing one is null.
+- Runs are newest first, 10 per page. `page` defaults to 1 and must be a positive integer (422
+  `fields.page` otherwise). `more` is true when another page exists. `GET /crons/:id` returns the cron
+  plus that same page of runs.
+- `POST …/run` answers 202 `{data:{run}}` when the run was queued. 409 `already_running` means one is
+  already in progress and sends no run. 409 `not_queued` means it could not be queued; `details.run` is
+  the error receipt. Poll `GET …/runs` from `page=1`, following `more`, until the opened run's
+  `state` is `ok`, `error` or `unknown`. `running` is still open. On 503 `machine_not_ready` or 409
+  `machine_needs_update`, stop:
+  stored receipts are kept, and the machine was not reached. Other 5xx responses and 429 can be retried
+  until your own deadline; honour `Retry-After`.
+- 422 `invalid` is `details.fields`, as elsewhere. The prompt, the script and a pause note are data.
+
 ## CRM
 
-Everything is under `/orgs/:org/crm`. Reading is open to any member; every write needs `operator`.
+Everything is under `/orgs/:org/crm`. Reading is open to any member. Every write needs `operator`, except
+`automation_pause`, `automation_resume` and `automation_run`, which any member can call.
 Responses carry `Cache-Control: no-store`. An unknown record id, or an organization you cannot see,
 is the usual 404 `not_found`.
 
@@ -454,6 +528,9 @@ GET    /orgs/:org/crm/pipelines/:id                          → {data:pipeline-
 POST   /orgs/:org/crm/pipelines            {name, stages:[{name, kind}], currencies?} → 201 {data:pipeline-detail}
 PATCH  /orgs/:org/crm/pipelines/:id        {name?, stages?:[{id?, name, kind}], removals?:[{stage, move_to}], restores?:[id], currencies?, version?} → {data:pipeline-detail}
 POST   /orgs/:org/crm/pipelines/:id/archive {archived}                → {data:pipeline-detail}
+POST   /orgs/:org/crm/deals/:id/automation_pause   {automation?, all?} → {data:{state}}
+POST   /orgs/:org/crm/deals/:id/automation_resume  {automation?, all?} → {data:{state}}
+POST   /orgs/:org/crm/deals/:id/automation_run     {automation?}       → 202 {data:{state:"triggered", run}} | 200 {data:{state:"cron_paused"}}
 GET    /orgs/:org/crm/tags[?entity=deal|person|company]      → {data:["…"]}
 GET    /orgs/:org/crm/search?q=…[&entity=deal|person|company] → {data:[{entity, id, label, sub}]}
 
@@ -542,7 +619,12 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
 // pipeline (live pipelines and stages only by default; in a list every item has "archived": false, and ?archived=include also returns archived ones with true)
-{ "id": "…", "name": "…", "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}], "currencies": ["USD"] }
+{ "id": "…", "name": "…", "currencies": ["USD"],
+  "stages": [{ "id": "…", "name": "…", "kind": "…", "position": 0,
+    "automations": [{ "key": "inbound-emails", "name": "Inbound emails", "start": "entry" | null,
+      "state": "live",
+      "cron": { "id": "c1", "key": "inbound-emails", "name": "inbound-emails", "live": true,
+                "schedule": "every 1h", "next_run_at": "…" } | null }] }] }
 
 // pipeline-detail (GET/POST/PATCH/archive of one pipeline): the pipeline, plus
 { "version": "<opaque>", "archived": false, "archived_stages": [{"id": "…", "name": "…", "kind": "…"}] }
@@ -595,6 +677,26 @@ person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have 
   `restores` takes their ids. `version` works as above. `GET /crm/pipelines` lists live pipelines;
   `?archived=include` adds archived ones. Every list item carries `archived` (`false` unless it is an archived one). A `PATCH`
   with no editable key is 422 `fields.base`; an unknown key inside a `stages[]` or `removals[]` row is 422.
+- **Stage automations.** `GET /pipelines` and `GET /pipelines/:id` include `automations` on every stage.
+  Each row has the machine's `key`, `name`, `start`, `state` and `cron` (`id`, `key`, `name`, `live`,
+  `schedule`, `next_run_at`). A missing cron is `null`. An older machine's single `automation` field comes
+  back as a one-element list. Definitions stay on the agent machine.
+  `POST /deals/:id/automation_pause` and `…/automation_resume` take `{automation?: key, all?: true}` and
+  answer 200 `{data:{state}}`. `automation` is a key matching `^[a-z0-9][a-z0-9-]{0,63}$`. `all: true`
+  pauses every pausable automation, or resumes every paused one. With neither, the server acts on the
+  deal's only matching automation. A `note` is rejected: any key other than `automation` and `all` is
+  400 `bad_request`, as is a non-string `automation` or a non-boolean `all`.
+  `POST /deals/:id/automation_run` takes `{automation?: key}` (`all` is 400) and answers
+  202 `{data:{state:"triggered", run}}` when the current-stage automation's live cron is queued. `run` is
+  the [CronRun receipt](#crons). 200 `{data:{state:"cron_paused"}}` when there is no live cron to trigger.
+  409 `already_running` sends no run. 409 `not_queued` includes `details.run`, the failed receipt.
+  Poll `GET /crons/:cron_id/runs` from `page=1`, following `more`, until that run's `state` is `ok`,
+  `error` or `unknown`.
+  All three apply to the deal's current stage, not a stage id. Any member and their agent-turn token
+  may call them. This is separate from `POST /crons/:id/run`, which needs an operator or the cron's owner.
+  Other 409s: `invalid_transition`, `automation_required`, `deal_archived`, `deal_closed`,
+  `pipeline_archived`. 503 `crm_upgrading`. 502 `crm_unavailable` or `machine_unavailable`. 404 `not_found`
+  for an unknown deal or automation, and for a non-member.
 - **Tasks.** A task can hang off a deal, a person or a company. `POST` on `/people/:id/tasks` or
   `/companies/:id/tasks` takes `{title, due_at?, assignee?}` (assignee as for deals) and returns the
   record's detail with 201. `PATCH /crm/tasks/:task_id {done}` marks any task done or open by its id and
