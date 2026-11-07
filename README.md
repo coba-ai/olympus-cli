@@ -37,6 +37,11 @@ olympus webhook create --name N --agent PROFILE (--instructions T | --instructio
                        [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
 olympus webhook update <id> [--name] [--agent] [--instructions|--instructions-file] [--[no-]full-tools]
                        [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
+olympus crons list | get <id> [--page N] | runs <id> [--page N]
+olympus crons create --name N (--schedule T | --schedule-file PATH|-) (--instructions T | --instructions-file PATH|-) [--profile P]
+olympus crons update <id> [--name N] [--schedule T | --schedule-file PATH|-] [--instructions T | --instructions-file PATH|-]
+                         [--script T | --script-file PATH|-]
+olympus crons pause <id> [--note T] | resume <id> | delete <id> --yes | run <id> [--wait] [--timeout SECONDS]
 olympus people                      # members, then agents (ids, kind, email, paused)
 olympus tags                        # the organization's tags, most used first
 olympus tasks | task list [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today] [--tag T]... [--backlog]
@@ -93,6 +98,19 @@ Global flags: `--json`, `--host URL`, `--org SLUG`, `-h/--help`. No flag takes a
 `delete` never prompts and requires `--yes`.
 When `approval` is `pending`, a terminal says `an owner must approve this in Olympus → Webhooks` on stdout, and `--json` puts that sentence in a top-level `hint`. When it is `rejected`, the sentence is `an owner rejected this; fix it and update to resubmit`. Piped stdout does not include the hint or the newer fields (`approval`, `approved_at`, `created_via`, `mode`, `signature`, `secret_set`, or anything else the server adds); the hint goes to stderr instead, including under `--json`.
 Roles are `operator` and `teammate`; a teammate cannot `webhook get` (exit 4) or write.
+
+Crons are scheduled jobs on the organization's agent machine. Any member can `list`, `get` and `runs`.
+`create`, `update`, `pause`, `resume` and `delete` need `operator` (exit 4 otherwise). `run` needs
+`operator` or the cron's owner. A non-member is exit 3. `create` and `update` take the schedule and the
+instructions as a flag or a file (`-` is stdin); one trailing newline is removed, an empty value is a
+usage error, and the flag and the file cannot both be given. Stdin can supply only one of them.
+`--script` is update only. `--profile` on create names the agent; omit it for an org-wide cron
+(`profile_name` `*` in the response). `delete` needs `--yes`. `run` returns once the run is accepted.
+`--wait` polls until that run's state is `ok`, `error` or `unknown`, or until `--timeout` (default 300
+seconds, at most 86400). A finished run is exit 0 whatever its state: read `state`. A timeout is exit 5
+`timeout`, and the message names `olympus crons runs <id>`. Ctrl-C is exit 130 and says whether the run
+was started. `create` is not idempotent: after exit 5, list before creating again. 409 `already_running`
+and `not_queued` are exit 5 (`not_queued` includes `details.run`). 422 `invalid` is exit 6.
 
 Tasks: any member, teammate included, can read and write them. Every `task` subcommand (and `tasks`) takes
 `--week DATE`: any date works, the server normalises it to that week's Monday, and the default is the
@@ -306,7 +324,7 @@ Human mode depends on where stdout goes. On a terminal you get headers, aligned 
 times ("3h ago"; a time in the future reads `+5m`, `+3h` or `+8d`, and beyond 30 days it is the ISO date, while piped and `--json` output are unaffected), a `*` on the default org in `org list`, and full-sentence confirmations; control
 characters in server text are stripped from stdout on a terminal and server text in error messages is cleaned on stderr too (except with `--json`, where stderr is the error body as sent). Piped or redirected, you get plain tab-separated lines that
 scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
-emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms, only when the response's `secret` is not null. `--json` prints the API body as-is (two exceptions: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent; a webhook whose `approval` is `pending` or `rejected` adds a top-level `hint` with the sentence to show a person, and prints that same sentence on stderr), one compact line
+emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms, only when the response's `secret` is not null. `--json` prints the API body as-is (three exceptions: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent; a webhook whose `approval` is `pending` or `rejected` adds a top-level `hint` with the sentence to show a person, and prints that same sentence on stderr; `crons run --wait` prints `{data:{run}}` for the closed receipt, the same shape as the 202, rather than the runs page it polled), one compact line
 (`org list` → `{data:[…]}`, `org use` → `{data:{org}}`, `delete` → `{data:{id,deleted:true}}`,
 `logout` → `{data:{deleted}}`, `task delete` and `subscription delete` → `{data:{id,deleted:true}}`; `task delegate`, `task breakdown`, `day …` → the response body; `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
 usage errors are `{"error":{"code":"usage",…}}`. A token is never printed.
@@ -372,6 +390,18 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `rotate-secret` add a last line `secret (shown once): <secret>`. `subscription delete` prints `deleted <id>`.
 - `subscription ping`: `delivered: true|false`, `status:` (HTTP status or `-`), `error:` (or `-`).
 - `event-types`: one event name per line.
+- `crons list`: `id  state  profile_name  owner-id|-  last_run_at|-  last_result|-  failure-count|-  schedule  name  prompt`.
+  `state` is `live` or `paused`. `profile_name` `*` is org-wide. The prompt is last, so it may contain spaces.
+  An empty list prints nothing.
+- `crons get`, and `create`, `update`, `pause` and `resume`: `field: value` for `id`, `name`, `profile_name`,
+  `schedule`, `state`, `paused` (`true` or `false`), `paused_note`, `owner` (the owner id), `prompt`, `script`,
+  `last_run_at`, `last_result`, `last_error`, `last_delivery_error`, and `latest_receipt` (one tab-separated
+  run, or `-`). Then one `failure:` line per recent failure. `get` also prints one `run:` line per run on
+  that page. A run's cells are `id  state  trigger  actor  started_at  finished_at  error` (empty prints `-`).
+- `crons run`, including a finished `--wait`: `id:`, `cron_id:`, `profile_name:`, `state:`, `trigger:`,
+  `actor:`, `started_at:`, `finished_at:`, `error:`. The receipt object is on a terminal and in `--json` only.
+- `crons runs`: one tab row per run, those same cells, one page. `--json` carries `page`, `per` and `more`.
+- `crons delete` prints `deleted <id>`; `--json` is `{"data":{"id":"…","deleted":true}}`.
 - `day list`: five rows, Monday to Friday, `day<TAB>closed|draft|-<TAB>score|-<TAB>shipped|-`
   (`draft` = saved but not closed, `-` = nothing saved).
 

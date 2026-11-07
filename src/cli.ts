@@ -9,6 +9,7 @@ import { askPlan } from "./ask";
 import { briefingPlan } from "./briefing";
 import { browserPlan } from "./browser";
 import { crmPlan } from "./crm";
+import { cronsPlan } from "./crons";
 import { dayPlan } from "./days";
 import { sessionsPlan } from "./sessions";
 import { subscriptionPlan } from "./subscriptions";
@@ -23,6 +24,11 @@ const USAGE = `usage: olympus <command> [flags]
       [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
   webhook update <id> [--name N] [--agent P] [--instructions T | --instructions-file PATH|-] [--[no-]full-tools]
       [--mode run|inbox] [--signature PRESET | --signature-file PATH] [--provider-secret-file PATH|-]
+  crons list | get <id> [--page N] | runs <id> [--page N]
+  crons create --name N (--schedule T | --schedule-file PATH|-) (--instructions T | --instructions-file PATH|-) [--profile P]
+  crons update <id> [--name N] [--schedule T | --schedule-file PATH|-] [--instructions T | --instructions-file PATH|-]
+      [--script T | --script-file PATH|-]
+  crons pause <id> [--note T] | resume <id> | delete <id> --yes | run <id> [--wait] [--timeout SECONDS]
   people | tasks [--week D] [--mine | --who ID|me|EMAIL] [--open | --done] [--today] [--tag T]... [--backlog]   (alias: task list)
   tags   (org tags, most used first)
   task get <id> | add TEXT | update <id> | done <id> | undone <id> | today <id> | star <id> | delete <id> --yes
@@ -82,6 +88,8 @@ const OPTIONS = {
     "person-email lost-reason version new email due phone job-title linkedin-url notes domain website industry city url").split(" ")
     .map((k) => [k, { type: "string" }])),
   mode: { type: "string" }, signature: { type: "string" }, "signature-file": { type: "string" }, "provider-secret-file": { type: "string" },
+  schedule: { type: "string" }, "schedule-file": { type: "string" }, script: { type: "string" }, "script-file": { type: "string" },
+  profile: { type: "string" }, note: { type: "string" },
   event: { type: "string", multiple: true }, "allow-origin": { type: "string", multiple: true },
   session: { type: "string" }, timeout: { type: "string" }, after: { type: "string" }, day: { type: "string" },
   wait: { type: "boolean" }, closed: { type: "boolean" }, all: { type: "boolean" }, request: { type: "boolean" },
@@ -247,7 +255,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     const [cmd, sub, arg] = pos;
     byId = (cmd === "webhook" && arg !== undefined) || (cmd === "task" && pos.length >= 3 && sub !== "list" && sub !== "add") ||
       (cmd === "crm" && pos.length >= 4 && pos[2] !== "add") || (cmd === "subscription" && pos.length >= 3 && sub !== "create") ||
-      (cmd === "session" && pos.length >= 3) || (cmd === "ask" && v.session !== undefined);
+      (cmd === "session" && pos.length >= 3) || (cmd === "ask" && v.session !== undefined) ||
+      (cmd === "crons" && pos.length >= 3);
     const want = (n: number) => { if (pos.length !== n) throw usage(`expected ${n} argument(s) in: ${pos.join(" ")}`); };
     const now = () => (io.now ?? Date.now)();
     const warnEnv = () => { if (envKey(io)) io.err("warning: OLYMPUS_API_KEY is set and overrides stored credentials\n"); };
@@ -483,6 +492,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
           print(io, json, { data: { id: arg, deleted: true } }, () => `deleted ${arg}`, () => `Deleted webhook ${clean(arg)}.`);
         };
       } else throw usage(`unknown webhook command: ${sub ?? ""}`);
+    } else if (cmd === "crons") {
+      plan = await cronsPlan(pos, v, io, json, now, signal);
     } else if (cmd === "people" || cmd === "tasks" || cmd === "task" || cmd === "tags") {
       plan = taskPlan(pos, v, io, json, now);
     } else if (cmd === "day") {
@@ -507,7 +518,9 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     host = resolveHost(v.host, io, creds);
     // A stored org belongs to the host it was saved for.
     const scoped: Creds = { ...creds, org: creds.host === host ? creds.org : undefined };
-    const call = api(host, resolveToken(host, io, creds), undefined, cmd === "ask" ? signal : undefined);
+    // ask, and `crons run --wait`, are the commands a Ctrl-C must stop without leaving the request hung.
+    const long = cmd === "ask" || (cmd === "crons" && v.wait === true);
+    const call = api(host, resolveToken(host, io, creds), undefined, long ? signal : undefined);
     let meCache: Promise<Me> | undefined;
     const me = () => (meCache ??= call("GET", "/me").then((b) => b.data as Me));
     const org = async () => {
@@ -516,7 +529,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       if (r.from === "stored") orgFromCreds = r.slug;
       return r.slug;
     };
-    if (cmd !== "ask") {
+    if (!long) {
       await plan(call, org, creds, me, scoped);
       return 0;
     }
