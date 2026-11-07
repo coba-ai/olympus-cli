@@ -107,8 +107,8 @@ instructions as a flag or a file (`-` is stdin); one trailing newline is removed
 usage error, and the flag and the file cannot both be given. Stdin can supply only one of them.
 `--script` is update only. `--profile` on create names the agent; omit it for an org-wide cron
 (`profile_name` `*` in the response). `delete` needs `--yes`. `run` returns once the run is accepted.
-`--wait` polls until that run's state is `ok`, `error` or `unknown`, or until `--timeout` (default 300
-seconds, at most 86400). A finished run is exit 0 whatever its state: read `state`. A timeout is exit 5
+`--wait` polls that cron's runs, following later pages while `more` is set, until that run's state is
+`ok`, `error` or `unknown`, or until `--timeout` (default 300 seconds, at most 86400). A finished run is exit 0 whatever its state: read `state`. A timeout is exit 5
 `timeout`, and the message names `olympus crons runs <id>`. Ctrl-C is exit 130 and says whether the run
 was started. `create` is not idempotent: after exit 5, list before creating again. 409 `already_running`
 and `not_queued` are exit 5 (`not_queued` includes `details.run`). 422 `invalid` is exit 6.
@@ -162,7 +162,7 @@ be named in `--remove STAGE_ID:MOVE_TO_ID`, which moves its deals to `MOVE_TO_ID
 otherwise (exit 6). `--restore ID` brings back an archived stage. `--currency` is repeatable and replaces the list.
 `--version V` works as on records.
 
-Stage automations are part of each pipeline stage: `pipelines` and `pipeline get` show the automation key, its state, and the cron that runs (live or paused). `crm automation pause`, `resume` and `run` act on the deal's **current** stage. Any member can run them. `--automation KEY` names one key (`a-z`, `0-9` and `-`, 1–64 characters, starting with a letter or digit). `--all` on pause and resume covers every automation that action can change. With neither flag, the server acts when the deal has exactly one and answers 409 `automation_required` when it has several. Pause takes no note: `--note` is a usage error and is not sent. `run` does not take `--all`. It returns that cron's run receipt (the same fields as `crons run`). `run --wait` polls `crons` runs for that receipt until it closes, with the same timeout as `crons run --wait` (default 300s, at most 86400). A cron that is not live answers `state: cron_paused` and queues nothing. These commands send no idempotency key. 409 `already_running` and `not_queued` are exit 5, and `not_queued` includes `details.run` in `--json`.
+Stage automations are part of each pipeline stage: `pipelines` and `pipeline get` show the automation key, its state, and the cron that runs (live or paused). `crm automation pause`, `resume` and `run` act on the deal's **current** stage. Any member can run them. `--automation KEY` names one key (`a-z`, `0-9` and `-`, 1–64 characters, starting with a letter or digit). `--all` on pause and resume covers every automation that action can change. With neither flag, the server acts when the deal has exactly one and answers 409 `automation_required` when it has several. Pause takes no note: `--note` is a usage error and is not sent. `run` does not take `--all`. It returns that cron's run receipt (the same fields as `crons run`). `run --wait` polls `crons` runs for that receipt, including later pages, until it closes, with the same timeout as `crons run --wait` (default 300s, at most 86400). A cron that is not live answers `state: cron_paused` and queues nothing. These commands send no idempotency key. 409 `already_running` and `not_queued` are exit 5, and `not_queued` includes `details.run` in `--json`.
 
 Idempotent creates: `deal|person|company add`, `deal note`, `deal|person|company task add` and `pipeline add`
 each send a fresh random `Idempotency-Key`. `--idempotency-key K` (1-128 characters from `A-Z a-z 0-9 _ . : -`)
@@ -402,12 +402,12 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `rotate-secret` add a last line `secret (shown once): <secret>`. `subscription delete` prints `deleted <id>`.
 - `subscription ping`: `delivered: true|false`, `status:` (HTTP status or `-`), `error:` (or `-`).
 - `event-types`: one event name per line.
-- `crons list`: `id  state  profile_name  owner-id|-  last_run_at|-  last_result|-  failure-count|-  schedule  name  prompt`.
+- `crons list`: `id  state  profile_name  owner-id|-  last_run_at|-  last_status|-  failure-count|-  schedule  name  prompt`.
   `state` is `live` or `paused`. `profile_name` `*` is org-wide. The prompt is last, so it may contain spaces.
   An empty list prints nothing.
 - `crons get`, and `create`, `update`, `pause` and `resume`: `field: value` for `id`, `name`, `profile_name`,
   `schedule`, `state`, `paused` (`true` or `false`), `paused_note`, `owner` (the owner id), `prompt`, `script`,
-  `last_run_at`, `last_result`, `last_error`, `last_delivery_error`, and `latest_receipt` (one tab-separated
+  `last_run_at`, `last_status`, `last_error`, `last_delivery_error`, and `latest_receipt` (one tab-separated
   run, or `-`). Then one `failure:` line per recent failure. `get` also prints one `run:` line per run on
   that page. A run's cells are `id  state  trigger  actor  started_at  finished_at  error` (empty prints `-`).
 - `crons run`, including a finished `--wait`: `id:`, `cron_id:`, `profile_name:`, `state:`, `trigger:`,

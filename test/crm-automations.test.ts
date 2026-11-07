@@ -238,6 +238,33 @@ test("run --wait polls GET /crons/:id/runs and stops on a timeout or a dead mach
   expect(r.err).toContain("Couldn't reach your agent's machine.");
 });
 
+test("run --wait follows more pages until the receipt is found", async () => {
+  let clock = NOW;
+  const sleeps: number[] = [];
+  const sleep: Io["sleep"] = async (ms) => { sleeps.push(ms); clock += ms; };
+  const target = { ...RUN, id: 9 };
+  fake.state.onRequest = () => {
+    const q = reqs()[reqs().length - 1]!;
+    if (q.path.endsWith("/automation_run")) {
+      fake.state.next = { status: 202, body: { data: { state: "triggered", run: running(9) } } };
+      return;
+    }
+    fake.state.next = q.search === "?page=2"
+      ? { status: 200, body: { data: [target], page: 2, per: 10, more: false } }
+      : { status: 200, body: { data: [running(100)], page: 1, per: 10, more: true } };
+  };
+  const r = await auto(["run", "d_renewal", "--wait", "--timeout", "5"], { sleep, now: () => clock });
+  expect(r.code).toBe(0);
+  expect(sleeps).toEqual([]);
+  expect(r.out).toContain("id: 9\n");
+  expect(r.out).toContain("state: ok\n");
+  expect(reqs().map((q) => `${q.method} ${q.path}${q.search}`)).toEqual([
+    `POST ${P}/automation_run`,
+    "GET /api/v1/orgs/acme/crons/c1/runs?page=1",
+    "GET /api/v1/orgs/acme/crons/c1/runs?page=2",
+  ]);
+});
+
 test("run --wait stops when cancelled, and a missing cron id is not a success", async () => {
   const ac = new AbortController();
   fake.state.onRequest = () => {

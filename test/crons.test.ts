@@ -20,7 +20,7 @@ const FAIL = {
 };
 const CRON = {
   id: "c1", name: "Morning", profile_name: "hermes", schedule: "weekdays at 7:00", state: "live", paused: false, paused_note: null,
-  owner: { id: 12, name: "Ada" }, prompt: "Read the board", script: null, last_run_at: "2026-11-07T12:00:00Z", last_result: "ok",
+  owner: { id: 12, name: "Ada" }, prompt: "Read the board", script: null, last_run_at: "2026-11-07T12:00:00Z", last_status: "ok",
   last_error: null, last_delivery_error: null, latest_receipt: RUN, recent_failures: [FAIL],
 };
 const running = (id: number) => ({ ...RUN, id, state: "running", finished_at: null, error: null, receipt: {} });
@@ -158,7 +158,7 @@ test("piped goldens: list, get, run, runs, delete", async () => {
   const got = await cron(["get", "c1"]);
   expect(got.out).toBe([
     "id: c1", "name: Morning", "profile_name: hermes", "schedule: weekdays at 7:00", "state: live", "paused: false",
-    "paused_note: -", "owner: 12", "prompt: Read the board", "script: -", "last_run_at: 2026-11-07T12:00:00Z", "last_result: ok",
+    "paused_note: -", "owner: 12", "prompt: Read the board", "script: -", "last_run_at: 2026-11-07T12:00:00Z", "last_status: ok",
     "last_error: -", "last_delivery_error: -", `latest_receipt: ${cells}`, `failure: ${fail}`, `run: ${cells}`, "",
   ].join("\n"));
   fake.state.next = { status: 202, body: { data: { run: RUN } } };
@@ -245,6 +245,26 @@ test("role and server errors keep the envelope; a redirect is not followed", asy
   expect(r.out + r.err).not.toContain(TOKENS.owner);
 });
 
+test("list and get print last_status from the API cron", async () => {
+  expect(CRON).toMatchObject({ last_status: "ok" });
+  expect(CRON).not.toHaveProperty("last_result");
+  const shaped = { ...CRON, last_status: "error", last_result: "annotation" };
+  fake.state.next = { status: 200, body: { data: [shaped] } };
+  const list = await cron(["list"]);
+  expect(list.out.split("\t")[5]).toBe("error");
+  expect(list.out).not.toContain("annotation");
+  fake.state.next = { status: 200, body: { data: shaped } };
+  const got = await cron(["get", "c1"]);
+  expect(got.out).toContain("last_status: error\n");
+  expect(got.out).not.toContain("last_result");
+  expect(got.out).not.toContain("annotation");
+  fake.state.next = { status: 200, body: { data: [shaped] } };
+  const tty = await cron(["list"], { tty: true });
+  expect(tty.out).toContain("STATUS");
+  expect(tty.out).toContain("error");
+  expect(tty.out).not.toContain("annotation");
+});
+
 test("run --wait polls until the receipt closes, and stops on a timeout", async () => {
   let clock = NOW;
   const sleeps: number[] = [];
@@ -316,6 +336,31 @@ test("run --wait polls until the receipt closes, and stops on a timeout", async 
   r = await wait();
   expect(r.code).toBe(0);
   expect(reqs().filter((q) => q.method === "GET").length).toBe(2);
+});
+
+test("run --wait follows more pages until the receipt is found", async () => {
+  let clock = NOW;
+  const sleeps: number[] = [];
+  const sleep: Io["sleep"] = async (ms) => { sleeps.push(ms); clock += ms; };
+  const target = { ...RUN, id: 9 };
+  fake.state.onRequest = () => {
+    const q = reqs()[reqs().length - 1]!;
+    if (q.path.endsWith("/run")) {
+      fake.state.next = { status: 202, body: { data: { run: running(9) } } };
+      return;
+    }
+    fake.state.next = q.search === "?page=2"
+      ? { status: 200, body: { data: [target], page: 2, per: 10, more: false } }
+      : { status: 200, body: { data: [running(100)], page: 1, per: 10, more: true } };
+  };
+  const r = await cron(["run", "c1", "--wait", "--timeout", "5"], { sleep, now: () => clock });
+  expect(r.code).toBe(0);
+  expect(sleeps).toEqual([]);
+  expect(r.out).toContain("id: 9\n");
+  expect(r.out).toContain("state: ok\n");
+  expect(reqs().map((q) => `${q.method} ${q.path}${q.search}`)).toEqual([
+    `POST ${P}/c1/run`, `GET ${P}/c1/runs?page=1`, `GET ${P}/c1/runs?page=2`,
+  ]);
 });
 
 test("run --wait stops when cancelled, and a missing receipt is not a success", async () => {

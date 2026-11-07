@@ -100,7 +100,7 @@ function cronPiped(d: any, runs?: any[]): string {
     `id: ${dash(d.id)}`, `name: ${dash(d.name)}`, `profile_name: ${dash(d.profile_name)}`, `schedule: ${dash(d.schedule)}`,
     `state: ${dash(d.state)}`, `paused: ${d.paused === true ? "true" : d.paused === false ? "false" : "-"}`,
     `paused_note: ${dash(d.paused_note)}`, `owner: ${dash(ownerId(d.owner))}`, `prompt: ${dash(d.prompt)}`, `script: ${dash(d.script)}`,
-    `last_run_at: ${dash(d.last_run_at)}`, `last_result: ${dash(d.last_result)}`, `last_error: ${dash(d.last_error)}`,
+    `last_run_at: ${dash(d.last_run_at)}`, `last_status: ${dash(d.last_status)}`, `last_error: ${dash(d.last_error)}`,
     `last_delivery_error: ${dash(d.last_delivery_error)}`,
     `latest_receipt: ${d.latest_receipt ? runCells(d.latest_receipt) : "-"}`,
     ...arr(d.recent_failures).map((r) => `failure: ${runCells(r)}`),
@@ -124,7 +124,7 @@ function cronBlock(d: any, now: number, runs: any[] | undefined, body: any): str
     ["paused note", d.paused_note == null ? null : clean(d.paused_note)],
     ["owner", owner == null || owner === "" ? null : clean(owner)],
     ["prompt", d.prompt == null ? null : clean(d.prompt, true)], ["script", d.script == null ? null : clean(d.script, true)],
-    ["last run", d.last_run_at == null ? null : when(d.last_run_at, now)], ["last result", d.last_result == null ? null : clean(d.last_result)],
+    ["last run", d.last_run_at == null ? null : when(d.last_run_at, now)], ["last status", d.last_status == null ? null : clean(d.last_status)],
     ["last error", d.last_error == null ? null : clean(d.last_error)],
     ["delivery error", d.last_delivery_error == null ? null : clean(d.last_delivery_error)],
     ["latest receipt", latest ? `${clean(latest.state)} ${when(latest.finished_at ?? latest.started_at, now)}` : null],
@@ -169,12 +169,14 @@ export function showRun(c: { io: Io; json: boolean; now: () => number }, body: a
 }
 
 const listRow = (c: any) => [
-  c?.id, c?.state, c?.profile_name, ownerId(c?.owner), c?.last_run_at, c?.last_result,
+  c?.id, c?.state, c?.profile_name, ownerId(c?.owner), c?.last_run_at, c?.last_status,
   Array.isArray(c?.recent_failures) ? c.recent_failures.length : null, c?.schedule, c?.name, c?.prompt,
 ].map(dash).join("\t");
 
 // Deadline bounds the wait when the clock moves. maxPolls stops a stuck clock from spinning.
-// `crm automation run --wait` calls this with the receipt's cron id: one GET /crons/:id/runs poll.
+// `crm automation run --wait` calls this with the receipt's cron id. Each pass walks `/runs`
+// from page 1 while `more` is set, so a receipt pushed off the newest page is still found
+// inside the same deadline.
 export async function pollRun(c: { io: Io; json: boolean; now: () => number; signal: AbortSignal }, call: Api, org: () => Promise<string>, id: string, opened: any, secs: number): Promise<void> {
   const runId = opened?.id;
   if (runId == null || runId === "") throw new CliError(5, { error: { code: "bad_response", message: "the server did not return a run receipt" } });
@@ -182,7 +184,7 @@ export async function pollRun(c: { io: Io; json: boolean; now: () => number; sig
   if (closed(opened)) return finish(opened);
   const deadline = c.now() + secs * 1000;
   const maxPolls = secs + 1;
-  const path = (await base(org, id)) + "/runs?page=1";
+  const runsPath = (await base(org, id)) + "/runs";
   const giveUp = () => new CliError(5, { error: { code: "timeout", message: `timed out after ${secs}s waiting for cron ${clean(id)} run ${clean(runId)}; it may still be running. Read it later: olympus crons runs ${clean(id)}` } });
   const cancelled = () => new CliError(130, { error: { code: "cancelled", message: `cancelled while waiting for cron ${clean(id)} run ${clean(runId)}; the run was started. Read it later: olympus crons runs ${clean(id)}` } });
   if (c.io.tty && !c.json) c.io.err(`Waiting up to ${secs}s for cron ${clean(id)} run ${clean(runId)}...\n`);
@@ -197,21 +199,32 @@ export async function pollRun(c: { io: Io; json: boolean; now: () => number; sig
       if (c.signal.aborted) throw cancelled();
       if (c.now() >= deadline) throw giveUp();
     }
-    let page: any;
-    try {
-      const left = deadline - c.now();
-      page = await call("GET", path, undefined, Math.max(1000, Math.min(30_000, left)));
-    } catch (e) {
-      if (!(e instanceof CliError)) throw e;
-      if (e.exit === 130 || c.signal.aborted) throw cancelled();
-      const code = e.body?.error?.code;
-      if (code === "machine_not_ready" || code === "machine_needs_update") throw e;
-      const transient = e.status === undefined ? code === "network_error" : e.status === 429 || (e.status ?? 0) >= 500;
-      if (!transient) throw e;
-      if (e.status === 429 && e.retryAfter && /^\d+$/.test(e.retryAfter)) gap = Math.max(POLL_MS, Number(e.retryAfter) * 1000);
-      continue;
+    const scanClock = c.now();
+    let found: any;
+    for (let pageNum = 1; ; pageNum++) {
+      if (pageNum > 1) {
+        if (c.signal.aborted) throw cancelled();
+        if (c.now() >= deadline) throw giveUp();
+        // ponytail: a frozen clock plus more:true never reaches the deadline; same maxPolls cap.
+        if (pageNum > maxPolls && c.now() === scanClock) throw giveUp();
+      }
+      let page: any;
+      try {
+        const left = deadline - c.now();
+        page = await call("GET", `${runsPath}?page=${pageNum}`, undefined, Math.max(1000, Math.min(30_000, left)));
+      } catch (e) {
+        if (!(e instanceof CliError)) throw e;
+        if (e.exit === 130 || c.signal.aborted) throw cancelled();
+        const code = e.body?.error?.code;
+        if (code === "machine_not_ready" || code === "machine_needs_update") throw e;
+        const transient = e.status === undefined ? code === "network_error" : e.status === 429 || (e.status ?? 0) >= 500;
+        if (!transient) throw e;
+        if (e.status === 429 && e.retryAfter && /^\d+$/.test(e.retryAfter)) gap = Math.max(POLL_MS, Number(e.retryAfter) * 1000);
+        break;
+      }
+      found = arr(page?.data).find((r) => r?.id != null && String(r.id) === String(runId));
+      if (found || page?.more !== true) break;
     }
-    const found = arr(page?.data).find((r) => r?.id != null && String(r.id) === String(runId));
     if (closed(found)) return finish(found);
   }
 }
@@ -224,10 +237,10 @@ const SPECS: Record<string, Spec> = {
     const b = await call("GET", await base(async () => slug));
     const rows = arr(b?.data);
     print(c.io, c.json, b, () => rows.map(listRow).join("\n"), () => rows.length
-      ? table(["ID", "NAME", "STATE", "SCHEDULE", "AGENT", "OWNER", "LAST RUN", "RESULT", "FAILURES"], rows.map((x) => [
+      ? table(["ID", "NAME", "STATE", "SCHEDULE", "AGENT", "OWNER", "LAST RUN", "STATUS", "FAILURES"], rows.map((x) => [
         x?.id, x?.name, x?.state, x?.schedule, x?.profile_name,
         x?.owner && typeof x.owner === "object" ? x.owner.name ?? x.owner.id : x?.owner,
-        x?.last_run_at == null ? null : when(x.last_run_at, c.now()), x?.last_result,
+        x?.last_run_at == null ? null : when(x.last_run_at, c.now()), x?.last_status,
         Array.isArray(x?.recent_failures) ? String(x.recent_failures.length) : null,
       ]))
       : `No crons in ${clean(slug)} yet.`);

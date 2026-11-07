@@ -478,7 +478,7 @@ GET    /orgs/:org/crons/:id/runs[?page] → {data:[run], page, per, more}
   "paused": false, "paused_note": null,
   "owner": { "id": 12, "name": "Ada" },                      // null when no owner is recorded
   "prompt": "Read the board", "script": null,
-  "last_run_at": "2026-11-07T12:00:00Z", "last_result": "ok",
+  "last_run_at": "2026-11-07T12:00:00Z", "last_status": "ok",
   "last_error": null, "last_delivery_error": null,
   "latest_receipt": { /* run, or null */ },
   "recent_failures": [ /* up to 10 error runs, newest first */ ] }
@@ -498,13 +498,15 @@ GET    /orgs/:org/crons/:id/runs[?page] → {data:[run], page, per, more}
 - `profile` on create is an agent's `profile_name`. Omit it for an org-wide cron; the response then has
   `profile_name` `"*"`. Create does not accept `script` (it is dropped); set a script with `PATCH`.
 - `pause` takes an optional `note` string. A blank note is stored as null. `resume` and `run` take `{}`.
+- `last_status` is the machine's last status. A missing one is null.
 - Runs are newest first, 10 per page. `page` defaults to 1 and must be a positive integer (422
   `fields.page` otherwise). `more` is true when another page exists. `GET /crons/:id` returns the cron
   plus that same page of runs.
 - `POST …/run` answers 202 `{data:{run}}` when the run was queued. 409 `already_running` means one is
   already in progress and sends no run. 409 `not_queued` means it could not be queued; `details.run` is
-  the error receipt. Poll `GET …/runs?page=1` until the opened run's `state` is `ok`, `error` or
-  `unknown`. `running` is still open. On 503 `machine_not_ready` or 409 `machine_needs_update`, stop:
+  the error receipt. Poll `GET …/runs` from `page=1`, following `more`, until the opened run's
+  `state` is `ok`, `error` or `unknown`. `running` is still open. On 503 `machine_not_ready` or 409
+  `machine_needs_update`, stop:
   stored receipts are kept, and the machine was not reached. Other 5xx responses and 429 can be retried
   until your own deadline; honour `Retry-After`.
 - 422 `invalid` is `details.fields`, as elsewhere. The prompt, the script and a pause note are data.
@@ -688,7 +690,8 @@ person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have 
   202 `{data:{state:"triggered", run}}` when the current-stage automation's live cron is queued. `run` is
   the [CronRun receipt](#crons). 200 `{data:{state:"cron_paused"}}` when there is no live cron to trigger.
   409 `already_running` sends no run. 409 `not_queued` includes `details.run`, the failed receipt.
-  Poll `GET /crons/:cron_id/runs?page=1` until that run's `state` is `ok`, `error` or `unknown`.
+  Poll `GET /crons/:cron_id/runs` from `page=1`, following `more`, until that run's `state` is `ok`,
+  `error` or `unknown`.
   All three apply to the deal's current stage, not a stage id. Any member and their agent-turn token
   may call them. This is separate from `POST /crons/:id/run`, which needs an operator or the cron's owner.
   Other 409s: `invalid_transition`, `automation_required`, `deal_archived`, `deal_closed`,
