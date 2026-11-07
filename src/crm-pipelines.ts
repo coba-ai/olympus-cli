@@ -31,12 +31,32 @@ function parseRemoval(text: string) {
 }
 
 const pipelinePath = (c: Ctx, rest = "") => `/pipelines/${seg(c.pos[3]!)}${rest}`;
-const stageLines = (label: string, stages: unknown) => arr(stages).map((s) => `${label}: ${[dash(s?.id), dash(s?.kind), dash(s?.name)].join("\t")}`);
+const cronOf = (a: any) => (a?.cron && typeof a.cron === "object" && !Array.isArray(a.cron) ? a.cron : null);
+const liveCell = (cron: any) => (cron?.live === true ? "true" : cron?.live === false ? "false" : "-");
+// Documented cells, in order: start, state, name, cron id, cron live, schedule, next run. key and stage id are added by the caller.
+const autoTail = (a: any) => {
+  const cron = cronOf(a);
+  return [dash(a?.start), dash(a?.state), dash(a?.name), dash(cron?.id), liveCell(cron), dash(cron?.schedule), dash(cron?.next_run_at)];
+};
+const stageLines = (label: string, stages: unknown) => arr(stages).flatMap((s) => [
+  `${label}: ${[dash(s?.id), dash(s?.kind), dash(s?.name)].join("\t")}`,
+  ...arr(s?.automations).map((a) => `automation: ${[dash(s?.id), dash(a?.key), ...autoTail(a)].join("\t")}`),
+]);
+const listAutos = (s: any) => arr(s?.automations).map((a) => [dash(a?.key), `automation:${dash(s?.id)}`, ...autoTail(a)].join("\t"));
 
 const detailPiped = (d: any) => [
   `id: ${dash(d.id)}`, `name: ${dash(d.name)}`, `currencies: ${dash(d.currencies)}`, `archived: ${String(d.archived === true)}`, `version: ${dash(d.version)}`,
   ...stageLines("stage", d.stages), ...stageLines("archived_stage", d.archived_stages),
 ].join("\n");
+
+function automationsTty(title: string, stages: unknown): string {
+  const lines = arr(stages).flatMap((s) => arr(s?.automations).map((a) => {
+    const cron = cronOf(a);
+    const live = cron?.live === true ? "cron live" : cron?.live === false ? "cron paused" : "-";
+    return "  " + [s?.id, a?.key, a?.start, a?.state, a?.name, live, cron?.schedule].map((x) => clean(x ?? "-")).join("  ");
+  }));
+  return lines.length ? `\n\n${title}:\n${lines.join("\n")}` : "";
+}
 
 function detailTty(d: any): string {
   const section = (title: string, stages: unknown) => arr(stages).length
@@ -44,7 +64,8 @@ function detailTty(d: any): string {
   return keyValue([
     ["id", display(d.id)], ["name", display(d.name)], ["currencies", display(d.currencies)], ["archived", d.archived === true ? "yes" : "no"], ["version", display(d.version)],
   ])
-    + section("stages", d.stages) + section("archived stages", d.archived_stages);
+    + section("stages", d.stages) + automationsTty("automations", d.stages)
+    + section("archived stages", d.archived_stages) + automationsTty("archived automations", d.archived_stages);
 }
 
 const showPipeline = (c: Ctx, body: any, sentence?: string) =>
@@ -56,10 +77,21 @@ function pipelines(c: Ctx): Plan {
     const ps = arr(b.data);
     print(c.io, c.json, b, () => ps.flatMap((p) => [
       [dash(p?.id), p?.archived === true ? "pipeline:archived" : "pipeline", dash(p?.currencies), dash(p?.name)].join("\t"),
-      ...arr(p?.stages).map((s) => [dash(s?.id), `stage:${dash(p?.id)}`, dash(s?.kind), dash(s?.name)].join("\t")),
+      ...arr(p?.stages).flatMap((s) => [
+        [dash(s?.id), `stage:${dash(p?.id)}`, dash(s?.kind), dash(s?.name)].join("\t"),
+        ...listAutos(s),
+      ]),
     ]).join("\n"), () => ps.length ? table(["ID", "NAME", "INFO"], ps.flatMap((p) => [
       [display(p?.id), (display(p?.name) ?? "-") + (p?.archived === true ? " (archived)" : ""), display(p?.currencies)],
-      ...arr(p?.stages).map((s) => ["  " + display(s?.id), "  " + display(s?.name), display(s?.kind)]),
+      ...arr(p?.stages).flatMap((s) => [
+        ["  " + display(s?.id), "  " + display(s?.name), display(s?.kind)],
+        ...arr(s?.automations).map((a) => {
+          const cron = cronOf(a);
+          const live = cron?.live === true ? "cron live" : cron?.live === false ? "cron paused" : null;
+          const info = [a?.state, live, cron?.schedule].filter((x) => x != null && x !== "").map((x) => clean(x)).join(" · ");
+          return ["    " + clean(a?.key ?? "-"), "    " + clean(a?.name ?? "-"), info || null];
+        }),
+      ]),
     ])) : "No pipelines.");
   };
 }

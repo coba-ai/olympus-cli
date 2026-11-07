@@ -77,6 +77,7 @@ olympus crm pipeline get <id> | archive <id> [--undo]
 olympus crm pipeline add NAME --stage NAME:KIND... [--currency C]...
 olympus crm pipeline update <id> [--name T] [--stage [ID=]NAME:KIND]... [--remove STAGE_ID:MOVE_TO_ID]...
                                  [--restore ID]... [--currency C]... [--version V]
+olympus crm automation pause|resume <deal-id> [--automation KEY | --all] | run <deal-id> [--automation KEY] [--wait] [--timeout SECONDS]
 olympus crm <create command> ... [--idempotency-key K]   # deal|person|company add, deal note, deal|person|company task add, pipeline add
 olympus crm person add NAME [--email E] [--phone P] [--job-title T] [--linkedin-url U] [--company ID | --new-company NAME]
 olympus crm company add NAME [--domain D] [--website U] [--industry T] [--linkedin-url U] [--phone P] [--city C]
@@ -128,7 +129,7 @@ and requires every tag given; `--backlog` keeps the backlog section. `--mine` wi
 `--open` with `--done`, are usage errors. An unknown `--who` is exit 6. Text that starts with `-` needs
 `--` (`olympus task add -- "-x"`).
 
-CRM (`olympus crm …`): any member can read; writing needs the `operator` role (a teammate gets exit 4). Records are
+CRM (`olympus crm …`): any member can read. Writing a record or a pipeline needs the `operator` role (a teammate gets exit 4). Pausing, resuming or running a stage automation is open to any member. Records are
 deals, people and companies. `--version V` on an `update` is optional. Sent, the update is refused when the record
 changed since you read it (exit 6, "it changed since you read it"); omitted, the last writer wins for the fields you
 send. `--add-tag` / `--remove-tag` read the record and then write it with the version they read, so they are **not
@@ -160,6 +161,8 @@ first: `--stage` is then the **full ordered list of live stages**, and `ID=NAME:
 be named in `--remove STAGE_ID:MOVE_TO_ID`, which moves its deals to `MOVE_TO_ID`; the server refuses the update
 otherwise (exit 6). `--restore ID` brings back an archived stage. `--currency` is repeatable and replaces the list.
 `--version V` works as on records.
+
+Stage automations are part of each pipeline stage: `pipelines` and `pipeline get` show the automation key, its state, and the cron that runs (live or paused). `crm automation pause`, `resume` and `run` act on the deal's **current** stage. Any member can run them. `--automation KEY` names one key (`a-z`, `0-9` and `-`, 1–64 characters, starting with a letter or digit). `--all` on pause and resume covers every automation that action can change. With neither flag, the server acts when the deal has exactly one and answers 409 `automation_required` when it has several. Pause takes no note: `--note` is a usage error and is not sent. `run` does not take `--all`. It returns that cron's run receipt (the same fields as `crons run`). `run --wait` polls `crons` runs for that receipt until it closes, with the same timeout as `crons run --wait` (default 300s, at most 86400). A cron that is not live answers `state: cron_paused` and queues nothing. These commands send no idempotency key. 409 `already_running` and `not_queued` are exit 5, and `not_queued` includes `details.run` in `--json`.
 
 Idempotent creates: `deal|person|company add`, `deal note`, `deal|person|company task add` and `pipeline add`
 each send a fresh random `Idempotency-Key`. `--idempotency-key K` (1-128 characters from `A-Z a-z 0-9 _ . : -`)
@@ -324,7 +327,7 @@ Human mode depends on where stdout goes. On a terminal you get headers, aligned 
 times ("3h ago"; a time in the future reads `+5m`, `+3h` or `+8d`, and beyond 30 days it is the ISO date, while piped and `--json` output are unaffected), a `*` on the default org in `org list`, and full-sentence confirmations; control
 characters in server text are stripped from stdout on a terminal and server text in error messages is cleaned on stderr too (except with `--json`, where stderr is the error body as sent). Piped or redirected, you get plain tab-separated lines that
 scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
-emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms, only when the response's `secret` is not null. `--json` prints the API body as-is (three exceptions: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent; a webhook whose `approval` is `pending` or `rejected` adds a top-level `hint` with the sentence to show a person, and prints that same sentence on stderr; `crons run --wait` prints `{data:{run}}` for the closed receipt, the same shape as the 202, rather than the runs page it polled), one compact line
+emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms, only when the response's `secret` is not null. `--json` prints the API body as-is (three exceptions: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent; a webhook whose `approval` is `pending` or `rejected` adds a top-level `hint` with the sentence to show a person, and prints that same sentence on stderr; `crons run --wait` prints `{data:{run}}` for the closed receipt, the same shape as the 202, rather than the runs page it polled; `crm automation run --wait` prints that same `{data:{run}}`), one compact line
 (`org list` → `{data:[…]}`, `org use` → `{data:{org}}`, `delete` → `{data:{id,deleted:true}}`,
 `logout` → `{data:{deleted}}`, `task delete` and `subscription delete` → `{data:{id,deleted:true}}`; `task delegate`, `task breakdown`, `day …` → the response body; `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
 usage errors are `{"error":{"code":"usage",…}}`. A token is never printed.
@@ -351,7 +354,9 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `closed_at:`, `score:`, `shipped:`, `reflection:`, `agent_note:` (empty values print `-`), then one
   `blocker: <id><TAB><text>` and one `learning: <id><TAB><text>` line per item. A day with nothing saved
   prints the same lines with `-` for the empty ones. The `summary` is in `--json` only.
-- `crm pipelines`: `id  pipeline  currencies|-  name`, then one `stage-id  stage:<pipeline id>  kind  name` row per stage.
+- `crm pipelines`: `id  pipeline  currencies|-  name`, then one `stage-id  stage:<pipeline id>  kind  name` row per stage, then one
+  `key  automation:<stage id>  start|-  state  name  cron-id|-  true|false|-  schedule|-  next_run_at|-` row per automation on that stage
+  (none when the stage has no automations). `true`/`false` is the cron's `live` flag.
 - `crm tags`: one tag per line. `crm search`: `entity  id  sub|-  label`.
 - `crm deals`: `id  status  pipeline-id|-  stage-id  amount  currency  owner-email|-  company-name|-  tag,tag|-  name`.
   `crm people`: `id  email|-  company-id|-  job-title|-  open-deals  tag,tag|-  name`.
@@ -380,9 +385,16 @@ newline in task text never splits a row; nothing is printed for an empty list):
   `unlink-person` and `person|company task add` print the whole deal, person or company as above.
 - `crm pipeline get`, `add`, `update` and `archive` print `id:`, `name:`, `currencies:` (comma-joined or `-`),
   `archived:` (`true|false`), `version:`, then one `stage: id<TAB>kind<TAB>name` line per live stage and one
-  `archived_stage: id<TAB>kind<TAB>name` line per archived stage, in the server's order.
+  `archived_stage: id<TAB>kind<TAB>name` line per archived stage, in the server's order. After each stage line, one
+  `automation: stage-id<TAB>key<TAB>start|-<TAB>state<TAB>name<TAB>cron-id|-<TAB>true|false|-<TAB>schedule|-<TAB>next_run_at|-`
+  line per automation (`true`/`false` is the cron's `live` flag).
   `crm pipelines --archived` marks an archived pipeline by `pipeline:archived` in the second column of its row
   (live ones stay `pipeline`; stage rows are unchanged).
+- `crm automation pause` and `resume` print `state: <state>`. `--json` is the response body `{"data":{"state":"…"}}`.
+- `crm automation run` prints the cron run lines (`id:`, `cron_id:`, `profile_name:`, `state:`, `trigger:`, `actor:`,
+  `started_at:`, `finished_at:`, `error:`), the same as `crons run`. The receipt object is on a terminal and in
+  `--json` only. A paused cron with nothing queued prints `state: cron_paused`. `run --wait` prints
+  `{"data":{"run":…}}` for the closed receipt, the same shape as `crons run --wait`.
 - `subscription list`: `id  active|inactive  event,event  last-status|-  consecutive-failures  url  name`.
 - `subscription get`, `create`, `update` and `rotate-secret`: `id:`, `name:`, `url:`, `events:`
   (comma-joined), `active:` (`true|false`), `created_by:` (user id), `last_delivery_at:`,

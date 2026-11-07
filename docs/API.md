@@ -35,8 +35,10 @@ Errors are `{"error": {"code": "…", "message": "…", "details": {…}}}` (`de
 | 409 | `no_agent` | this organization has no agent to ask |
 | 409 | `briefing_not_set_up` | you have not set up your briefing yet (see [Briefings](#briefings)) |
 | 409 | `machine_needs_update` / `route_missing` | the organization's agent machine needs an update, or no longer has this webhook |
-| 409 | `already_running` | that cron is already running; nothing new was queued (see [Crons](#crons)) |
-| 409 | `not_queued` | the cron run could not be queued; `details.run` is the error receipt (see [Crons](#crons)) |
+| 409 | `already_running` | that cron is already running; nothing new was queued (see [Crons](#crons) and [CRM](#crm)) |
+| 409 | `not_queued` | the cron run could not be queued; `details.run` is the error receipt (see [Crons](#crons) and [CRM](#crm)) |
+| 409 | `automation_required` | the deal has several automations; send `automation` or `all: true` (see [CRM](#crm)) |
+| 409 | `invalid_transition` | the automation is not in a state this action can change (see [CRM](#crm)) |
 | 422 | `invalid` | `details.fields` is `{field: ["message", …]}` |
 | 429 | `rate_limited` | see `Retry-After` (seconds) |
 | 502 | `agent_failed` | an agent could not do the job (breakdown only): `message` says why; nothing was saved |
@@ -509,7 +511,8 @@ GET    /orgs/:org/crons/:id/runs[?page] → {data:[run], page, per, more}
 
 ## CRM
 
-Everything is under `/orgs/:org/crm`. Reading is open to any member; every write needs `operator`.
+Everything is under `/orgs/:org/crm`. Reading is open to any member. Every write needs `operator`, except
+`automation_pause`, `automation_resume` and `automation_run`, which any member can call.
 Responses carry `Cache-Control: no-store`. An unknown record id, or an organization you cannot see,
 is the usual 404 `not_found`.
 
@@ -523,6 +526,9 @@ GET    /orgs/:org/crm/pipelines/:id                          → {data:pipeline-
 POST   /orgs/:org/crm/pipelines            {name, stages:[{name, kind}], currencies?} → 201 {data:pipeline-detail}
 PATCH  /orgs/:org/crm/pipelines/:id        {name?, stages?:[{id?, name, kind}], removals?:[{stage, move_to}], restores?:[id], currencies?, version?} → {data:pipeline-detail}
 POST   /orgs/:org/crm/pipelines/:id/archive {archived}                → {data:pipeline-detail}
+POST   /orgs/:org/crm/deals/:id/automation_pause   {automation?, all?} → {data:{state}}
+POST   /orgs/:org/crm/deals/:id/automation_resume  {automation?, all?} → {data:{state}}
+POST   /orgs/:org/crm/deals/:id/automation_run     {automation?}       → 202 {data:{state:"triggered", run}} | 200 {data:{state:"cron_paused"}}
 GET    /orgs/:org/crm/tags[?entity=deal|person|company]      → {data:["…"]}
 GET    /orgs/:org/crm/search?q=…[&entity=deal|person|company] → {data:[{entity, id, label, sub}]}
 
@@ -611,7 +617,12 @@ unknown `status` or `sort` is 422 with `fields.<param>`, not ignored. Deals take
 // and a company also carries "people": [{"id": "…", "full_name": "…", "email": "…", "job_title": "…"}]
 
 // pipeline (live pipelines and stages only by default; in a list every item has "archived": false, and ?archived=include also returns archived ones with true)
-{ "id": "…", "name": "…", "stages": [{"id": "…", "name": "…", "kind": "…", "position": 0}], "currencies": ["USD"] }
+{ "id": "…", "name": "…", "currencies": ["USD"],
+  "stages": [{ "id": "…", "name": "…", "kind": "…", "position": 0,
+    "automations": [{ "key": "inbound-emails", "name": "Inbound emails", "start": "entry" | null,
+      "state": "live",
+      "cron": { "id": "c1", "key": "inbound-emails", "name": "inbound-emails", "live": true,
+                "schedule": "every 1h", "next_run_at": "…" } | null }] }] }
 
 // pipeline-detail (GET/POST/PATCH/archive of one pipeline): the pipeline, plus
 { "version": "<opaque>", "archived": false, "archived_stages": [{"id": "…", "name": "…", "kind": "…"}] }
@@ -664,6 +675,25 @@ person rows omit `linkedin_url`, `notes`, `version` and `deal_count` (they have 
   `restores` takes their ids. `version` works as above. `GET /crm/pipelines` lists live pipelines;
   `?archived=include` adds archived ones. Every list item carries `archived` (`false` unless it is an archived one). A `PATCH`
   with no editable key is 422 `fields.base`; an unknown key inside a `stages[]` or `removals[]` row is 422.
+- **Stage automations.** `GET /pipelines` and `GET /pipelines/:id` include `automations` on every stage.
+  Each row has the machine's `key`, `name`, `start`, `state` and `cron` (`id`, `key`, `name`, `live`,
+  `schedule`, `next_run_at`). A missing cron is `null`. An older machine's single `automation` field comes
+  back as a one-element list. Definitions stay on the agent machine.
+  `POST /deals/:id/automation_pause` and `…/automation_resume` take `{automation?: key, all?: true}` and
+  answer 200 `{data:{state}}`. `automation` is a key matching `^[a-z0-9][a-z0-9-]{0,63}$`. `all: true`
+  pauses every pausable automation, or resumes every paused one. With neither, the server acts on the
+  deal's only matching automation. A `note` is rejected: any key other than `automation` and `all` is
+  400 `bad_request`, as is a non-string `automation` or a non-boolean `all`.
+  `POST /deals/:id/automation_run` takes `{automation?: key}` (`all` is 400) and answers
+  202 `{data:{state:"triggered", run}}` when the current-stage automation's live cron is queued. `run` is
+  the [CronRun receipt](#crons). 200 `{data:{state:"cron_paused"}}` when there is no live cron to trigger.
+  409 `already_running` sends no run. 409 `not_queued` includes `details.run`, the failed receipt.
+  Poll `GET /crons/:cron_id/runs?page=1` until that run's `state` is `ok`, `error` or `unknown`.
+  All three apply to the deal's current stage, not a stage id. Any member and their agent-turn token
+  may call them. This is separate from `POST /crons/:id/run`, which needs an operator or the cron's owner.
+  Other 409s: `invalid_transition`, `automation_required`, `deal_archived`, `deal_closed`,
+  `pipeline_archived`. 503 `crm_upgrading`. 502 `crm_unavailable` or `machine_unavailable`. 404 `not_found`
+  for an unknown deal or automation, and for a non-member.
 - **Tasks.** A task can hang off a deal, a person or a company. `POST` on `/people/:id/tasks` or
   `/companies/:id/tasks` takes `{title, due_at?, assignee?}` (assignee as for deals) and returns the
   record's detail with 201. `PATCH /crm/tasks/:task_id {done}` marks any task done or open by its id and

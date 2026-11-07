@@ -203,10 +203,54 @@ test("idempotency on add: reused key replays, invalid key refused, hint rules", 
   expect([r.code, r.err]).toEqual([5, JSON.stringify(body) + "\n"]);
 });
 
+test("pipeline output lists each stage's automations", async () => {
+  const live = {
+    key: "inbound-emails", name: "Inbound emails", start: "entry", state: "live", secret: "sekrit",
+    cron: { id: "c1", key: "inbound-emails", name: "cron-name-hidden", live: true, schedule: "every 1h", next_run_at: "2026-11-05T15:00:00Z", private: "nope" },
+  };
+  const paused = { key: "renewal", name: "Renewal", start: null, state: "paused", cron: { id: "c2", name: "renewal", live: false } };
+  const stages = S().pipelines[0]!.stages;
+  stages[0]!.automations = [live];
+  stages[1]!.automations = [];
+  stages[2]!.automations = [paused];
+  const row = "inbound-emails\tautomation:st_lead\tentry\tlive\tInbound emails\tc1\ttrue\tevery 1h\t2026-11-05T15:00:00Z";
+  const held = "renewal\tautomation:st_lost\t-\tpaused\tRenewal\tc2\tfalse\t-\t-";
+  const list = await run1(["pipelines"]);
+  const lead = list.out.indexOf("st_lead\tstage:p_sales\topen\tLead\n");
+  const auto = list.out.indexOf(row + "\n");
+  const won = list.out.indexOf("st_won\tstage:p_sales\twon\tWon\n");
+  expect(lead).toBeGreaterThanOrEqual(0);
+  expect(auto).toBeGreaterThan(lead);
+  expect(won).toBeGreaterThan(auto);
+  expect(list.out).toContain(held);
+  expect(list.out).not.toContain("automation:st_won");
+  expect(list.out).not.toContain("sekrit");
+  expect(list.out).not.toContain("cron-name-hidden");
+  expect(list.out).not.toContain("nope");
+  const detail = "automation: st_lead\tinbound-emails\tentry\tlive\tInbound emails\tc1\ttrue\tevery 1h\t2026-11-05T15:00:00Z";
+  const got = await run1(["pipeline", "get", "p_sales"]);
+  expect(got.out).toContain(detail);
+  expect(got.out).toContain("automation: st_lost\trenewal\t-\tpaused\tRenewal\tc2\tfalse\t-\t-");
+  expect(got.out.indexOf("stage: st_lead\topen\tLead\n")).toBeLessThan(got.out.indexOf(detail));
+  const tty = await run1(["pipeline", "get", "p_sales"], { tty: true });
+  expect(tty.out).toContain("automations:");
+  expect(tty.out).toContain("inbound-emails");
+  expect(tty.out).toContain("cron live");
+  expect(tty.out).toContain("cron paused");
+  const listed = await run1(["pipelines"], { tty: true });
+  expect(listed.out).toContain("inbound-emails");
+  expect(listed.out).toContain("cron live");
+  const body = JSON.parse((await run1(["pipeline", "get", "p_sales", "--json"])).out);
+  expect(body.data.stages[0].automations[0].cron).toMatchObject({ id: "c1", live: true, schedule: "every 1h" });
+  expect(body.data.stages[0].automations[0].secret).toBe("sekrit");
+  expect(body.data.stages[1].automations).toEqual([]);
+});
+
 test("EVIL control strings never reach stdout", async () => {
   S().pipelines[0] = {
     ...S().pipelines[0]!, id: EVIL, name: EVIL, currencies: [EVIL], version: EVIL, archived_at: "2026-10-01T00:00:00Z",
-    stages: [{ id: EVIL, name: EVIL, kind: EVIL }], archived_stages: [{ id: EVIL, name: EVIL, kind: EVIL }],
+    stages: [{ id: EVIL, name: EVIL, kind: EVIL, automations: [{ key: EVIL, name: EVIL, start: EVIL, state: EVIL, cron: { id: EVIL, live: true, schedule: EVIL, next_run_at: EVIL } }] }],
+    archived_stages: [{ id: EVIL, name: EVIL, kind: EVIL }],
   };
   for (const tty of [false, true]) {
     for (const a of [["pipelines", "--archived"], ["pipelines"]]) noCtl((await run1(a, { tty })).out);
@@ -216,7 +260,7 @@ test("EVIL control strings never reach stdout", async () => {
       noCtl(r.err);
     }
   }
-  fake.state.next = { status: 201, body: { data: { id: EVIL, name: EVIL, stages: [{ id: EVIL, name: EVIL, kind: EVIL }], currencies: [EVIL], archived_stages: [] } } };
+  fake.state.next = { status: 201, body: { data: { id: EVIL, name: EVIL, stages: [{ id: EVIL, name: EVIL, kind: EVIL, automations: [{ key: EVIL, name: EVIL, state: EVIL, cron: { id: EVIL, schedule: EVIL, live: true } }] }], currencies: [EVIL], archived_stages: [] } } };
   noCtl((await run1(["pipeline", "add", EVIL, "--stage", `${EVIL}:open`], { tty: true })).out);
   fake.state.next = { status: 201, body: { data: { id: EVIL, name: EVIL, stages: [], currencies: [] } } };
   noCtl((await run1(["pipeline", "add", "P", "--stage", "a:open"])).out);

@@ -78,7 +78,7 @@ function pageQuery(v: Opts): string {
 }
 
 // `--wait` polls; `--timeout` without it, and `--no-wait`, are usage errors. Returns 0 when not waiting.
-function timeoutSecs(v: Opts): number {
+export function timeoutSecs(v: Opts): number {
   if (v.wait === false) throw usage("waiting is off unless you pass --wait");
   if (v.wait !== true) {
     if (v.timeout !== undefined) throw usage("--timeout needs --wait");
@@ -164,7 +164,7 @@ function runBlock(r: any, now: number): string {
   return head + (empty ? "" : `\n\nreceipt:\n` + clean(JSON.stringify(receipt, null, 2), true).split("\n").map((l) => "  " + l).join("\n"));
 }
 
-function showRun(c: Ctx, body: any, sentence?: string): void {
+export function showRun(c: { io: Io; json: boolean; now: () => number }, body: any, sentence?: string): void {
   print(c.io, c.json, body, () => runPiped(body?.data?.run ?? {}), () => (sentence ? `${sentence}\n\n` : "") + runBlock(body?.data?.run ?? {}, c.now()));
 }
 
@@ -174,7 +174,8 @@ const listRow = (c: any) => [
 ].map(dash).join("\t");
 
 // Deadline bounds the wait when the clock moves. maxPolls stops a stuck clock from spinning.
-async function pollRun(c: Ctx, call: Api, org: () => Promise<string>, id: string, opened: any, secs: number): Promise<void> {
+// `crm automation run --wait` calls this with the receipt's cron id: one GET /crons/:id/runs poll.
+export async function pollRun(c: { io: Io; json: boolean; now: () => number; signal: AbortSignal }, call: Api, org: () => Promise<string>, id: string, opened: any, secs: number): Promise<void> {
   const runId = opened?.id;
   if (runId == null || runId === "") throw new CliError(5, { error: { code: "bad_response", message: "the server did not return a run receipt" } });
   const finish = (run: any) => showRun(c, { data: { run } }, `Run ${clean(runId)} finished: ${clean(run.state)}.`);

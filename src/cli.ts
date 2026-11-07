@@ -8,6 +8,7 @@ import {
 import { askPlan } from "./ask";
 import { briefingPlan } from "./briefing";
 import { browserPlan } from "./browser";
+import { automationPlan } from "./crm-automations";
 import { crmPlan } from "./crm";
 import { cronsPlan } from "./crons";
 import { dayPlan } from "./days";
@@ -54,6 +55,7 @@ const USAGE = `usage: olympus <command> [flags]
   crm pipelines [--archived]   crm pipeline get <id> | archive <id> [--undo]
   crm pipeline add NAME --stage NAME:KIND... [--currency C]...
   crm pipeline update <id> [--name T] [--stage [ID=]NAME:KIND]... [--remove STAGE_ID:MOVE_TO_ID]... [--restore ID]... [--currency C]... [--version V]
+  crm automation pause|resume <deal-id> [--automation KEY | --all] | run <deal-id> [--automation KEY] [--wait] [--timeout SECONDS]
   crm creates (add, note, task add, pipeline add) take [--idempotency-key K]; a retry with the same K replays the first result (once the agent machine is updated)
   subscription list | get <id> | delete <id> --yes | rotate-secret <id> | ping <id>
   subscription create --name N --url URL --event T... ('*' = all) | update <id> [--name N] [--url URL] [--event T]... [--active | --inactive]
@@ -89,7 +91,7 @@ const OPTIONS = {
     .map((k) => [k, { type: "string" }])),
   mode: { type: "string" }, signature: { type: "string" }, "signature-file": { type: "string" }, "provider-secret-file": { type: "string" },
   schedule: { type: "string" }, "schedule-file": { type: "string" }, script: { type: "string" }, "script-file": { type: "string" },
-  profile: { type: "string" }, note: { type: "string" },
+  profile: { type: "string" }, note: { type: "string" }, automation: { type: "string" },
   event: { type: "string", multiple: true }, "allow-origin": { type: "string", multiple: true },
   session: { type: "string" }, timeout: { type: "string" }, after: { type: "string" }, day: { type: "string" },
   wait: { type: "boolean" }, closed: { type: "boolean" }, all: { type: "boolean" }, request: { type: "boolean" },
@@ -498,6 +500,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
       plan = taskPlan(pos, v, io, json, now);
     } else if (cmd === "day") {
       plan = dayPlan(pos, v, io, json, now);
+    } else if (cmd === "crm" && sub === "automation") {
+      plan = automationPlan(pos, v, io, json, now, signal);
     } else if (cmd === "crm") {
       plan = crmPlan(pos, v, io, json, now);
     } else if (cmd === "subscription" || cmd === "event-types") {
@@ -518,8 +522,8 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     host = resolveHost(v.host, io, creds);
     // A stored org belongs to the host it was saved for.
     const scoped: Creds = { ...creds, org: creds.host === host ? creds.org : undefined };
-    // ask, and `crons run --wait`, are the commands a Ctrl-C must stop without leaving the request hung.
-    const long = cmd === "ask" || (cmd === "crons" && v.wait === true);
+    // ask, `crons run --wait` and `crm automation run --wait` are the commands a Ctrl-C must stop without leaving the request hung.
+    const long = cmd === "ask" || (v.wait === true && (cmd === "crons" || (cmd === "crm" && sub === "automation" && arg === "run")));
     const call = api(host, resolveToken(host, io, creds), undefined, long ? signal : undefined);
     let meCache: Promise<Me> | undefined;
     const me = () => (meCache ??= call("GET", "/me").then((b) => b.data as Me));
