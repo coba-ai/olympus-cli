@@ -311,7 +311,7 @@ test("AC24 help lists the day lines; processIo offers ask only on a terminal", a
   const r = await cli(["--help"]);
   for (const l of [
     "  day [DATE] | day show [DATE] | day list [--week D]   (DATE: YYYY-MM-DD, default today)",
-    "  task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT]   (both accept --week D)",
+    "  task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT] [--timeout SECONDS | --no-wait]   (both accept --week D)",
     "  day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]",
   ]) expect(r.out).toContain(l + "\n");
   const io = processIo();

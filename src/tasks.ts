@@ -1,9 +1,9 @@
-import { CliError, print, seg, usage, type Api, type Io } from "./core";
+import { CliError, print, realSleep, seg, usage, type Api, type Exit, type Io } from "./core";
 import { clean, keyValue, table, when } from "./format";
 
 const enc = encodeURIComponent;
 type Opts = Record<string, unknown>;
-type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number };
+type Ctx = { pos: string[]; v: Opts; io: Io; json: boolean; now: () => number; signal: AbortSignal };
 export type Plan = (call: Api, org: () => Promise<string>) => Promise<void>;
 
 // Flags every command accepts; the rest are per subcommand.
@@ -93,9 +93,6 @@ function subDelete(c: Ctx): Plan {
     item(c, await call("DELETE", await subPath(c, org, c.pos[4]!)), `Deleted subtask ${clean(c.pos[4])} from ${clean(c.pos[3])}.`);
 }
 
-// breakdown waits on the agent; the server may take up to ~90 s, so this overrides the default timeout for that call only.
-export const BREAKDOWN_TIMEOUT_MS = 100_000;
-
 function delegate(c: Ctx): Plan {
   const body = c.v.to === undefined ? {} : { agent: c.v.to };
   return async (call, org) => {
@@ -107,20 +104,161 @@ function delegate(c: Ctx): Plan {
   };
 }
 
+// ---- breakdown: POST /tasks/:id/breakdowns answers at once with a handle; GET /breakdowns/:handle is polled.
+// The 202 says Retry-After: 3, but api() does not expose success headers, so the documented 3 s is used.
+const POLL_MS = 3000;
+const BREAKDOWN_WAIT_S = 300;
+const HANDLE = /^bd_[A-Za-z0-9_-]{1,120}$/;
+const isObj = (x: unknown): x is Record<string, any> => typeof x === "object" && x !== null && !Array.isArray(x);
+
+function waitSecs(t: unknown): number {
+  if (t === undefined) return BREAKDOWN_WAIT_S;
+  const n = /^\d+$/.test(String(t)) ? Number(t) : 0;
+  if (n < 1 || n > 86400) throw usage("--timeout must be a whole number of seconds from 1 to 86400");
+  return n;
+}
+
+// Printed commands must paste back into a shell: plain words as they are, anything else single-quoted.
+const sh = (x: unknown) => { const s = clean(x); return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`; };
+// The org (resolved) and an explicit --host, so the command reads from the same place the start went to.
+const target = (c: Ctx, org: string) => ` --org ${sh(org)}${typeof c.v.host === "string" && c.v.host ? ` --host ${sh(c.v.host)}` : ""}`;
+// The read-only command that picks a breakdown up again; the handle is HANDLE-checked, so it is safe to print.
+const resumeCmd = (c: Ctx, org: string, h: string) => `olympus task breakdown-status ${h}${target(c, org)} --wait`;
+const taskGet = (c: Ctx, org: string, id: unknown) =>
+  `olympus task get ${sh(id)}${typeof c.v.week === "string" ? ` --week ${sh(c.v.week)}` : ""}${target(c, org)}`;
+
 function breakdown(c: Ctx): Plan {
-  const body = c.v.agent === undefined ? {} : { agent: c.v.agent };
+  const { v } = c;
+  if (v.wait === true) throw usage("waiting is the default; use --no-wait to skip it");
+  if (v.wait === false && v.timeout !== undefined) throw usage("--timeout cannot be combined with --no-wait");
+  const secs = v.wait === false ? 0 : waitSecs(v.timeout);
+  const body = v.agent === undefined ? {} : { agent: v.agent };
+  const id = c.pos[2]!, tid = clean(id);
   return async (call, org) => {
-    const path = await tasksPath(c, org, `/${seg(c.pos[2]!)}/breakdown`);
-    if (c.io.tty && !c.json) c.io.err(`Asking ${c.v.agent === undefined ? "the agent" : clean(c.v.agent)} to break down task ${clean(c.pos[2])}...\n`);
-    const b = await call("POST", path, body, BREAKDOWN_TIMEOUT_MS);
-    const added: any[] = b.data?.added ?? [];
-    const id = clean(c.pos[2]);
-    print(c.io, c.json, b,
-      () => [`agent: ${dash(b.data?.agent)}`, ...added.map((x) => `added: ${dash(x.id)}\t${dash(x.text)}`)].join("\n"),
-      () => added.length
-        ? [`${dash(b.data?.agent)} added ${added.length} ${added.length === 1 ? "subtask" : "subtasks"} to task ${id}:`, ...added.map((x) => `  ${dash(x.id)}  ${dash(x.text)}`)].join("\n")
-        : `${dash(b.data?.agent)} added no subtasks to task ${id}.`);
+    const slug = await org();
+    const path = `/orgs/${seg(slug)}/tasks/${seg(id)}/breakdowns${weekQuery(c)}`;
+    const check = `check the task before running it again: ${taskGet(c, slug, id)}`;
+    if (c.signal.aborted) throw new CliError(130, { error: { code: "cancelled", message: "cancelled; nothing was started" } });
+    if (c.io.tty && !c.json) c.io.err(`Asking ${v.agent === undefined ? "the agent" : clean(v.agent)} to break down task ${tid}...\n`);
+    let b: any;
+    try {
+      b = await call("POST", path, body);
+    } catch (e) {
+      if (!(e instanceof CliError)) throw e;
+      if (e.exit === 130) throw new CliError(130, { error: { code: "cancelled", message: `cancelled; the breakdown may have started; ${check}` } });
+      // No answer, a non-JSON or redirected answer, or a 5xx that is not a known refusal: the start may have been
+      // accepted. It is never sent again, and never falls back to the synchronous route.
+      const st = e.status, code = e.body.error.code;
+      const unknown = st === undefined || st < 400 || (st >= 500 && code !== "not_queued" && code !== "machine_not_ready");
+      if (!unknown) throw e;
+      throw new CliError(e.exit, { error: { ...e.body.error, message: `${e.body.error.message}; the breakdown may have started; ${check}` } }, e.retryAfter, e.location, st);
+    }
+    const h = b?.data?.id;
+    if (typeof h !== "string" || !HANDLE.test(h))
+      throw new CliError(5, { error: { code: "bad_response", message: `the server accepted the breakdown but sent no usable handle; ${check}` } });
+    const resume = resumeCmd(c, slug, h);
+    if (!secs) {
+      const st = dash(b.data.status);
+      return print(c.io, c.json, b, () => `id: ${h}\nstatus: ${st}`, () => `Started breakdown ${h} of task ${tid} (${st}). Check it: ${resume}`);
+    }
+    if (c.io.tty && !c.json) c.io.err(`Started breakdown ${h}; waiting up to ${secs}s...\n`);
+    await follow(c, call, slug, h, secs, id);
   };
+}
+
+function breakdownStatus(c: Ctx): Plan {
+  const { v } = c;
+  if (v.wait === false) throw usage("waiting is off unless you pass --wait");
+  if (v.wait !== true && v.timeout !== undefined) throw usage("--timeout needs --wait");
+  const secs = v.wait === true ? waitSecs(v.timeout) : 0;
+  const h = c.pos[2]!;
+  if (!HANDLE.test(h)) throw usage(`invalid breakdown handle: "${clean(h)}" (it starts with bd_)`);
+  return async (call, org) => follow(c, call, await org(), h, secs);
+}
+
+// Reads the handle until it is terminal (secs > 0) or once (secs 0). Paths are built from the org and the checked
+// handle, never from the server's status_url. Every error carries the handle and org. GET only: nothing is started here.
+async function follow(c: Ctx, call: Api, org: string, h: string, secs: number, taskId?: string): Promise<void> {
+  const path = `/orgs/${seg(org)}/breakdowns/${seg(h)}`;
+  const resume = resumeCmd(c, org, h);
+  const mk = (exit: Exit, code: string, message: string) => new CliError(exit, { error: { code, message, details: { breakdown_id: h, org } } });
+  const giveUp = () => mk(5, "timeout", `no result within ${secs}s; breakdown ${h} may still be running. Check it: ${resume}`);
+  const cancelled = () => mk(130, "cancelled", `cancelled; breakdown ${h} may still be running. Check it: ${resume}`);
+  const bad = (why: string) => mk(5, "bad_response", `${why}; breakdown ${h} may still be running. Check it: ${resume}`);
+  const deadline = c.now() + secs * 1000;
+  let gap = taskId === undefined ? 0 : POLL_MS, errs = 0; // a fresh start is not read before the first interval
+  for (let reads = 0; ; reads++) {
+    if (c.signal.aborted) throw cancelled();
+    // reads: a clock that does not move cannot keep this going; each pass sleeps at least POLL_MS otherwise.
+    if (secs && (reads > secs || c.now() >= deadline)) throw giveUp();
+    if (gap) {
+      await (c.io.sleep ?? realSleep)(Math.min(gap, Math.max(0, deadline - c.now())), c.signal);
+      if (c.signal.aborted) throw cancelled();
+      if (c.now() >= deadline) throw giveUp();
+    }
+    gap = POLL_MS;
+    let b: any;
+    try {
+      b = await call("GET", path, undefined, secs ? Math.max(1000, Math.min(30_000, deadline - c.now())) : undefined);
+    } catch (e) {
+      if (!(e instanceof CliError)) throw e;
+      if (e.exit === 130 || c.signal.aborted) throw cancelled();
+      const transient = e.status === undefined ? e.body.error.code === "network_error" : e.status === 429 || e.status >= 500;
+      if (!secs || !transient) throw withHandle(c, e, h, org);
+      const ra = e.retryAfter && /^\d+$/.test(e.retryAfter) ? Number(e.retryAfter) * 1000 : undefined;
+      gap = ra === undefined ? Math.min(POLL_MS * 2 ** ++errs, 30_000) : Math.max(POLL_MS, ra); // clamped to the deadline above
+      continue;
+    }
+    errs = 0;
+    const d = b?.data;
+    // The answer must be about this handle (and, after a start, this task), or it proves nothing.
+    if (!isObj(d) || d.id !== h || (taskId !== undefined && d.task_id !== undefined && d.task_id !== taskId)) throw bad("unexpected breakdown status");
+    const tid = d.task_id ?? taskId;
+    if (d.status === "queued" || d.status === "running") {
+      if (secs) continue;
+      return print(c.io, c.json, b, () => `id: ${h}\nstatus: ${d.status}`, () => `Breakdown ${h} of task ${clean(tid)} is ${d.status}. Check it: ${resume}`);
+    }
+    if (d.status === "succeeded") {
+      if (!Array.isArray(d.added) || !d.added.every(isObj)) throw bad("the breakdown succeeded but its result was unreadable");
+      return breakdownDone(c, b, d, clean(tid));
+    }
+    if (d.status === "failed") {
+      const raw = isObj(d.error) ? d.error : {};
+      const code = typeof raw.code === "string" && /^[a-z0-9_]{1,40}$/.test(raw.code) ? raw.code : "breakdown_failed";
+      const exit: Exit = code === "full" || code === "no_agent" ? 6 : code === "task_gone" ? 3 : 5;
+      const why = typeof raw.message === "string" && raw.message ? raw.message : "the breakdown failed";
+      throw mk(exit, code, `${why} (breakdown ${h})`); // fail() cleans it on stderr
+    }
+    if (d.status === "expired")
+      throw mk(3, "expired", `breakdown ${h} has expired and its result is no longer kept; read the task to see what was added`);
+    throw bad("unexpected breakdown status");
+  }
+}
+
+// The added subtasks are exactly those the server committed; a task deleted since is said so, never "added none".
+function breakdownDone(c: Ctx, b: any, d: any, tid: string): void {
+  const added: any[] = d.added;
+  const name = d.agent == null || d.agent === "" ? "The agent" : clean(d.agent);
+  const gone = d.task === null;
+  const n = gone && Array.isArray(d.added_ids) ? d.added_ids.length : added.length;
+  const count = `${n} ${n === 1 ? "subtask" : "subtasks"}`;
+  print(c.io, c.json, b,
+    () => [`agent: ${dash(d.agent)}`, ...added.map((x) => `added: ${dash(x.id)}\t${dash(x.text)}`)].join("\n"),
+    () => gone ? `${name} added ${count} to task ${tid}, which has since been deleted.`
+      : added.length ? [`${name} added ${count} to task ${tid}:`, ...added.map((x) => `  ${dash(x.id)}  ${dash(x.text)}`)].join("\n")
+      : `${name} added no subtasks to task ${tid}.`);
+  if (gone && !c.json && !c.io.tty) c.io.err(`note: task ${tid} has since been deleted\n`);
+}
+
+// A server error read after the start: tagged with the handle and org so a script can pick it up again.
+function withHandle(c: Ctx, e: CliError, h: string, org: string): CliError {
+  const b: any = e.body.error;
+  const d = isObj(b.details) ? b.details : {};
+  if (d.breakdown_id === undefined) {
+    b.details = { ...d, breakdown_id: h, org };
+    if (!c.json && typeof b.message === "string") b.message += ` (breakdown ${h})`;
+  }
+  return e;
 }
 
 // n = expected positionals (including the command word).
@@ -138,7 +276,8 @@ const SPECS: Record<string, Spec> = {
   star: { flags: [...W, "off"], n: 3, build: (c) => patch(c, { one_thing: !c.v.off }, (id) => (c.v.off ? `Unstarred ${id}.` : `Starred ${id}.`)) },
   delete: { flags: [...W, "yes"], n: 3, build: del },
   delegate: { flags: [...W, "to"], n: 3, build: delegate },
-  breakdown: { flags: [...W, "agent"], n: 3, build: breakdown },
+  breakdown: { flags: [...W, "agent", "wait", "timeout"], n: 3, build: breakdown },
+  "breakdown-status": { flags: ["wait", "timeout"], n: 3, build: breakdownStatus },
   "sub add": { flags: [...W, "assign"], n: 5, build: subAdd },
   "sub done": { flags: [...W, "undo"], n: 5, build: subDone },
   "sub delete": { flags: [...W, "yes"], n: 5, build: subDelete },
@@ -146,12 +285,13 @@ const SPECS: Record<string, Spec> = {
 
 // Positionals that become path segments, by spec key.
 const ID_POS: Record<string, number[]> = {
-  get: [2], update: [2], done: [2], undone: [2], today: [2], star: [2], delete: [2], delegate: [2], breakdown: [2],
+  get: [2], update: [2], done: [2], undone: [2], today: [2], star: [2], delete: [2], delegate: [2], breakdown: [2], "breakdown-status": [2],
   "sub add": [3], "sub done": [3, 4], "sub delete": [3, 4],
 };
 
 // Validates everything synchronously (so usage errors exit 1 before credentials are read), then returns the closure.
-export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () => number): Plan {
+// `signal` (Ctrl-C) is read by breakdown and breakdown-status only.
+export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () => number, signal: AbortSignal = new AbortController().signal): Plan {
   const [cmd, a, b] = pos;
   const isSub = cmd === "task" && a === "sub";
   const key = cmd === "people" || cmd === "tags" ? cmd : cmd === "tasks" ? "list" : isSub ? (b ? `sub ${b}` : "sub") : (a ?? "");
@@ -166,7 +306,7 @@ export function taskPlan(pos: string[], v: Opts, io: Io, json: boolean, now: () 
   if (v.mine && v.who !== undefined) throw usage("give only one of --mine / --who");
   if (v.open && v.done) throw usage("give only one of --open / --done");
   if (v.tags === true) throw usage("--tags is only valid as --no-tags");
-  return spec.build({ pos, v, io, json, now });
+  return spec.build({ pos, v, io, json, now, signal });
 }
 
 // ---- shared helpers

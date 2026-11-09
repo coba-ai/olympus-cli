@@ -56,6 +56,15 @@ export type FakeState = {
   device?: { script: string[]; interval?: number; expires_in?: number; omitComplete?: boolean; codeBody?: unknown };
   // pending pairing codes for POST /browser/pair; tests reset it with seedBrowserPair()
   browserPair: BrowserPairState;
+  // async breakdown receipts by handle; each GET shifts one step off `steps` (the last one sticks).
+  // A step is queued | running | succeeded | expired | failed:<code>; succeeded adds two subtasks once.
+  breakdowns: Record<string, BreakdownReceipt>;
+  // the steps the next started receipt gets; default queued, running, succeeded
+  breakdownSteps?: string[];
+};
+export type BreakdownReceipt = {
+  id: string; org: string; task_id: string; week: string; agent: string; steps: string[]; status: string;
+  created_at: string; finished_at: string | null; added_ids: string[]; task_version: number | null; error?: string;
 };
 
 const NAMES: Record<string, string> = { acme: "Acme", beta: "Beta" };
@@ -657,7 +666,7 @@ function sessionsApi(state: FakeState, org: string, me: { id: string; name: stri
 
 export function startFake(): { url: string; state: FakeState; stop(): void } {
   let n = 2;
-  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10), sessions: {}, briefings: {}, turns: [], browserPair: seedBrowserPair() };
+  const state: FakeState = { requests: [], webhooks: { acme: [], beta: [] }, tasks: {}, days: {}, crm: seedCrm(), idempotency: {}, subscriptions: seedSubscriptions(), today: new Date().toISOString().slice(0, 10), sessions: {}, briefings: {}, turns: [], browserPair: seedBrowserPair(), breakdowns: {} };
   state.tasks = seedTasks(state.today);
   state.sessions = seedSessions(new Date().toISOString());
   state.briefings = seedBriefings(state.today);
@@ -748,7 +757,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         seg[0] === "api" && seg[1] === "v1" &&
         ((r === "me" && seg.length === 3) ||
           (r === "orgs" && !!org && ((sub === "agents" && seg.length === 5) || (sub === "people" && seg.length === 5) || (sub === "tags" && seg.length === 5) ||
-            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)) ||
+            (sub === "tasks" && (seg.length === 5 || seg.length === 6 || (seg.length === 7 && (seg[6] === "subtasks" || seg[6] === "delegate" || seg[6] === "breakdown" || seg[6] === "breakdowns")) || (seg.length === 8 && seg[6] === "subtasks"))) || (sub === "breakdowns" && seg.length === 6) || (sub === "days" && (seg.length === 5 || seg.length === 6)) || (sub === "webhooks" && (seg.length === 5 || seg.length === 6)) ||
             (sub === "crm" && seg.length >= 6 && seg.length <= 9 && ["pipelines", "tags", "search", "tasks", "deals", "people", "companies"].includes(seg[5]!)) ||
             (sub === "subscriptions" && seg.length >= 5 && seg.length <= 7) || (sub === "sessions" && seg.length >= 5 && seg.length <= 7) || (sub === "briefings" && seg.length === 6) || (sub === "event_types" && seg.length === 5))));
       if (!known) return notFound();
@@ -795,7 +804,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
       if (sub === "subscriptions") return reply(subsApi((state.subscriptions[org!] ??= []), req.method, seg.slice(5), body, operator));
       if (sub === "event_types") return req.method === "GET" ? send(200, { data: EVENT_TYPES }) : notFound();
       if (sub === "agents") return req.method === "GET" ? send(200, { data: AGENTS }) : notFound();
-      if (sub === "people" || sub === "tasks" || sub === "tags" || sub === "days") return tasksRoute();
+      if (sub === "people" || sub === "tasks" || sub === "tags" || sub === "days" || sub === "breakdowns") return tasksRoute();
       const list = state.webhooks[org!] ?? (state.webhooks[org!] = []);
       // provider_secret is accepted and never stored or returned. instructions stay off the list.
       const publish = ({ provider_secret, ...rest }: Webhook) => rest;
@@ -877,6 +886,7 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
           return tsend(200, { data: [...counts].sort((a, b) => b[1] - a[1]).slice(0, 50).map(([g]) => g) });
         }
         const me = people.find((p) => p.me)!;
+        if (sub === "breakdowns") return breakdownRead(seg[5]!);
 
         const q = u.searchParams;
         if (sub === "days" && seg[5]) return dayOne(seg[5]);
@@ -912,7 +922,21 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         }
         const t = row?.tasks.find((x) => x.id === tid);
         if (!t) return terr(404, "not_found", NOT_FOUND);
-        const act = seg[6] === "delegate" || seg[6] === "breakdown" ? seg[6] : null;
+        if (seg[6] === "breakdowns") {
+          if (m !== "POST") return terr(404, "not_found", NOT_FOUND);
+          const b = isObj(body) ? body : {};
+          const agent = typeof b.agent === "string" ? b.agent : "hermes";
+          const active = Object.values(state.breakdowns).find((x) => x.org === org && (x.status === "queued" || x.status === "running"));
+          if (active && active.task_id !== t.id) return send(429, { error: { code: "rate_limited", message: "Too many breakdowns in progress. Try again shortly." } }, { ...nsHdr, "Retry-After": "15" });
+          const rec: BreakdownReceipt = active ?? {
+            id: rid("bd_", 20), org: org!, task_id: t.id, week, agent, steps: [...(state.breakdownSteps ?? ["queued", "running", "succeeded"])],
+            status: "queued", created_at: nowIso(), finished_at: null, added_ids: [], task_version: null,
+          };
+          state.breakdowns[rec.id] = rec;
+          const data = receipt(rec);
+          return send(202, { data }, { ...nsHdr, Location: data.status_url, "Retry-After": "3" });
+        }
+        const act =seg[6] === "delegate" || seg[6] === "breakdown" ? seg[6] : null;
         if (act) {
           if (m !== "POST") return terr(404, "not_found", NOT_FOUND);
           const b = isObj(body) ? body : {};
@@ -1013,6 +1037,44 @@ export function startFake(): { url: string; state: FakeState; stop(): void } {
         }
         function nowIso() {
           return new Date(state.now?.() ?? Date.now()).toISOString();
+        }
+        // The receipt as the API serializes it; expired is only the handle, status and expires_at.
+        function receipt(r: BreakdownReceipt): Item {
+          const expires_at = new Date(Date.parse(r.created_at) + 86_400_000).toISOString();
+          if (r.status === "expired") return { id: r.id, status: "expired", expires_at };
+          const d: Item = {
+            id: r.id, status: r.status, task_id: r.task_id, week: r.week, agent: r.agent, created_at: r.created_at,
+            finished_at: r.finished_at, expires_at, status_url: `${u.origin}/api/v1/orgs/${r.org}/breakdowns/${r.id}`,
+          };
+          if (r.status === "failed") d.error = { code: r.error, message: `failed: ${r.error}` };
+          if (r.status === "succeeded") {
+            const task = state.tasks[r.org]?.[r.week]?.tasks.find((x) => x.id === r.task_id) ?? null;
+            Object.assign(d, { task_version: r.task_version, added_ids: r.added_ids, task, added: task ? task.subtasks.filter((s: Item) => r.added_ids.includes(s.id)) : [] });
+          }
+          return d;
+        }
+        // GET /breakdowns/:id: org-scoped, one 404 otherwise. Advances the receipt one step per read.
+        function breakdownRead(id: string) {
+          const r = state.breakdowns[id];
+          if (req.method !== "GET" || !r || r.org !== org) return terr(404, "not_found", NOT_FOUND);
+          const step = r.steps.length > 1 ? r.steps.shift()! : r.steps[0] ?? r.status;
+          const was = r.status;
+          r.status = step.startsWith("failed:") ? "failed" : step;
+          if (r.status === "failed") r.error = step.slice(7);
+          if (r.status !== was && (r.status === "succeeded" || r.status === "failed")) r.finished_at = nowIso();
+          if (r.status === "succeeded" && was !== "succeeded") {
+            const wk = state.tasks[r.org]?.[r.week];
+            const t = wk?.tasks.find((x) => x.id === r.task_id);
+            if (t) {
+              for (const text of ["First step", "Second step"]) {
+                const s = { id: rid("s"), text, done: false, done_at: null, assignee: null, today: false, order: t.subtasks.length };
+                t.subtasks.push(s);
+                r.added_ids.push(s.id);
+              }
+              r.task_version = ++wk!.version;
+            }
+          }
+          return tsend(200, { data: receipt(r) });
         }
         // string -> {id,name,kind} | error message
         function resolve(v: unknown): { ok: Item | null } | { err: string } {

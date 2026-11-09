@@ -51,6 +51,27 @@ test("breakdown: 200, display name, two subtasks appended, injected 502", async 
   expect((await api("POST", "/tasks/trest001/breakdown", {})).status).toBe(502);
 });
 
+test("async breakdown: 202 receipt with Location/Retry-After, steps per read, org-scoped 404, one active per org", async () => {
+  fake.state.breakdowns = {};
+  const r = await api("POST", "/tasks/trest001/breakdowns", { agent: "hermes" });
+  expect([r.status, r.h.get("retry-after"), r.h.get("cache-control")]).toEqual([202, "3", "no-store"]);
+  const h = r.json.data.id;
+  expect(h).toMatch(/^bd_[0-9a-z]{20}$/);
+  expect(r.h.get("location")).toBe(r.json.data.status_url);
+  expect(r.json.data).toMatchObject({ status: "queued", task_id: "trest001", agent: "hermes", finished_at: null });
+  expect((await api("POST", "/tasks/trest001/breakdowns", {})).json.data.id).toBe(h);
+  const other = await api("POST", "/tasks/tback001/breakdowns", {});
+  expect([other.status, other.h.get("retry-after"), other.json.error.code]).toEqual([429, "15", "rate_limited"]);
+  expect((await api("GET", `/breakdowns/${h}`)).json.data.status).toBe("queued");
+  expect((await api("GET", `/breakdowns/${h}`)).json.data.status).toBe("running");
+  const done = (await api("GET", `/breakdowns/${h}`)).json.data;
+  expect([done.status, done.added.map((s: any) => s.text), done.added.map((s: any) => s.id)]).toEqual(["succeeded", ["First step", "Second step"], done.added_ids]);
+  expect((await api("GET", `/breakdowns/${h}`)).json.data.added_ids).toEqual(done.added_ids); // committed once
+  const beta = await fetch(`${fake.url}/api/v1/orgs/beta/breakdowns/${h}`, { headers: { Authorization: `Bearer ${TOKENS.multi}` } });
+  expect(beta.status).toBe(404);
+  expect((await api("GET", "/breakdowns/bd_unknown")).status).toBe(404);
+});
+
 test("days list: Mon-Fri with nulls, week normalised, malformed 422", async () => {
   const r = await api("GET", "/days?week=2026-10-11");
   expect(r.status).toBe(200);

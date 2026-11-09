@@ -52,7 +52,8 @@ olympus task update <id> [--text T] [--desc T] [--assign W | --unassign] [--sect
 olympus task today <id> [--off] | star <id> [--off]
 olympus task sub add <id> TEXT [--assign W] | sub done <id> <sid> [--undo] | sub delete <id> <sid> --yes
 olympus task delegate <id> [--to AGENT]         # open an agent session for the task
-olympus task breakdown <id> [--agent AGENT]     # ask an agent to add subtasks (can take ~90 s)
+olympus task breakdown <id> [--agent AGENT] [--timeout SECONDS | --no-wait]   # ask an agent to add subtasks
+olympus task breakdown-status <handle> [--wait] [--timeout SECONDS]           # read a started breakdown again
 olympus day [DATE] | day show [DATE]            # one day's close-of-day entry; DATE is YYYY-MM-DD, default today
 olympus day list [--week D]                     # the week's five weekdays
 olympus day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]
@@ -198,11 +199,19 @@ Agents and days:
   assignee is used if it is an active agent, otherwise the organization's primary agent. It is **not
   idempotent**: running it again opens another session. It takes `--week` like the other task commands.
 - `task breakdown` asks an agent to propose subtasks and appends them to the task (a task holds at
-  most 5, and one that is full is exit 6). `--agent` works like `--to`. The call waits for the agent and
-  can take up to about 90 seconds; the CLI allows 100 s. If the agent fails or answers badly the server
-  replies `502 agent_failed` and the CLI exits 5 with the agent's message; nothing is saved. If you
-  interrupt it (or it times out) the subtasks may still have been added, so check with `task get <id>`
-  before running it again.
+  most 5, and one that is full is exit 6). `--agent` works like `--to`. It starts the breakdown once
+  (the server answers at once with a handle, `bd_…`), then reads its status every 3 seconds until it
+  has finished, for up to `--timeout` seconds (default 300). It prints the subtasks the server says it
+  added, never a guess. `--no-wait` prints the handle and returns at once. A failed breakdown exits
+  with its reason (5; 6 when the task is full or there is no agent; 3 when the task is gone), and an
+  expired one exits 3. If the wait times out (exit 5) or you press Ctrl-C (exit 130), the breakdown
+  may still be running: the error names the handle and the org, and the command to pick it up again,
+  `olympus task breakdown-status <handle> --org <org> --wait`. If the start itself got no clear answer
+  (a network failure or a 5xx), it may have started anyway; the CLI does not send it again and says
+  to check with `task get <id>` before you do.
+- `task breakdown-status <handle>` reads a breakdown again (it never starts one): once without
+  `--wait`, printing its status, or with `--wait` (and `--timeout`, default 300) until it finishes.
+  A handle is kept 24 hours, then reads as expired (exit 3), and later as not found.
 - `day` shows your own close-of-day entry for one weekday (Monday to Friday; the default is today in
   your local time zone, so a weekend "today" is exit 6). `day list` shows the week's five days.
   `--week` takes any date in the week. Only your own entries are visible.
@@ -329,7 +338,8 @@ characters in server text are stripped from stdout on a terminal and server text
 scripts can rely on and that will not change. `olympus org list | cat` forces the plain form. No colour is
 emitted, so `NO_COLOR` does not apply. `webhook create` shows the signing secret once, in both forms, only when the response's `secret` is not null. `--json` prints the API body as-is (three exceptions: `tasks` with list filters narrows `data.tasks` and leaves every other key as sent; a webhook whose `approval` is `pending` or `rejected` adds a top-level `hint` with the sentence to show a person, and prints that same sentence on stderr; `crons run --wait` prints `{data:{run}}` for the closed receipt, the same shape as the 202, rather than the runs page it polled; `crm automation run --wait` prints that same `{data:{run}}`), one compact line
 (`org list` → `{data:[…]}`, `org use` → `{data:{org}}`, `delete` → `{data:{id,deleted:true}}`,
-`logout` → `{data:{deleted}}`, `task delete` and `subscription delete` → `{data:{id,deleted:true}}`; `task delegate`, `task breakdown`, `day …` → the response body; `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
+`logout` → `{data:{deleted}}`, `task delete` and `subscription delete` → `{data:{id,deleted:true}}`; `task delegate`, `day …` → the response body; `task breakdown` and `task breakdown-status` → the last status
+body read, `{data:{id, status, task_id, agent, task, added, …}}` (with `--no-wait`, the start's `{data:{id, status:"queued", …}}`); `task sub delete` prints the parent item the server returns). Errors go to stderr; with `--json` stderr is the error object, and
 usage errors are `{"error":{"code":"usage",…}}`. A token is never printed.
 
 **Piped tasks output** (tab-separated; every server string has control characters stripped, so a tab or
@@ -348,8 +358,10 @@ newline in task text never splits a row; nothing is printed for an empty list):
 - `task delete` prints `deleted <id>`.
 - `task delegate`, four lines: `agent: <name>`, `session: <session id>`, `title: <title|->`,
   `url: <session URL>`.
-- `task breakdown`: `agent: <name>`, then one `added: <sid><TAB><text>` line per new subtask (none if the
-  agent added nothing).
+- `task breakdown` and `task breakdown-status`, once finished: `agent: <name>`, then one
+  `added: <sid><TAB><text>` line per new subtask (none if the agent added nothing). While it is still
+  queued or running (`--no-wait`, or `breakdown-status` without `--wait`): `id: <handle>` and
+  `status: queued|running`.
 - `day show` / `day [DATE]`, and what `day close` prints after saving: `day:`, `closed:` (`true|false`),
   `closed_at:`, `score:`, `shipped:`, `reflection:`, `agent_note:` (empty values print `-`), then one
   `blocker: <id><TAB><text>` and one `learning: <id><TAB><text>` line per item. A day with nothing saved
