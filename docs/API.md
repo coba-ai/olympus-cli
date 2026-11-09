@@ -83,6 +83,8 @@ PATCH  /orgs/:org/tasks/:id/subtasks/:sid[?week]         {text?, done?, assignee
 DELETE /orgs/:org/tasks/:id/subtasks/:sid[?week]         → {data:item}
 POST   /orgs/:org/tasks/:id/delegate[?week]              {agent?} → 201 {data:{task:item, session:{id, title, agent, url}}}
 POST   /orgs/:org/tasks/:id/breakdown[?week]             {agent?} → {data:{task:item, agent, added:[subtask…]}}
+POST   /orgs/:org/tasks/:id/breakdowns[?week]            {agent?} → 202 {data:{id:"bd_…", status:"queued", task_id, week, agent, created_at, finished_at, expires_at, status_url}}
+GET    /orgs/:org/breakdowns/:id                         → {data:breakdown}
 
 GET    /orgs/:org/days[?week]                            → {data:{week, days:[{day, closed, closed_at, score, entry}]}}
 GET    /orgs/:org/days/:day                              → {data:{day, closed, closed_at, score, entry|null}}
@@ -331,6 +333,28 @@ synchronous and can take up to about 90 seconds, so clients should allow at leas
 `fields.agent`; 503 `machine_not_ready` when the agent machine is not connected or unreachable; and
 502 `agent_failed` when the agent's reply was unusable, too slow or refused, with a human-readable
 `message`. If a client gives up waiting, the subtasks may still land; read the task to find out.
+
+**Asynchronous breakdown.** `POST /tasks/:id/breakdowns` takes the same body, `?week` and checks as
+`POST /tasks/:id/breakdown`, and answers at once: 202 with the breakdown's handle in `data.id` (`bd_…`,
+scoped to the organization), `status:"queued"`, `Location` equal to `data.status_url`, and
+`Retry-After: 3`, the poll interval. Starting again for the same task while it is still active answers
+202 with the same handle and starts nothing new. Poll `GET /breakdowns/:id`; `status` is `queued`,
+`running`, `succeeded`, `failed` or `expired`:
+
+- `succeeded` adds `task_version`, `added_ids`, `task` (the task as stored now, `null` if it has since
+  been deleted) and `added` (those subtasks).
+- `failed` adds `error:{code, message}`; the message is a fixed sentence. Codes include `full`,
+  `no_agent`, `task_gone`, `machine_not_ready`, `agent_failed`, `unreadable` and `timed_out`.
+- A handle is kept 24 hours. After that it reads `{id, status:"expired", expires_at}` only, and later
+  404.
+
+An unknown handle, another organization's and a non-member's all get the same 404. One breakdown runs
+per organization at a time, synchronous or not: starting one for another task meanwhile is 429
+`rate_limited` with `Retry-After: 15`. Both start routes share a limit of 2 per minute per token; status
+reads count only against the general limit. 503 `not_queued` means it could not be queued: nothing will
+run, and `details.breakdown` is the closed receipt. Other refusals are as for the synchronous route.
+Build the status path from the organization and the handle you were given; the CLI does not follow
+`status_url` or `Location`. The synchronous route above is unchanged; the CLI uses only this one.
 
 ## Days (close of day)
 

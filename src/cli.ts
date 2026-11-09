@@ -35,7 +35,8 @@ const USAGE = `usage: olympus <command> [flags]
   task get <id> | add TEXT | update <id> | done <id> | undone <id> | today <id> | star <id> | delete <id> --yes
   task update <id> [--text T] [--desc T] [--assign W | --unassign] [--section S] [--tag T]... [--no-tags] [--add-tag T]... [--remove-tag T]...
   task sub add <id> TEXT | sub done <id> <sid> | sub delete <id> <sid> --yes   (all accept --week D)
-  task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT]   (both accept --week D)
+  task delegate <id> [--to AGENT] | task breakdown <id> [--agent AGENT] [--timeout SECONDS | --no-wait]   (both accept --week D)
+  task breakdown-status <handle> [--wait] [--timeout SECONDS]   (read a started breakdown again; never starts one)
   day [DATE] | day show [DATE] | day list [--week D]   (DATE: YYYY-MM-DD, default today)
   day close [DATE] [--shipped T] [--blocker T]... [--learning T]... [--reflection T] [--draft]
   crm pipelines | crm tags [--entity E] | crm search QUERY [--entity E]
@@ -226,7 +227,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
   let json = argv.includes("--json");
   let host = "";
   let orgFromCreds: string | undefined;
-  // `ask` and `browser attach` only: aborted by Ctrl-C (a listener around each) or by io.signal; other commands never see it.
+  // The long-running commands only (`long` below, and `browser attach`): aborted by Ctrl-C (a listener around each) or by io.signal.
   const ctl = new AbortController();
   const signal = io.signal ? AbortSignal.any([ctl.signal, io.signal]) : ctl.signal;
   if (argv.length === 1 && argv[0] === "--version") { io.out(`olympus ${VERSION}\n`); return 0; }
@@ -497,7 +498,7 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     } else if (cmd === "crons") {
       plan = await cronsPlan(pos, v, io, json, now, signal);
     } else if (cmd === "people" || cmd === "tasks" || cmd === "task" || cmd === "tags") {
-      plan = taskPlan(pos, v, io, json, now);
+      plan = taskPlan(pos, v, io, json, now, signal);
     } else if (cmd === "day") {
       plan = dayPlan(pos, v, io, json, now);
     } else if (cmd === "crm" && sub === "automation") {
@@ -522,8 +523,10 @@ export async function run(argv: string[], io: Io): Promise<Exit> {
     host = resolveHost(v.host, io, creds);
     // A stored org belongs to the host it was saved for.
     const scoped: Creds = { ...creds, org: creds.host === host ? creds.org : undefined };
-    // ask, `crons run --wait` and `crm automation run --wait` are the commands a Ctrl-C must stop without leaving the request hung.
-    const long = cmd === "ask" || (v.wait === true && (cmd === "crons" || (cmd === "crm" && sub === "automation" && arg === "run")));
+    // ask, `task breakdown`, the --wait forms of `task breakdown-status`, `crons run` and `crm automation run` are the
+    // commands a Ctrl-C must stop without leaving the request hung.
+    const long = cmd === "ask" || (cmd === "task" && sub === "breakdown") ||
+      (v.wait === true && (cmd === "crons" || (cmd === "task" && sub === "breakdown-status") || (cmd === "crm" && sub === "automation" && arg === "run")));
     const call = api(host, resolveToken(host, io, creds), undefined, long ? signal : undefined);
     let meCache: Promise<Me> | undefined;
     const me = () => (meCache ??= call("GET", "/me").then((b) => b.data as Me));
